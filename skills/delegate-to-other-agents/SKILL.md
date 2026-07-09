@@ -160,6 +160,8 @@ Never delegate a task you couldn't implement yourself. Before any executor promp
 
 Planning depth scales with risk: trivial/mechanical tasks (known repro, dep bump, tiny scoped edit) need only the repro + verification command; medium+ tasks need the full bar — code read, files known, approach frozen.
 
+The bar is model-relative — if you (per the self-aware table) are a weaker tier and can't honestly meet it for this task, don't lower the bar and don't fire the spec anyway: spawn a stronger subagent (opus/fable) to do the planning or diff review, and dispatch from its plan. Weak orchestrator + strong planner + flat-rate executor is still cheaper than a strong model doing everything. If the stronger tier can't be spawned (quota/limits), walk down the chain (fable → opus → sonnet); if no available tier meets the bar, halt and report to the user — never ship a spec or accept a diff nobody understood. Both external executors dry → Claude (or a capable subagent) implements directly, same halt rule if none can.
+
 Cheap exception: bulk exploration/read-only recon may be delegated *as* the planning step — its output feeds Claude's plan, nothing mutates.
 
 ## Prompt contract
