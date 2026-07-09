@@ -7,18 +7,25 @@ Backing data for the firm routing rules in SKILL.md. Read this when the user say
 
 | Role | Model / harness | Billing |
 |---|---|---|
-| Orchestrator / direct implementer | Claude Fable 5 (sometimes Opus 4.8) via Claude Code | metered, expensive |
+| Orchestrator / direct implementer | Opus 4.8 default; Fable 5 reserved for hardest non-debug/non-security ceiling work (classifier reroute risk) | metered, expensive |
+| Subagent worker | Sonnet 5 default; opus for adversarial/security; fable reserved | metered |
 | Executor (co-default) | Codex CLI + GPT-5.5 | flat-rate |
 | Executor (co-default) | Grok CLI + grok-4.5 (CLI default since 2026-07-08; grok-composer-2.5-fast still available) | flat-rate (sub) |
 
+Orchestrator choice (user-facing, not agent-actionable mid-task): prefer Opus 4.8 sessions; Fable 5 sessions only for long-horizon taste-sensitive feature work unlikely to trip the safety classifier.
+
+2026-07-10: SKILL.md consolidated after adversarial 3-model review (Fable 5 high, GPT-5.5, Grok 4.5) — contradictions removed, benchmarks moved here, single decision flow.
+
 ## Evidence snapshot (research run 2026-07-08, Grok Heavy: benchmarks + X practitioner sentiment)
+
+> **SUPERSEDED (2026-07-09) for Grok routing and orchestrator choice — see the two snapshots below. Do not cite the struck bullets for current routing.**
 
 - **SWE-bench Verified**: Fable 5 ~95%; Opus 4.8 ~88.6%; GPT-5.5 ~82–88.7%; grok-code-fast-1 ~70.8%.
 - **SWE-bench Pro** (harder, low leakage): Fable 5 80.3%; Opus 4.8 69.2%; GPT-5.5 58.6% → drives the "Claude does big multi-file work itself" rule.
 - **Terminal-Bench 2.1**: GPT-5.5 ~83.4% (lead/near-top); Fable 5 ~83.1%; Opus lower; Grok ~70.8% → drives "Codex for CI/tooling/terminal".
 - **Aider Polyglot**: GPT-5 series lead (~88%) → drives "Codex for test writing".
-- **Practitioner sentiment (X)**: Grok praised for terminal UX/speed on routine work despite lower peak quality; short autonomous stamina (beta) → avoid for >30 min runs. Fable praised for one-shot long-horizon/taste ("generational"); safety-refuses security-adjacent tasks → Opus fallback there. Heavy users noted GPT-5.5 instruction drift; GPT-5.6 reportedly fixes it.
-- **Grok context ceiling**: 256k → Codex for bulk exploration beyond that.
+- ~~**Practitioner sentiment (X)**: Grok short autonomous stamina (beta) → avoid for >30 min runs.~~ (superseded: stamina fixed in 4.5) Fable praised for one-shot long-horizon/taste ("generational"). Heavy users noted GPT-5.5 instruction drift; GPT-5.6 reportedly fixes it.
+- ~~**Grok context ceiling**: 256k → Codex for bulk exploration beyond that.~~ (superseded: 500k in 4.5)
 - **Thresholds**: no published hard numbers; consensus ≈ scoped/low-ambiguity/≲2k LOC/few files → delegate.
 
 ## Evidence snapshot — Grok 4.5 (research run 2026-07-09; model released 2026-07-08)
