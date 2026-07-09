@@ -233,10 +233,22 @@ def cmd_list(as_json=False):
                   f"last_used={a.get('last_used_at') or 'never'}")
         return
     ledger = load_ledger()
+    now = time.time()
     out = []
     for a in store["accounts"]:
         led = ledger.get(a["id"], {})
         obs_ts = led.get("ts")
+        # self-healing: an observation from before a window reset means fresh
+        h5, h5_reset = led.get("h5"), led.get("h5_resets_at")
+        eff_h5 = 0.0 if (h5 is not None and h5_reset and now > h5_reset) else h5
+        wk, wk_reset = led.get("weekly"), led.get("weekly_resets_at")
+        eff_wk = 0.0 if (wk is not None and wk_reset and now > wk_reset) else wk
+        flags = dict(led.get("flags", {}))
+        # a weekly/5h cap flag expires once that window has reset
+        if "weekly" in flags and wk_reset and now > wk_reset:
+            flags["weekly"] = "expired"
+        if "5h" in flags and h5_reset and now > h5_reset:
+            flags["5h"] = "expired"
         out.append({
             "name": a["name"],
             "plan": a.get("plan_type"),
@@ -245,11 +257,15 @@ def cmd_list(as_json=False):
             "subscription_expires_at": a.get("subscription_expires_at"),
             "last_used_at": a.get("last_used_at"),
             "last_observed": {
-                "5h_pct": led.get("h5"), "weekly_pct": led.get("weekly"),
+                "5h_pct": h5, "weekly_pct": wk,
                 "ts": obs_ts,
-                "age_s": int(time.time() - obs_ts) if obs_ts else None,
+                "age_s": int(now - obs_ts) if obs_ts else None,
             },
-            "flags": led.get("flags", {}),
+            "effective": {
+                "5h_pct": eff_h5, "weekly_pct": eff_wk,
+                "5h_resets_at": h5_reset, "weekly_resets_at": wk_reset,
+            },
+            "flags": flags,
         })
     print(json.dumps(out, indent=1))
 
@@ -318,6 +334,10 @@ def cmd_status():
         if isinstance(s_pct, (int, float)):
             e["weekly"] = s_pct
         e["ts"] = int(time.time()) - snap["age_s"]
+        if p.get("resets_at"):
+            e["h5_resets_at"] = p["resets_at"]
+        if s.get("resets_at"):
+            e["weekly_resets_at"] = s["resets_at"]
         save_ledger(ledger)
     # exit 3 when hot, so callers can `|| switch`
     try:
