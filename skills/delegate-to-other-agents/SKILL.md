@@ -158,6 +158,8 @@ Parallelism buys wall-clock only; quality is protected by rules, not luck.
 
 Never delegate a task you couldn't implement yourself. Before any executor prompt is written, Claude must have a concrete plan: read the relevant code, know which files change and roughly how, know the verification command, know the risks. The spec is the *output* of that plan — not a paraphrase of the user's request. Test: if the executor came back and asked "which approach?", you should already have the answer. If planning reveals you can't freeze the approach, that's the high-ambiguity signal — Claude does it itself (or does the design part itself, then delegates the frozen remainder).
 
+Planning depth scales with risk: trivial/mechanical tasks (known repro, dep bump, tiny scoped edit) need only the repro + verification command; medium+ tasks need the full bar — code read, files known, approach frozen.
+
 Cheap exception: bulk exploration/read-only recon may be delegated *as* the planning step — its output feeds Claude's plan, nothing mutates.
 
 ## Prompt contract
