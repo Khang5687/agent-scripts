@@ -43,6 +43,17 @@ Rough threshold: scoped, low-ambiguity, ≲2k LOC / a few files → delegate; bi
 
 Fable vs Opus (updated post re-release, July 2026): Fable's weights are unchanged but a broad safety classifier now silently reroutes flagged prompts (debugging, security-adjacent, dual-use-ish) to Opus 4.8 — you pay Fable rates for Opus output, and mid-task switches break autonomous runs. So: **Opus 4.8 is the default orchestrator/direct implementer**; reserve Fable for the hardest long-horizon/taste-sensitive work where its ceiling matters and the prompt is unlikely to trigger the classifier (pure feature/creative work, not debugging or security). Opus wins security review/auditing outright.
 
+### Know which model YOU are (self-aware routing)
+
+First step on any routing decision: check the harness-declared model in your environment context ("You are powered by the model named ..."). Trust that declaration only — never guess your identity from self-perception (models are unreliable at self-identifying). Then shift the routing bar:
+
+| You are | Routing shift |
+|---|---|
+| **Fable 5** | Baseline rules as written. Do the hardest/taste-sensitive work yourself; delegate scoped work. |
+| **Opus 4.8** | Same as Fable for orchestration; on the very hardest one-shot multi-file work (SWE Pro 69 vs Fable 80), consider a fable subagent instead of doing it directly. |
+| **Sonnet 5** | Delegate MORE aggressively: your direct-impl bar drops to trivial/small edits; route medium+ implementation to Codex/Grok (GPT-5.5 and Grok 4.5 beat Sonnet on hard tasks), and spawn **opus** subagents for adversarial/security verification instead of self-reviewing. |
+| **Haiku (any)** | Pure dispatcher: implement nothing non-trivial yourself; spec, delegate, and have an opus/sonnet subagent do the review. |
+
 ### Claude subagent tiers (spawn rules)
 
 When Claude spawns subagents (Agent tool, `model:` param), pick the tier by task — subagents keep session tools/MCP, which Codex/Grok never get:
