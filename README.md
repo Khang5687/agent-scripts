@@ -8,6 +8,16 @@ This repo is the canonical place for:
 - `scripts/`: dependency-light helpers used across projects
 - `hooks/`: local guardrails such as skill validation
 
+## Install
+
+Interactive selector (pick skills, pick agents, global or project scope) via the [skills CLI](https://skills.sh):
+
+```bash
+npx skills add Khang5687/agent-scripts
+```
+
+Works on this private repo — it clones with your local git credentials. Useful flags: `--list` to browse, `-s <name>` to install one skill, `-g` for user-level install, `--all` for everything non-interactively.
+
 ## Skills
 
 Skills are the main routing layer. Each `skills/<name>/SKILL.md` has YAML front matter:
