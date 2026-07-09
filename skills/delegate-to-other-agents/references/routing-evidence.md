@@ -9,14 +9,27 @@ when the user asks to update the delegation skill (new models, new harnesses, ne
 |---|---|---|
 | Orchestrator / direct implementer | Opus 4.8 default; Fable 5 reserved for hardest non-debug/non-security ceiling work (classifier reroute risk) | metered, expensive |
 | Subagent worker | Sonnet 5 default; opus for adversarial/security; fable reserved | metered |
-| Executor (co-default) | Codex CLI + GPT-5.5 | flat-rate |
-| Executor (co-default) | Grok CLI + grok-4.5 (CLI default since 2026-07-08; grok-composer-2.5-fast still available) | flat-rate (sub) |
+| Executor (co-default) | Codex CLI + GPT-5.6 — terra default; luna cheap lane (tests, high-volume small one-shots); sol escalation for top-band (inaccessible on this account as of 2026-07-10; rules fall back to terra) | flat-rate |
+| Executor (co-default) | Grok CLI + grok-4.5 (CLI default since 2026-07-08) | flat-rate (sub) |
 
 Orchestrator choice (user-facing, not agent-actionable mid-task): prefer Opus 4.8 sessions; Fable 5 sessions only for long-horizon taste-sensitive feature work unlikely to trip the safety classifier.
 
 2026-07-10: SKILL.md consolidated after adversarial 3-model review (Fable 5 high, GPT-5.5, Grok 4.5) — contradictions removed, benchmarks moved here, single decision flow.
 
-Original 2026-07-08 snapshot removed (superseded by the two snapshots below; see git history). Still-current findings carried forward: SWE Pro gap Fable 80.3% vs GPT-5.5 58.6% (drives "Claude keeps hard multi-file work"); Aider Polyglot GPT-5 lead (drives "Codex for tests"); delegation threshold consensus ≈ scoped/low-ambiguity/≲2k LOC.
+Original 2026-07-08 snapshot removed (superseded; see git history). Still-current findings carried forward: SWE Pro gap Fable 80.4% vs GPT-5.5 58.6% (drives "Claude keeps hard multi-file work"); delegation threshold consensus ≈ scoped/low-ambiguity/≲2k LOC.
+
+## Evidence snapshot — GPT-5.6 tier family (research run 2026-07-10; launched 2026-07-09)
+
+Verdict: terra replaces GPT-5.5 as Codex default; luna added as cheap lane (tests, high-volume small one-shots); sol named escalation for top-band work when accessible; Grok stays co-default (routine impl, bulk exploration).
+
+- **Pricing**: luna $1/$6, terra $2.50/$15, sol $5/$30 per MTok. Claude side: Fable 5 now **$10/$50**; Opus 4.8 $5/$25; Sonnet 5 intro $2/$10 ends **2026-08-31** (then $3/$15) → once sol is accessible, the keep-in-Claude boundary for near-2k multi-file work leans delegate.
+- **Terminal-Bench 2.1** (vendor): sol Ultra 91.9 / sol 88.8 / terra ~82.5 / **luna 78.9**; Grok 83.3 → CI/terminal → terra; never luna.
+- **SWE-bench Pro** (vendor): sol 64.6 / terra 63.4 / luna 62.7; Grok 64.7; Fable 80.4 → Claude keep-boundary intact for now.
+- **DeepSWE 1.1**: sol 72.7 (vendor SOTA). AA Coding Agent Index: sol 80.0 / terra 77.4 / luna 74.6.
+- **Luna failure mode** (consistent: Reddit workload test, launch sentiment, our first-party test): shortcuts multi-step chains; reliable on single-step scoped work. Never route multi-step/CI/top-band to luna.
+- **First-party test (2026-07-10)**: identical adversarial review of this skill — terra: 10 findings, caught 2 real regressions, low noise; luna: 12 findings incl. 2 unique real mechanical bugs, but noisier and re-litigated settled arbitrations. Matches the tier personalities above.
+- **Sentiment (X, launch window)**: sol praised for multi-step stamina + self-correction (fixes 5.5's instruction drift); terra = "near-5.5 at half cost" consensus; hybrid stacks (cheap background / mid default / premium escalation) now the norm.
+- **CAVEATS**: all 5.6 numbers are vendor launch-day material; **METR flagged detected-cheating on some long-horizon suites**; no independent SWE Verified / Aider Polyglot numbers yet. Re-check in 2–4 weeks for independent replication. Context windows unconfirmed (reports: sol/terra ~1–1.5M; luna weaker on long-context retention).
 
 ## Evidence snapshot — Grok 4.5 (research run 2026-07-09; model released 2026-07-08)
 
