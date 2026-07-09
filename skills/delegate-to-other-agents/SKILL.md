@@ -72,6 +72,8 @@ Executors start with zero session context. Spec = the frozen plan (§2) + constr
 
 Record the emitted session id after every executor run — required for any resume.
 
+**Codex multi-account** (only when the codex-switcher store `~/.codex-switcher/accounts.json` exists — skip this block otherwise): before each Codex dispatch run `scripts/codex-account.py status` (in this skill's dir); exit code 3 (5h ≥85% or weekly ≥95%) → `scripts/codex-account.py next` (rotates to the least-recently-used account; syncs tokens back first so codex-switcher never desyncs). Quota failure mid-task → `next` + retry the same Codex lane — once per remaining account; only when ALL accounts are capped does Codex count as failing for the §5 switch-to-Grok step. Caveat: the snapshot reflects the account that last ran codex — stale right after a switch; treat quota errors as the authoritative signal.
+
 Codex — prompt via temp file, never inline; per-lane output files; model per the §3 lane (default terra):
 
 ```bash
@@ -115,7 +117,7 @@ grok -r <recorded-session-id> --no-alt-screen -m grok-4.5 --always-approve \
 
 Resume rules: resume only the same executor in the same repo, by the recorded session id; unsure which session → fresh run with git diff/status + full spec, never guess. Cross-executor is always a fresh run.
 
-**Failure policy (authoritative):** inspect stderr/output/diff first — a valid in-scope diff is usable even after a non-zero exit; a no-op is success when the requested state already holds. Otherwise: fix the invoke and retry the same executor once → still failing (incl. quota/transport, empty output, the quiet rule): user pinned this executor with "only"/"exclusively" → halt and report; else switch once to the other executor with the same spec + git diff/status — never switch back. Infrastructure failures never increment §7's failed-round counter. Both executors dead → §3 both-dead rule. `HEAD` ≠ `BASE` after a run = unexpected executor commit: never reset/stash/amend — stop the lane, report the commit hash + `git status -sb`, ask the user.
+**Failure policy (authoritative):** inspect stderr/output/diff first — a valid in-scope diff is usable even after a non-zero exit; a no-op is success when the requested state already holds. Otherwise: fix the invoke and retry the same executor once (Codex quota → rotate accounts per the multi-account block instead; Codex "fails" only when all accounts are capped) → still failing (incl. quota/transport, empty output, the quiet rule): user pinned this executor with "only"/"exclusively" → halt and report; else switch once to the other executor with the same spec + git diff/status — never switch back. Infrastructure failures never increment §7's failed-round counter. Both executors dead → §3 both-dead rule. `HEAD` ≠ `BASE` after a run = unexpected executor commit: never reset/stash/amend — stop the lane, report the commit hash + `git status -sb`, ask the user.
 
 ## 6. Parallelize
 
