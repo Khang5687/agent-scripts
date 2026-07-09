@@ -3,13 +3,13 @@
 Backing data for the firm routing rules in SKILL.md. Read this when the user says
 "update codex-first skill" (new models, new harnesses, new evidence).
 
-## Current lineup (as of 2026-07-08)
+## Current lineup (as of 2026-07-09)
 
 | Role | Model / harness | Billing |
 |---|---|---|
 | Orchestrator / direct implementer | Claude Fable 5 (sometimes Opus 4.8) via Claude Code | metered, expensive |
-| Executor (default) | Codex CLI + GPT-5.5 | flat-rate |
-| Executor (alternate/fallback) | Grok CLI + grok-composer-2.5-fast | flat-rate |
+| Executor (co-default) | Codex CLI + GPT-5.5 | flat-rate |
+| Executor (co-default) | Grok CLI + grok-4.5 (CLI default since 2026-07-08; grok-composer-2.5-fast still available) | flat-rate (sub) |
 
 ## Evidence snapshot (research run 2026-07-08, Grok Heavy: benchmarks + X practitioner sentiment)
 
@@ -20,6 +20,20 @@ Backing data for the firm routing rules in SKILL.md. Read this when the user say
 - **Practitioner sentiment (X)**: Grok praised for terminal UX/speed on routine work despite lower peak quality; short autonomous stamina (beta) → avoid for >30 min runs. Fable praised for one-shot long-horizon/taste ("generational"); safety-refuses security-adjacent tasks → Opus fallback there. Heavy users noted GPT-5.5 instruction drift; GPT-5.6 reportedly fixes it.
 - **Grok context ceiling**: 256k → Codex for bulk exploration beyond that.
 - **Thresholds**: no published hard numbers; consensus ≈ scoped/low-ambiguity/≲2k LOC/few files → delegate.
+
+## Evidence snapshot — Grok 4.5 (research run 2026-07-09; model released 2026-07-08)
+
+Verdict: promoted Grok from fallback/small-task pick to **co-default executor**.
+
+- **SWE-bench Verified** (independent, vals.ai): Grok 4.5 86.6% — behind Fable ~95% / Opus 88.6%, but ~$0.54 and ~200s per task.
+- **SWE-bench Pro**: Grok 4.5 64.7% vs Fable 80.4% → Claude-side boundary unchanged; hardest multi-file/global-consistency stays with Fable. Beats GPT-5.5 (58.6%) here though.
+- **Terminal-Bench 2.1**: Grok 4.5 83.3% ≈ GPT-5.5 83.4% → CI/terminal now a tie; Codex kept as default there only by incumbency.
+- **DeepSWE 1.1** (mini-swe-agent): Grok 53% vs GPT-5.5 67% / Fable 70% → Codex keeps "hardest delegable, first-pass matters" tasks.
+- **Token efficiency**: ~15.9k output tokens/task vs Opus ~67k (4.2×) → drives bulk-exploration + high-volume routing to Grok.
+- **Stamina fixed**: RL on long multi-step SE tasks + Cursor data flywheel; old >30-min autonomous weakness no longer applies (vendor claim + early practitioner consensus, low volume).
+- **Context**: 500k native (old 256k ceiling gone; 1M planned). Cursor client caps at 256k; CLI/API get full 500k.
+- **Sentiment (X, early)**: strongly positive on speed/flow/agentic endurance; recurring caveat — fast but occasionally less nuanced than Fable on diagnosis. Too new for production-longevity data; re-check in a quarter.
+- **Caveats**: mostly vendor/launch-window numbers, independent replication thin; test writing stays Codex (no Aider Polyglot number published for 4.5 yet).
 
 ## How to update this skill
 

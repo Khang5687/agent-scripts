@@ -9,7 +9,7 @@ Claude Code sessions only. Codex/other harnesses: skip; never self-delegate.
 
 Rationale: Claude (Fable/Opus) tokens metered + expensive; Codex flat-rate. GPT-5.5+ is usually the better and faster model at writing/implementing code; Claude wins at ergonomics — judgment, design, spec-writing, review, orchestration. So Codex types, Claude thinks and verifies.
 
-Grok CLI (`grok`, model `grok-composer-2.5-fast`) is a second flat-rate executor, same role as Codex: it types, Claude thinks and verifies. Use it two ways:
+Grok CLI (`grok`, model `grok-4.5`) is a second flat-rate executor, same role as Codex: it types, Claude thinks and verifies. Use it two ways:
 
 - **Fallback** — Codex run fails/errors with a usage-limit or quota message → resume the same task on Grok instead of stalling. Give Grok the same spec; if Codex had already made partial progress, tell Grok what's done and what's left (git diff/status is enough context, no need to replay history).
 - **Free pick** — for a given task, pick per the executor table below, or split independent subtasks across both in parallel (separate repos/worktrees/dirs, like parallel Codex runs).
@@ -20,12 +20,15 @@ Evidence + update procedure (for "update codex-first skill" requests): `referenc
 
 | Task type | Executor |
 |---|---|
-| Test writing; CI/tooling; terminal/infra/computer-use; anything long-autonomous (>30 min) | **Codex** (Terminal-Bench + Aider lead; determined runs) |
-| Simple bugfix, routine feature, rapid prototyping, scoped refactor, high-volume bursts | **Grok** (fastest iteration; quality gap irrelevant at this size) |
-| Bulk exploration needing >256k context | **Codex** (Grok context ceiling) |
-| Everything else delegable | **Codex** (default) |
+| Simple bugfix, routine feature, prototyping, scoped refactor, greenfield build-out, high-volume bursts | **Grok 4.5** (fastest iteration + 4× token efficiency; Cursor-data real-workflow fit) |
+| Bulk codebase exploration | **Grok 4.5** (token efficiency; 500k context) |
+| Long autonomous runs (>30 min) | **Grok 4.5** (RL-trained stamina — old short-run weakness is fixed) or **Codex**, either fine |
+| Test writing | **Codex** (Aider Polyglot lead) |
+| CI/tooling; terminal/infra/computer-use | Either — near-tie (Terminal-Bench 83.4 vs 83.3); default Codex |
+| Hardest delegable tasks where first-pass solve rate matters most | **Codex** (edges Grok on some hard harnesses; DeepSWE 1.1: 67 vs 53) |
+| Exploration needing >500k context | **Codex** (Grok context ceiling, was 256k pre-4.5) |
 
-Grok is a real first pick for small routine work, not just fallback — but avoid it for long autonomous runs and complex multi-file tasks (short-run stamina, lower peak quality). Fallback rule unchanged: Codex quota/failure → resume on Grok.
+Grok 4.5 (July 2026) is a co-default, not a fallback: it wins on throughput/cost for most routine-to-medium work; Codex wins on peak solve rate and tests. Fallback rule unchanged and now symmetric: quota/failure on one → resume the task on the other.
 
 ### Claude does it itself (don't delegate)
 
@@ -101,7 +104,7 @@ Same prompt-via-temp-file discipline as Codex. Grok has no `-o` file flag; redir
 P=$(mktemp); cat >"$P" <<'EOF'
 <same spec contract as the Codex prompt below>
 EOF
-grok --no-alt-screen -m grok-composer-2.5-fast --always-approve \
+grok --no-alt-screen -m grok-4.5 --always-approve \
   --cwd <repo> --output-format plain \
   -p "$(cat "$P")" >/tmp/grok-last.md 2>/dev/null
 ```
