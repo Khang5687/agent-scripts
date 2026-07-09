@@ -53,10 +53,48 @@ def load(path):
         return json.load(f)
 
 
+LOCK_PATH = os.path.expanduser("~/.codex-switcher/.switch.lock")
+NOT_INSTALLED = 4  # exit code: no store — caller should treat as single-account mode
+
+
 def load_store():
     if not os.path.exists(STORE_PATH):
-        die(f"no accounts store at {STORE_PATH} (is codex-switcher set up?)")
-    return load(STORE_PATH)
+        die(f"no accounts store at {STORE_PATH} — codex-switcher not set up; "
+            "single-account mode (nothing to rotate)", NOT_INSTALLED)
+    try:
+        return load(STORE_PATH)
+    except json.JSONDecodeError as e:
+        die(f"accounts store is corrupt ({e}); fix or restore from "
+            "~/.codex-switcher/backups/ — refusing to touch it")
+
+
+class SwitchLock:
+    """Guards against two parallel lanes rotating at once. Stale after 30s."""
+
+    def __enter__(self):
+        deadline = time.time() + 10
+        while True:
+            try:
+                fd = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, str(os.getpid()).encode())
+                os.close(fd)
+                return self
+            except FileExistsError:
+                try:
+                    if time.time() - os.path.getmtime(LOCK_PATH) > 30:
+                        os.unlink(LOCK_PATH)  # stale
+                        continue
+                except OSError:
+                    continue
+                if time.time() > deadline:
+                    die("another switch is in progress (lock held >10s)", 2)
+                time.sleep(0.2)
+
+    def __exit__(self, *exc):
+        try:
+            os.unlink(LOCK_PATH)
+        except OSError:
+            pass
 
 
 def die(msg, code=1):
@@ -136,24 +174,27 @@ def do_switch(store, target):
 
 
 def cmd_switch(name):
-    store = load_store()
-    target = next((a for a in store["accounts"] if a["name"] == name), None)
-    if target is None:
-        die(f"account '{name}' not found; have: "
-            + ", ".join(a["name"] for a in store["accounts"]))
-    do_switch(store, target)
+    with SwitchLock():
+        store = load_store()
+        target = next((a for a in store["accounts"] if a["name"] == name), None)
+        if target is None:
+            die(f"account '{name}' not found; have: "
+                + ", ".join(a["name"] for a in store["accounts"]))
+        do_switch(store, target)
 
 
 def cmd_next():
-    store = load_store()
-    masked = set(store.get("masked_account_ids", []))
-    aid = store.get("active_account_id")
-    candidates = [a for a in store["accounts"] if a["id"] not in masked and a["id"] != aid]
-    if not candidates:
-        die("no other unmasked account to rotate to", 2)
-    # least-recently-used first
-    candidates.sort(key=lambda a: a.get("last_used_at") or "")
-    do_switch(store, candidates[0])
+    with SwitchLock():
+        store = load_store()
+        masked = set(store.get("masked_account_ids", []))
+        aid = store.get("active_account_id")
+        candidates = [a for a in store["accounts"]
+                      if a["id"] not in masked and a["id"] != aid]
+        if not candidates:
+            die("no other unmasked account to rotate to (single-account mode)", 2)
+        # least-recently-used first
+        candidates.sort(key=lambda a: a.get("last_used_at") or "")
+        do_switch(store, candidates[0])
 
 
 def cmd_list():
@@ -218,8 +259,9 @@ def cmd_status():
     rl = snap["rl"]
     p = rl.get("primary") or {}
     s = rl.get("secondary") or {}
-    p_pct = p.get("used_percent", "?")
-    s_pct = s.get("used_percent", "?")
+    # field name varies across codex versions
+    p_pct = p.get("used_percent", p.get("used_percentage", "?"))
+    s_pct = s.get("used_percent", s.get("used_percentage", "?"))
     print(f"account={name} 5h={p_pct}% weekly={s_pct}% snapshot_age={snap['age_s']}s")
     # exit 3 when hot, so callers can `|| switch`
     try:
