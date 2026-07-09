@@ -6,10 +6,18 @@ update_account_chatgpt_tokens + touch_account), so the app and this script can
 be used interchangeably without desyncing each other.
 
 Commands:
-  status          active account + latest local rate-limit snapshot (5h/weekly %)
-  list            all accounts with active marker
+  status          active account + latest local rate-limit snapshot (5h/weekly %);
+                  also records the observation into the local usage ledger
+  list [--json]   all accounts; --json adds plan, ledger observations, and flags
   next            sync back current tokens, rotate to least-recently-used account
   switch <name>   sync back current tokens, switch to the named account
+  mark <name> <5h|weekly|no-sol|auth-failed>   record a quota/capability event
+  clear <name>    remove all flags for an account
+
+The ledger (~/.codex-switcher/usage-ledger.json) is a sidecar this script owns;
+codex-switcher never reads it. It holds last-known usage per account so an
+orchestrator can pick accounts despite stale knowledge. Decisions live in the
+caller; this script only records facts and performs switches.
 
 Token safety: before any switch, tokens currently in ~/.codex/auth.json are
 copied back into accounts.json for the account they belong to (matched by
@@ -54,7 +62,24 @@ def load(path):
 
 
 LOCK_PATH = os.path.expanduser("~/.codex-switcher/.switch.lock")
+LEDGER_PATH = os.path.expanduser("~/.codex-switcher/usage-ledger.json")
 NOT_INSTALLED = 4  # exit code: no store — caller should treat as single-account mode
+VALID_MARKS = ("5h", "weekly", "no-sol", "auth-failed")
+
+
+def load_ledger():
+    try:
+        return load(LEDGER_PATH)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_ledger(ledger):
+    atomic_write(LEDGER_PATH, ledger)
+
+
+def ledger_entry(ledger, account_id):
+    return ledger.setdefault(account_id, {"flags": {}})
 
 
 def load_store():
@@ -197,14 +222,36 @@ def cmd_next():
         do_switch(store, candidates[0])
 
 
-def cmd_list():
+def cmd_list(as_json=False):
     store = load_store()
     aid = store.get("active_account_id")
     masked = set(store.get("masked_account_ids", []))
+    if not as_json:
+        for a in store["accounts"]:
+            flags = ("*" if a["id"] == aid else " ") + ("m" if a["id"] in masked else " ")
+            print(f"{flags} {a['name']}\t{a.get('plan_type') or '?'}\t"
+                  f"last_used={a.get('last_used_at') or 'never'}")
+        return
+    ledger = load_ledger()
+    out = []
     for a in store["accounts"]:
-        flags = ("*" if a["id"] == aid else " ") + ("m" if a["id"] in masked else " ")
-        print(f"{flags} {a['name']}\t{a.get('plan_type') or '?'}\t"
-              f"last_used={a.get('last_used_at') or 'never'}")
+        led = ledger.get(a["id"], {})
+        obs_ts = led.get("ts")
+        out.append({
+            "name": a["name"],
+            "plan": a.get("plan_type"),
+            "active": a["id"] == aid,
+            "masked": a["id"] in masked,
+            "subscription_expires_at": a.get("subscription_expires_at"),
+            "last_used_at": a.get("last_used_at"),
+            "last_observed": {
+                "5h_pct": led.get("h5"), "weekly_pct": led.get("weekly"),
+                "ts": obs_ts,
+                "age_s": int(time.time() - obs_ts) if obs_ts else None,
+            },
+            "flags": led.get("flags", {}),
+        })
+    print(json.dumps(out, indent=1))
 
 
 def latest_rate_limits():
@@ -263,12 +310,54 @@ def cmd_status():
     p_pct = p.get("used_percent", p.get("used_percentage", "?"))
     s_pct = s.get("used_percent", s.get("used_percentage", "?"))
     print(f"account={name} 5h={p_pct}% weekly={s_pct}% snapshot_age={snap['age_s']}s")
+    # record the observation for the active account
+    if act is not None and isinstance(p_pct, (int, float)):
+        ledger = load_ledger()
+        e = ledger_entry(ledger, act["id"])
+        e["h5"] = p_pct
+        if isinstance(s_pct, (int, float)):
+            e["weekly"] = s_pct
+        e["ts"] = int(time.time()) - snap["age_s"]
+        save_ledger(ledger)
     # exit 3 when hot, so callers can `|| switch`
     try:
         if float(p_pct) >= 85 or float(s_pct) >= 95:
             sys.exit(3)
     except (TypeError, ValueError):
         pass
+
+
+def account_by_name(store, name):
+    a = next((a for a in store["accounts"] if a["name"] == name), None)
+    if a is None:
+        die(f"account '{name}' not found; have: "
+            + ", ".join(x["name"] for x in store["accounts"]))
+    return a
+
+
+def cmd_mark(name, event):
+    if event not in VALID_MARKS:
+        die(f"mark must be one of {'/'.join(VALID_MARKS)}", 2)
+    store = load_store()
+    a = account_by_name(store, name)
+    ledger = load_ledger()
+    e = ledger_entry(ledger, a["id"])
+    e["flags"][event] = int(time.time())
+    if event == "5h":
+        e["h5"] = 100.0
+    if event == "weekly":
+        e["weekly"] = 100.0
+    save_ledger(ledger)
+    print(f"marked {name}: {event}")
+
+
+def cmd_clear(name):
+    store = load_store()
+    a = account_by_name(store, name)
+    ledger = load_ledger()
+    ledger.pop(a["id"], None)  # forget flags AND observations (marks seed h5/weekly)
+    save_ledger(ledger)
+    print(f"cleared ledger entry for {name}")
 
 
 def main():
@@ -279,13 +368,21 @@ def main():
     if cmd == "status":
         cmd_status()
     elif cmd == "list":
-        cmd_list()
+        cmd_list(as_json="--json" in args)
     elif cmd == "next":
         cmd_next()
     elif cmd == "switch":
         if len(args) < 2:
             die("switch requires an account name", 2)
         cmd_switch(args[1])
+    elif cmd == "mark":
+        if len(args) < 3:
+            die("usage: mark <name> <5h|weekly|no-sol|auth-failed>", 2)
+        cmd_mark(args[1], args[2])
+    elif cmd == "clear":
+        if len(args) < 2:
+            die("clear requires an account name", 2)
+        cmd_clear(args[1])
     else:
         die(f"unknown command '{cmd}'", 2)
 
