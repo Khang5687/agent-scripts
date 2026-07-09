@@ -7,12 +7,18 @@ be used interchangeably without desyncing each other.
 
 Commands:
   status          active account + latest local rate-limit snapshot (5h/weekly %);
-                  also records the observation into the local usage ledger
-  list [--json]   all accounts; --json adds plan, ledger observations, and flags
-  next            sync back current tokens, rotate to least-recently-used account
-  switch <name>   sync back current tokens, switch to the named account
-  mark <name> <5h|weekly|no-sol|auth-failed>   record a quota/capability event
-  clear <name>    remove all flags for an account
+                  records the observation (only if it postdates the last switch)
+  list [--json]   all accounts; --json adds plan, observations, flags, eligible
+  next [--force]  rotate to the least-recently-used ELIGIBLE account
+  switch <name> [--force]   switch to the named account
+  mark <name> <5h|weekly|no-sol|auth-failed>   record a quota/capability event;
+                  5h/weekly marks self-expire at the window reset (from the
+                  latest snapshot, else now+5h / now+7d) — no manual clear needed
+  clear <name>    forget the account's ledger entry (admin use)
+
+Exit codes: 0 ok · 1 error · 2 usage/no-account · 3 hot (5h>=85 or weekly>=95)
+· 4 store missing (single-account mode) · 5 no usable snapshot · 6 refused:
+codex processes running (switch would yank auth from under them; --force overrides)
 
 The ledger (~/.codex-switcher/usage-ledger.json) is a sidecar this script owns;
 codex-switcher never reads it. It holds last-known usage per account so an
@@ -25,9 +31,11 @@ account_id) — codex CLI rotates refresh tokens, and losing the newest one
 would invalidate the stored copy. All writes are atomic (temp + rename), 0600.
 """
 
+import fcntl
 import glob
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -80,6 +88,45 @@ def save_ledger(ledger):
 
 def ledger_entry(ledger, account_id):
     return ledger.setdefault(account_id, {"flags": {}})
+
+
+class LedgerLock:
+    """flock around every ledger read-modify-write; prevents lost updates."""
+
+    def __enter__(self):
+        os.makedirs(os.path.dirname(LEDGER_PATH), exist_ok=True)
+        self.fd = os.open(LEDGER_PATH + ".flock", os.O_CREAT | os.O_WRONLY)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.fd, fcntl.LOCK_UN)
+        os.close(self.fd)
+
+
+def active_flags(flags, now):
+    """Flag value = expires_at epoch (0 = never expires)."""
+    return {k: v for k, v in flags.items() if v == 0 or now < v}
+
+
+def live_codex_pids():
+    """PIDs of running `codex exec` processes (pgrep -f is unreliable on macOS)."""
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,command="],
+                             capture_output=True, text=True, timeout=5)
+    except Exception:
+        return []
+    me = os.getpid()
+    pids = []
+    for line in out.stdout.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2:
+            continue
+        pid, command = parts
+        if "codex exec" in command and "codex-account" not in command \
+                and int(pid) != me:
+            pids.append(pid)
+    return pids
 
 
 def load_store():
@@ -188,35 +235,70 @@ def write_auth(account):
     atomic_write(AUTH_PATH, auth)
 
 
+def guard_live_processes(force):
+    pids = live_codex_pids()
+    if pids and not force:
+        die("refusing to switch: codex processes running (pids "
+            + ",".join(pids) + ") — switching would yank auth from under them; "
+            "wait, use per-lane CODEX_HOME, or --force", 6)
+
+
 def do_switch(store, target):
     synced = sync_back(store)
     write_auth(target)
     store["active_account_id"] = target["id"]
     target["last_used_at"] = now_rfc3339()
     atomic_write(STORE_PATH, store)
+    with LedgerLock():
+        ledger = load_ledger()
+        ledger.setdefault("_meta", {})["last_switch_ts"] = int(time.time())
+        save_ledger(ledger)
     prev = " (tokens synced back)" if synced else ""
     print(f"switched to {target['name']}{prev}")
 
 
-def cmd_switch(name):
+def is_eligible(a, led, masked, now):
+    if a["id"] in masked:
+        return False
+    sub = a.get("subscription_expires_at")
+    if sub:
+        try:
+            if datetime.fromisoformat(sub.replace("Z", "+00:00")).timestamp() < now:
+                return False
+        except ValueError:
+            pass
+    if active_flags(led.get("flags", {}), now):
+        return False
+    h5, h5_reset = led.get("h5"), led.get("h5_resets_at")
+    eff_h5 = 0.0 if (h5 is not None and h5_reset and now > h5_reset) else h5
+    wk, wk_reset = led.get("weekly"), led.get("weekly_resets_at")
+    eff_wk = 0.0 if (wk is not None and wk_reset and now > wk_reset) else wk
+    if (eff_h5 is not None and eff_h5 >= 85) or (eff_wk is not None and eff_wk >= 95):
+        return False
+    return True
+
+
+def cmd_switch(name, force=False):
     with SwitchLock():
+        guard_live_processes(force)
         store = load_store()
-        target = next((a for a in store["accounts"] if a["name"] == name), None)
-        if target is None:
-            die(f"account '{name}' not found; have: "
-                + ", ".join(a["name"] for a in store["accounts"]))
-        do_switch(store, target)
+        do_switch(store, account_by_name(store, name))
 
 
-def cmd_next():
+def cmd_next(force=False):
     with SwitchLock():
+        guard_live_processes(force)
         store = load_store()
         masked = set(store.get("masked_account_ids", []))
         aid = store.get("active_account_id")
+        ledger = load_ledger()
+        now = time.time()
         candidates = [a for a in store["accounts"]
-                      if a["id"] not in masked and a["id"] != aid]
+                      if a["id"] != aid
+                      and is_eligible(a, ledger.get(a["id"], {}), masked, now)]
         if not candidates:
-            die("no other unmasked account to rotate to (single-account mode)", 2)
+            die("no other ELIGIBLE account to rotate to "
+                "(all flagged/hot/masked/expired, or single-account mode)", 2)
         # least-recently-used first
         candidates.sort(key=lambda a: a.get("last_used_at") or "")
         do_switch(store, candidates[0])
@@ -243,12 +325,7 @@ def cmd_list(as_json=False):
         eff_h5 = 0.0 if (h5 is not None and h5_reset and now > h5_reset) else h5
         wk, wk_reset = led.get("weekly"), led.get("weekly_resets_at")
         eff_wk = 0.0 if (wk is not None and wk_reset and now > wk_reset) else wk
-        flags = dict(led.get("flags", {}))
-        # a weekly/5h cap flag expires once that window has reset
-        if "weekly" in flags and wk_reset and now > wk_reset:
-            flags["weekly"] = "expired"
-        if "5h" in flags and h5_reset and now > h5_reset:
-            flags["5h"] = "expired"
+        flags = active_flags(led.get("flags", {}), now)  # expired flags dropped
         out.append({
             "name": a["name"],
             "plan": a.get("plan_type"),
@@ -266,6 +343,7 @@ def cmd_list(as_json=False):
                 "5h_resets_at": h5_reset, "weekly_resets_at": wk_reset,
             },
             "flags": flags,
+            "eligible": is_eligible(a, led, masked, now),
         })
     print(json.dumps(out, indent=1))
 
@@ -318,7 +396,14 @@ def cmd_status():
     snap = latest_rate_limits()
     if snap is None:
         print(f"account={name} 5h=? weekly=? (no rate_limits snapshot found)")
-        return
+        sys.exit(5)
+    # ownership guard: a snapshot from before the last account switch belongs
+    # to the PREVIOUS account — never attribute it to the current one
+    last_switch = load_ledger().get("_meta", {}).get("last_switch_ts", 0)
+    if time.time() - snap["age_s"] < last_switch:
+        print(f"account={name} 5h=? weekly=? "
+              "(latest snapshot predates the account switch — run codex once to refresh)")
+        sys.exit(5)
     rl = snap["rl"]
     p = rl.get("primary") or {}
     s = rl.get("secondary") or {}
@@ -328,17 +413,18 @@ def cmd_status():
     print(f"account={name} 5h={p_pct}% weekly={s_pct}% snapshot_age={snap['age_s']}s")
     # record the observation for the active account
     if act is not None and isinstance(p_pct, (int, float)):
-        ledger = load_ledger()
-        e = ledger_entry(ledger, act["id"])
-        e["h5"] = p_pct
-        if isinstance(s_pct, (int, float)):
-            e["weekly"] = s_pct
-        e["ts"] = int(time.time()) - snap["age_s"]
-        if p.get("resets_at"):
-            e["h5_resets_at"] = p["resets_at"]
-        if s.get("resets_at"):
-            e["weekly_resets_at"] = s["resets_at"]
-        save_ledger(ledger)
+        with LedgerLock():
+            ledger = load_ledger()
+            e = ledger_entry(ledger, act["id"])
+            e["h5"] = p_pct
+            if isinstance(s_pct, (int, float)):
+                e["weekly"] = s_pct
+            e["ts"] = int(time.time()) - snap["age_s"]
+            if p.get("resets_at"):
+                e["h5_resets_at"] = p["resets_at"]
+            if s.get("resets_at"):
+                e["weekly_resets_at"] = s["resets_at"]
+            save_ledger(ledger)
     # exit 3 when hot, so callers can `|| switch`
     try:
         if float(p_pct) >= 85 or float(s_pct) >= 95:
@@ -360,23 +446,38 @@ def cmd_mark(name, event):
         die(f"mark must be one of {'/'.join(VALID_MARKS)}", 2)
     store = load_store()
     a = account_by_name(store, name)
-    ledger = load_ledger()
-    e = ledger_entry(ledger, a["id"])
-    e["flags"][event] = int(time.time())
-    if event == "5h":
-        e["h5"] = 100.0
-    if event == "weekly":
-        e["weekly"] = 100.0
-    save_ledger(ledger)
-    print(f"marked {name}: {event}")
+    now = int(time.time())
+    expires = 0  # never (no-sol, auth-failed: cleared manually or by re-add)
+    if event in ("5h", "weekly"):
+        # prefer the real reset time — the quota-failing run just wrote a snapshot
+        snap = latest_rate_limits()
+        window = "primary" if event == "5h" else "secondary"
+        resets = (snap["rl"].get(window) or {}).get("resets_at") if snap else None
+        if not resets or resets <= now:
+            resets = now + (5 * 3600 if event == "5h" else 7 * 86400)
+        expires = resets
+    with LedgerLock():
+        ledger = load_ledger()
+        e = ledger_entry(ledger, a["id"])
+        e["flags"][event] = expires
+        if event == "5h":
+            e["h5"] = 100.0
+            e["h5_resets_at"] = expires
+        elif event == "weekly":
+            e["weekly"] = 100.0
+            e["weekly_resets_at"] = expires
+        save_ledger(ledger)
+    until = "" if expires == 0 else f" (self-expires {datetime.fromtimestamp(expires, timezone.utc).isoformat()})"
+    print(f"marked {name}: {event}{until}")
 
 
 def cmd_clear(name):
     store = load_store()
     a = account_by_name(store, name)
-    ledger = load_ledger()
-    ledger.pop(a["id"], None)  # forget flags AND observations (marks seed h5/weekly)
-    save_ledger(ledger)
+    with LedgerLock():
+        ledger = load_ledger()
+        ledger.pop(a["id"], None)  # forget flags AND observations (marks seed h5/weekly)
+        save_ledger(ledger)
     print(f"cleared ledger entry for {name}")
 
 
@@ -390,11 +491,12 @@ def main():
     elif cmd == "list":
         cmd_list(as_json="--json" in args)
     elif cmd == "next":
-        cmd_next()
+        cmd_next(force="--force" in args)
     elif cmd == "switch":
-        if len(args) < 2:
+        names = [a for a in args[1:] if not a.startswith("--")]
+        if not names:
             die("switch requires an account name", 2)
-        cmd_switch(args[1])
+        cmd_switch(names[0], force="--force" in args)
     elif cmd == "mark":
         if len(args) < 3:
             die("usage: mark <name> <5h|weekly|no-sol|auth-failed>", 2)
