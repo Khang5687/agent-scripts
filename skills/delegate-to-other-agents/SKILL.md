@@ -7,30 +7,32 @@ description: "Route implementation work to flat-rate executors (Codex CLI, Grok 
 
 Claude Code sessions only. Codex/other harnesses: skip; never self-delegate.
 
-Claude tokens are metered; Codex CLI (GPT-5.5) and Grok CLI (grok-4.5) are flat-rate and good enough for scoped work. Claude's edge — judgment, design, spec-writing, review, hard multi-file work — is reserved for where it pays. Executors type; Claude thinks and verifies.
+Metered Claude: design, plan, review, verify, hard/taste/global work. Flat-rate Codex CLI (GPT-5.5) and Grok CLI (grok-4.5): scoped implementation.
 
-Evidence + update procedure (for "update this skill" requests): `references/routing-evidence.md`. Rules here are firm verdicts; benchmark numbers live there.
+Firm rules below. Benchmarks + update procedure: `references/routing-evidence.md` (read only when updating this skill).
 
 ## 1. Know your model
 
-Check the harness-declared model in your environment context ("You are powered by the model named ..."). Trust only that declaration — never self-perception. No trusted declaration → follow the Opus row, and when in doubt on review, spawn rather than self-accept.
+Check the harness-declared model in your environment context ("You are powered by the model named ..."). Trust only that declaration — never self-perception. No trusted declaration → follow the Sonnet row (over-delegation is cheap; an unidentified weak model doing the hardest work is not).
+
+Tier order (high→low): fable > opus > sonnet > haiku.
 
 | You are | Shift |
 |---|---|
-| **Fable 5** | Baseline rules. Do the hardest/taste-sensitive work yourself. |
-| **Opus 4.8** | Same; optional fable subagent for pure-feature multi-file ceiling work (never debug/security-flavored). |
-| **Sonnet 5** | Delegate more: direct-impl bar drops to trivial edits; medium+ implementation → executors; spawn opus for adversarial/security review. |
+| **Fable 5** | Baseline. Hardest taste/feature work yourself; debug/security-heavy work → prefer opus (classifier — §4 fable row). |
+| **Opus 4.8** | Baseline; optional fable subagent for pure-feature multi-file ceiling work (§4 fable constraints). |
+| **Sonnet 5** | Delegate more: direct-impl bar drops to trivial one-liners; medium+ implementation → executors; adversarial review → spawn opus. |
 | **Haiku** | Pure dispatcher: implement nothing non-trivial; spawn opus/sonnet for planning and review. |
 
 ## 2. Keep or delegate?
 
 Ordered checks — stop at the first hit:
 
-1. **Keep in Claude**: needs session tools (MCP/browser/1Password/secrets — main session or Claude subagent, never an executor); remote mutations (push/release/GitHub) per git rules; design/API/architecture/naming/UX judgment; tiny edits (<20 lines); review of executor output.
-2. **Plan first.** Never ship a spec or accept a diff nobody understood. Before any executor prompt, you (or a stronger spawned tier) must hold a concrete plan: files that change, approach, verification command. Depth scales with risk — trivial/mechanical needs only repro + verify command; medium+ needs the full bar. Can't meet the bar at your tier → spawn a stronger tier (opus, or fable if classifier-safe) to plan/review and dispatch from its plan; unavailable → walk down the chain; no tier meets it → halt and report. Plan can't be frozen at all → Claude does it (or designs, freezes, delegates the remainder).
-3. **Delegate** when scoped, low-ambiguity, ≲2k LOC, and free of global invariants / concurrency / taste-sensitive polish — those stay with Claude even under 2k LOC.
+1. **Keep in Claude**: needs session tools (MCP/browser/1Password/secrets — main session or Claude subagent, never an executor); remote mutations (push/release/GitHub — Claude does these itself in the main session); design/API/architecture/naming/UX judgment; tiny edits per your tier (Fable/Opus <20 lines; Sonnet trivial one-liners; Haiku none); review of executor output.
+2. **Plan first** before any executor prompt: files that change, approach, verify command (trivial tasks: repro + verify command only). Can't plan at your tier → spawn stronger (§4) to plan and dispatch from its plan; no available tier meets the bar → halt and report. Plan unfreezable → Claude implements (or designs until freezable, then delegates the remainder).
+3. **Delegate** when scoped, low-ambiguity, ≲2k LOC, and free of auth/security/privacy, data-loss/migration risk, global invariants, concurrency, and taste-sensitive polish — those stay with Claude even when small.
 
-Mixed task: Claude designs first, freezes spec, delegates build-out. Heuristic: prompt reads as a work order → delegate; writing it forces decisions → design, Claude. Portfolio/multi-repo work: `$maintainer-orchestrator` (if available).
+Mixed task: Claude designs first, freezes spec, delegates build-out. Portfolio/multi-repo: `$maintainer-orchestrator` if available; else one frozen plan, serial per-repo runs.
 
 ## 3. Executor pick
 
@@ -40,29 +42,31 @@ Mixed task: Claude designs first, freezes spec, delegates build-out. Heuristic: 
 | Bulk codebase exploration | **Grok** (500k context; beyond that, chunk by path globs) |
 | Test writing | **Codex** (unless tests need session fixtures/MCP → sonnet subagent) |
 | CI/tooling; terminal/infra | **Codex** |
-| Hardest delegable work where first-pass solve rate matters | **Codex** (peak solve rate) |
+| Delegable work at the top of the size band (near 2k LOC, multi-file) | **Codex** (peak solve rate) |
 
-Quota/failure on either → **restart** on the other: same spec, plus git diff/status as done/remaining context. Long autonomous runs (>30 min): either, in background.
+Quota/transport failure → **restart** on the other executor: same spec + git diff/status as done/remaining context. At most one such switch per side per task; both sides dead → sonnet subagent implements (§4) or Claude absorbs; none can → halt and report. No ping-pong.
 
 ## 4. Claude subagents
 
-Spawn (Agent tool, `model:`) when the task needs session tools, tight multi-turn state, or Claude reasoning depth; use executors for high-volume scoped one-shots.
+Spawn (Agent tool, `model:`) when the task needs session tools, tight multi-turn state, or Claude reasoning depth; executors for high-volume scoped one-shots.
 
 | Subagent task | Model |
 |---|---|
 | Bulk exploration/search; scoped impl from frozen spec; standard review | **sonnet** |
-| Adversarial verification; security-adjacent/deep review; architecture drafts | **opus** |
-| Hardest long-horizon runs — pure feature/creative only | **fable** (avoid debugging, security/auth, dual-use-adjacent prompts: classifier reroutes to Opus and breaks runs) |
+| Adversarial review; architecture drafts | **opus** |
+| Hardest long-horizon runs — pure feature/creative only | **fable** — avoid debugging, security/auth, dual-use-adjacent prompts (silent classifier reroute breaks runs). Mid-run symptoms (stall, style shift on a debug turn) → stop it; continue on opus with the same frozen plan + git diff. |
 
-Follow-ups: continue an existing subagent via SendMessage (agent ID/name) — it resumes with full context; never re-spawn fresh to iterate on the same task. Same 2-failed-rounds cap as executors. Fresh spawn only for a new task or when the session has drifted (agent contradicts its own earlier output).
+Follow-ups: continue an existing subagent via SendMessage (agent ID/name) — it resumes with full context; never re-spawn fresh to iterate on the same task. Fresh spawn only for a new task or a drifted session (agent contradicts its own earlier output).
 
-**Review policy (sole statement):** executor output is reviewed by Claude-family only — never by an external executor, never skipped. Self-review only when your tier ≥ the required tier for that review class; Sonnet/Haiku never self-accept adversarial/security review — spawn opus.
+**Review policy (sole statement):** executor output is reviewed by Claude-family only — never by an executor, never skipped. Adversarial-class = the diff touches auth/security/privacy, concurrency, migration/data-loss, global invariants, or was already rejected once → requires opus+. Everything else = standard → requires sonnet+. Self-review only when your tier ≥ the class floor; below it, spawn the minimum sufficient tier. Haiku never self-accepts any implementation review.
 
 ## 5. Invoke
 
-Executors start with zero session context. Spec = goal, exact repo/paths, constraints, non-goals, proof expected, output shape. Proof = exact verification command; no-run is acceptable only for docs/comment/rename changes with listed paths. Every prompt must include: "do not push, release, tag, or mutate remote state unless this prompt explicitly authorizes it."
+Preflight: `git status -sb`. Dirty tree → commit/stash first, or run the lane in a worktree — the post-run diff must be attributable to the executor alone.
 
-Codex — prompt via temp file, never inline quoting:
+Executors start with zero session context. Spec = goal, exact repo/paths, constraints, non-goals, proof expected, output shape. Proof = exact verification command (no-run only for docs/comment/rename changes with listed paths). Every prompt states local scope ("edit only <named files/areas>", or "do not edit files" for recon) and includes: "do not push, release, tag, open/merge PRs, publish, or otherwise mutate remote state." Never include credentials, tokens, or content from session tools (1Password, MCP, private browser state) in an executor spec.
+
+Codex — prompt via temp file, never inline:
 
 ```bash
 P=$(mktemp); cat >"$P" <<'EOF'
@@ -70,49 +74,48 @@ P=$(mktemp); cat >"$P" <<'EOF'
 EOF
 command codex exec --yolo -C <repo> \
   -c model_reasoning_effort="high" \
-  -o /tmp/codex-last.md - <"$P" 2>/dev/null
+  -o /tmp/codex-last.md - <"$P" 2>/tmp/codex-err.log
 ```
 
 - `command codex` bypasses the zsh wrapper; not on PATH → `fnm exec --using default -- codex`. Outside a git repo add `--skip-git-repo-check`.
-- House model is GPT-5.5 — if the CLI default drifts, pin explicitly (`-c model=...`).
-- stderr suppressed (thinking noise); read the `-o` file, not the stream. Long runs: run_in_background; don't kill quiet runs <30 min.
+- Read the `-o` file, not the stream. Long runs: run_in_background; don't kill quiet runs <30 min; after 30 min quiet, check the `-o` file / git status — no progress across two checks → executor error, restart.
 
-Codex follow-ups (`resume` has no `-C`/`--yolo`; drop the bypass flag for read-only follow-ups — it's only needed when the follow-up edits files):
+Codex follow-ups (`resume` has no `-C`/`--yolo`; run from the repo dir):
 
 ```bash
 (cd <repo> && command codex exec resume --last \
-  --dangerously-bypass-approvals-and-sandbox \
-  -o /tmp/codex-last.md - <"$P2" 2>/dev/null)
+  -o /tmp/codex-last.md - <"$P2" 2>/tmp/codex-err.log)
 ```
 
-Grok — no `-o` flag (redirect stdout); no stdin prompt, so `$(cat)` is the unavoidable exception to the never-inline rule (keep specs well under ARG_MAX):
+Add `--dangerously-bypass-approvals-and-sandbox` only when the follow-up must edit files.
+
+Grok — no `-o` flag (redirect stdout); no stdin prompt, so `$(cat)` is the exception to never-inline. Oversized spec → make `-p` just "Read and execute the spec file at <path>":
 
 ```bash
 grok --no-alt-screen -m grok-4.5 --always-approve \
   --cwd <repo> --output-format plain \
-  -p "$(cat "$P")" >/tmp/grok-last.md 2>/dev/null
+  -p "$(cat "$P")" >/tmp/grok-last.md 2>/tmp/grok-err.log
 ```
 
 Grok follow-ups: `grok -c ...` (continues the most recent session for that cwd; `-r <id>` targets one).
 
 Resume rules: resume only the same executor in the same repo. `--last`/`-c` only when exactly one recent session exists there; after parallel/interleaved runs, resume by explicit session id or start fresh with git diff/status. Cross-executor is always a fresh run.
 
+Executor error (≠ failed round): non-zero exit, missing/empty output file, no diff when edits were expected, or the 30-min-quiet rule → read the err log, fix the invoke or switch executor.
+
 ## 6. Parallelize
 
-Independence test (all three, else serial): no shared files; no lane consumes another's output; no lane sets a convention others must follow.
-
-Pilot-then-fan-out for N similar tasks: run ONE serially, review to full standard, freeze the reviewed diff as the template in every remaining spec, then fan out N−1. Never fan out an unproven pattern.
+Independence test (all three, else serial): no shared files; no lane consumes another's output; no lane sets a convention others must follow. N similar tasks: pilot ONE → full review → freeze that diff as the template in the remaining specs → fan out N−1; never fan out an unproven pattern.
 
 Isolation: different repos → separate `--cwd`/`-C`. Same repo → one git worktree per lane (serialize instead if project rules forbid worktrees); Claude merges after review. Separate output files per lane.
 
-Caps: review is the bottleneck — max 3–4 implementation lanes; every diff still gets full review on landing. Read-only fan-out (exploration, multi-lens review) is uncapped and often raises quality.
+Caps: review is the bottleneck — max 3–4 implementation lanes; every diff gets full review on landing. Read-only fan-out (exploration, multi-lens review) is uncapped.
 
-Failures: one lane never blocks the others; failed lane → other executor or absorb into Claude. Merge conflict between lanes = the independence test failed: stop fanning, integrate directly.
+Failures: counters are per-lane — one lane never blocks the others; a lane at 2 failed rounds → absorb into Claude or drop that item. Merge conflict between lanes = the independence test failed: stop fanning, integrate directly.
 
 ## 7. Verify (always)
 
 - `git status -sb` + read the full diff; judge like a contributor PR.
 - Run focused verification yourself when feasible; executor claims are advisory.
-- Failed round = an attempt whose diff fails verify (tests fail or review rejects). Quota/error switches don't count; the counter never resets across executors. After 2 failed rounds: takeover by max(your tier, opus if spawnable) per the model table; none available → halt and report.
-- Don't ping-pong trivia through delegation; don't re-explore what the executor already summarized — still read the full diff.
-- Closeout: `$autoreview` before ship (if available).
+- Failed round = an attempt that (a) claims done but verify fails, (b) produces an empty/wrong-scope diff when edits were required, or (c) is rejected on review. Executor errors and quota switches don't count. The counter never resets across executors or subagents on the same task. After 2 failed rounds: takeover by max(your tier, opus if spawnable); none available → halt and report.
+- Closeout: `$autoreview` if available; else this full review is the closeout.

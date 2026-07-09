@@ -16,17 +16,7 @@ Orchestrator choice (user-facing, not agent-actionable mid-task): prefer Opus 4.
 
 2026-07-10: SKILL.md consolidated after adversarial 3-model review (Fable 5 high, GPT-5.5, Grok 4.5) — contradictions removed, benchmarks moved here, single decision flow.
 
-## Evidence snapshot (research run 2026-07-08, Grok Heavy: benchmarks + X practitioner sentiment)
-
-> **SUPERSEDED (2026-07-09) for Grok routing and orchestrator choice — see the two snapshots below. Do not cite the struck bullets for current routing.**
-
-- **SWE-bench Verified**: Fable 5 ~95%; Opus 4.8 ~88.6%; GPT-5.5 ~82–88.7%; grok-code-fast-1 ~70.8%.
-- **SWE-bench Pro** (harder, low leakage): Fable 5 80.3%; Opus 4.8 69.2%; GPT-5.5 58.6% → drives the "Claude does big multi-file work itself" rule.
-- **Terminal-Bench 2.1**: GPT-5.5 ~83.4% (lead/near-top); Fable 5 ~83.1%; Opus lower; Grok ~70.8% → drives "Codex for CI/tooling/terminal".
-- **Aider Polyglot**: GPT-5 series lead (~88%) → drives "Codex for test writing".
-- ~~**Practitioner sentiment (X)**: Grok short autonomous stamina (beta) → avoid for >30 min runs.~~ (superseded: stamina fixed in 4.5) Fable praised for one-shot long-horizon/taste ("generational"). Heavy users noted GPT-5.5 instruction drift; GPT-5.6 reportedly fixes it.
-- ~~**Grok context ceiling**: 256k → Codex for bulk exploration beyond that.~~ (superseded: 500k in 4.5)
-- **Thresholds**: no published hard numbers; consensus ≈ scoped/low-ambiguity/≲2k LOC/few files → delegate.
+Original 2026-07-08 snapshot removed (superseded by the two snapshots below; see git history). Still-current findings carried forward: SWE Pro gap Fable 80.3% vs GPT-5.5 58.6% (drives "Claude keeps hard multi-file work"); Aider Polyglot GPT-5 lead (drives "Codex for tests"); delegation threshold consensus ≈ scoped/low-ambiguity/≲2k LOC.
 
 ## Evidence snapshot — Grok 4.5 (research run 2026-07-09; model released 2026-07-08)
 
@@ -46,7 +36,7 @@ Verdict: promoted Grok from fallback/small-task pick to **co-default executor**.
 
 Verdict: Opus 4.8 becomes default orchestrator; Sonnet 5 default subagent worker; Fable reserved.
 
-- **Fable 5 "nerf"** (re-released ~2026-07-01 after US gov involvement): weights UNCHANGED (BridgeBench: pure-Fable tasks match June exactly). A broad safety classifier silently reroutes flagged prompts to Opus 4.8. BridgeBench post-drop (debugging 86.2%→25.9%, refactoring 73.6%→38.4%) is reroute artifact, not capability loss. Dev reports: 25–75% of coding sessions rerouted (Anthropic claims "small fraction" — contradicted by billing reports). Debugging + security-adjacent prompts trigger most; pure feature/creative work mostly unaffected. Net: pay Fable rate for Opus output + broken autonomous runs → Fable no longer default.
+- **Fable 5 reroute risk** (post ~2026-07-01 re-release): a safety classifier silently reroutes debugging/refactor/security-adjacent prompts to Opus 4.8 — Fable-rate billing for Opus output, and mid-run switches break long autonomous runs. Pure feature/creative work mostly unaffected. Reroute frequency is contested (vendor: "small fraction"; dev billing reports: 25–75% of coding sessions). Net: Fable no longer default; use only for pure feature/creative ceiling work.
 - **Sonnet 5** (launched ~2026-06-30, $2/$10 intro ≈ 1/5 Opus): SWE-bench Verified ~85.2% (Opus 88.6%), SWE Pro 63.2% (Opus 69.2%), Terminal-Bench 2.1 **80.4% beats Opus 74.6%**. Sufficient for exploration, tests, scoped impl, standard review. Weaknesses: safeguard-weakened on exploit/cyber; tokenizer inflates code tokens 1–1.35×; shallower on hardest ambiguous work.
 - **Opus 4.8 as middle tier**: consistent depth, no classifier friction, wins adversarial/security verification and architecture drafts. 2–5× Sonnet cost.
 - **Hybrid pattern** (Anthropic-endorsed): flagship orchestrator + Sonnet workers = 92–96% of top-tier perf at 46–63% cost.
@@ -56,7 +46,7 @@ Verdict: Opus 4.8 becomes default orchestrator; Sonnet 5 default subagent worker
 ## How to update this skill
 
 1. Re-run research. Copy-paste prompt for the research agent (Grok Heavy or similar) is below — swap in the current model/harness names first.
-2. From results, update in SKILL.md: the **Executor pick** table, the **Claude does it itself** list + threshold, and the Fable-vs-Opus (or successor) note.
+2. From results, update in SKILL.md: §3 Executor pick table; §2 keep/delegate checks + LOC/ambiguity bar; §1 model shift rows; §4 subagent tiers + classifier caveat.
 3. Update this file: lineup table, evidence snapshot (keep dated), and prune stale claims.
 4. Keep the rules firm — verdicts per task type, not "use judgment". Flag contradictory evidence rather than silently picking a side.
 
