@@ -1,7 +1,7 @@
 # Routing evidence & update procedure
 
-Backing data for the firm routing rules in SKILL.md. Read this when the user says
-"update codex-first skill" (new models, new harnesses, new evidence).
+Backing data for the firm routing rules in SKILL.md. NOT for mid-task routing. Read this
+when the user asks to update the delegation skill (new models, new harnesses, new evidence).
 
 ## Current lineup (as of 2026-07-09)
 
