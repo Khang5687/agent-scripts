@@ -41,7 +41,19 @@ Beyond the existing "Keep in Claude" list, Claude (Fable/Opus) implements direct
 
 Rough threshold: scoped, low-ambiguity, ≲2k LOC / a few files → delegate; big, ambiguous, or taste-sensitive → Claude.
 
-Fable vs Opus: Fable for the hardest/longest/taste-sensitive work; Opus as the cheaper executor for routine-to-medium Claude-side work, or when Fable safety-refuses (common on security-adjacent tasks — Opus wins security review/auditing outright).
+Fable vs Opus (updated post re-release, July 2026): Fable's weights are unchanged but a broad safety classifier now silently reroutes flagged prompts (debugging, security-adjacent, dual-use-ish) to Opus 4.8 — you pay Fable rates for Opus output, and mid-task switches break autonomous runs. So: **Opus 4.8 is the default orchestrator/direct implementer**; reserve Fable for the hardest long-horizon/taste-sensitive work where its ceiling matters and the prompt is unlikely to trigger the classifier (pure feature/creative work, not debugging or security). Opus wins security review/auditing outright.
+
+### Claude subagent tiers (spawn rules)
+
+When Claude spawns subagents (Agent tool, `model:` param), pick the tier by task — subagents keep session tools/MCP, which Codex/Grok never get:
+
+| Subagent task | Model |
+|---|---|
+| Bulk exploration/search; test writing; scoped impl from frozen spec; standard code review | **sonnet** (85–95% of Opus at ~1/5 cost; beats Opus on Terminal-Bench 80.4 vs 74.6) |
+| Adversarial verification; security-adjacent review; deep/complex review; architecture drafts | **opus** (Sonnet is safeguard-weakened on exploit/cyber; Opus adds real depth) |
+| Hardest long-horizon subagent runs, non-security-flavored | **fable** (highest ceiling, but classifier reroute risk — see above) |
+
+Claude subagent vs external executor: spawn a Claude subagent when the task needs session tools (MCP/browser/secrets), tight multi-turn state, or Claude-family reasoning depth; delegate to Codex/Grok for high-volume, scoped, one-shot work where flat-rate economics dominate. Hybrid (Claude orchestrates, Sonnet workers, external executors for bulk typing) is the consensus quality-per-dollar pattern.
 
 Everything else in this skill (route table, prompt contract, verify obligations, economics) applies identically regardless of which executor runs the work.
 

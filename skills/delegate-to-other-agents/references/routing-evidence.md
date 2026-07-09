@@ -35,6 +35,17 @@ Verdict: promoted Grok from fallback/small-task pick to **co-default executor**.
 - **Sentiment (X, early)**: strongly positive on speed/flow/agentic endurance; recurring caveat — fast but occasionally less nuanced than Fable on diagnosis. Too new for production-longevity data; re-check in a quarter.
 - **Caveats**: mostly vendor/launch-window numbers, independent replication thin; test writing stays Codex (no Aider Polyglot number published for 4.5 yet).
 
+## Evidence snapshot — Claude tiers + Fable re-release (research run 2026-07-09)
+
+Verdict: Opus 4.8 becomes default orchestrator; Sonnet 5 default subagent worker; Fable reserved.
+
+- **Fable 5 "nerf"** (re-released ~2026-07-01 after US gov involvement): weights UNCHANGED (BridgeBench: pure-Fable tasks match June exactly). A broad safety classifier silently reroutes flagged prompts to Opus 4.8. BridgeBench post-drop (debugging 86.2%→25.9%, refactoring 73.6%→38.4%) is reroute artifact, not capability loss. Dev reports: 25–75% of coding sessions rerouted (Anthropic claims "small fraction" — contradicted by billing reports). Debugging + security-adjacent prompts trigger most; pure feature/creative work mostly unaffected. Net: pay Fable rate for Opus output + broken autonomous runs → Fable no longer default.
+- **Sonnet 5** (launched ~2026-06-30, $2/$10 intro ≈ 1/5 Opus): SWE-bench Verified ~85.2% (Opus 88.6%), SWE Pro 63.2% (Opus 69.2%), Terminal-Bench 2.1 **80.4% beats Opus 74.6%**. Sufficient for exploration, tests, scoped impl, standard review. Weaknesses: safeguard-weakened on exploit/cyber; tokenizer inflates code tokens 1–1.35×; shallower on hardest ambiguous work.
+- **Opus 4.8 as middle tier**: consistent depth, no classifier friction, wins adversarial/security verification and architecture drafts. 2–5× Sonnet cost.
+- **Hybrid pattern** (Anthropic-endorsed): flagship orchestrator + Sonnet workers = 92–96% of top-tier perf at 46–63% cost.
+- **Subagent vs external executor**: no universal crossover; subagent wins when session tools/state/multi-turn needed, external wins on volume/flat-rate. (Anecdotal/medium confidence.)
+- **Caveats**: Fable fallback rate is prompt-dependent (some heavy users see almost none); Sonnet intro pricing may lapse; SWE numbers for Fable often pre-re-release.
+
 ## How to update this skill
 
 1. Re-run research. Copy-paste prompt for the research agent (Grok Heavy or similar) is below — swap in the current model/harness names first.
