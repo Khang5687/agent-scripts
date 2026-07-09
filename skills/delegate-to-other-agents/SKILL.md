@@ -137,6 +137,23 @@ grok --no-alt-screen -m grok-4.5 --always-approve \
 - Follow-up fixes: `grok -c --always-approve -p "$(cat "$P2")" --cwd <repo> --output-format plain >/tmp/grok-last.md 2>/dev/null` (`-c` continues the most recent session for that cwd; use `-r <id>` to target a specific one).
 - long runs: same as Codex — Bash `run_in_background`, read the redirected file on exit.
 
+## Parallelize
+
+Parallelism buys wall-clock only; quality is protected by rules, not luck.
+
+**Independence test (all three, else serial):**
+1. No shared files between lanes.
+2. No lane consumes another's output.
+3. No lane establishes a convention the others must follow.
+
+**Pilot-then-fan-out** — for N similar tasks (migrations, per-module repeats): run ONE serially, review it to full standard, freeze the reviewed diff as the template in every remaining spec, then fan out N−1 in parallel. Never fan out an unproven pattern.
+
+**Isolation mechanics:** different repos → separate `--cwd`/`-C`. Same repo → one git worktree per lane (`git worktree add`), Claude merges after review. Separate output files per lane. Subagents mutating files in parallel → worktree isolation.
+
+**Caps:** review is the bottleneck, not spawning — max 3–4 implementation lanes at once; each diff still gets full serial-strength review on landing. Exploration/review fan-out (read-only) has no such cap and often *raises* quality — diverse lenses catch what one pass misses.
+
+**Failures:** one lane failing never blocks the others. Failed lane → fallback rule (other executor) or absorb into Claude. Merge conflict between lanes = the independence test was failed, not bad luck: stop fanning, take over integration directly.
+
 ## Prompt contract
 
 Codex/Grok both start with zero session context. Every prompt: goal, exact repo/paths, constraints, non-goals, proof expected (exact test command), output shape ("report files changed + test output"). Spec quality decides success.
