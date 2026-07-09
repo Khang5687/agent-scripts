@@ -54,6 +54,8 @@ Spawn (Agent tool, `model:`) when the task needs session tools, tight multi-turn
 | Adversarial verification; security-adjacent/deep review; architecture drafts | **opus** |
 | Hardest long-horizon runs — pure feature/creative only | **fable** (avoid debugging, security/auth, dual-use-adjacent prompts: classifier reroutes to Opus and breaks runs) |
 
+Follow-ups: continue an existing subagent via SendMessage (agent ID/name) — it resumes with full context; never re-spawn fresh to iterate on the same task. Same 2-failed-rounds cap as executors. Fresh spawn only for a new task or when the session has drifted (agent contradicts its own earlier output).
+
 **Review policy (sole statement):** executor output is reviewed by Claude-family only — never by an external executor, never skipped. Self-review only when your tier ≥ the required tier for that review class; Sonnet/Haiku never self-accept adversarial/security review — spawn opus.
 
 ## 5. Invoke
@@ -75,7 +77,7 @@ command codex exec --yolo -C <repo> \
 - House model is GPT-5.5 — if the CLI default drifts, pin explicitly (`-c model=...`).
 - stderr suppressed (thinking noise); read the `-o` file, not the stream. Long runs: run_in_background; don't kill quiet runs <30 min.
 
-Codex follow-ups (`resume` has no `-C`/`--yolo`):
+Codex follow-ups (`resume` has no `-C`/`--yolo`; drop the bypass flag for read-only follow-ups — it's only needed when the follow-up edits files):
 
 ```bash
 (cd <repo> && command codex exec resume --last \
