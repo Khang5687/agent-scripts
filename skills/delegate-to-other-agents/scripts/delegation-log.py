@@ -115,7 +115,7 @@ def cmd_status(argv):
     scope = "all projects" if all_projects else f"project: {project}"
     print(f"DELEGATION STATUS ({scope}, last {days}d)\n")
     if not entries:
-        print("  no delegations recorded yet")
+        print("  no entries for this filter — try --all or --days 30")
         return
 
     work = [e for e in entries if e["kind"] in ("executor", "subagent", "kept")]

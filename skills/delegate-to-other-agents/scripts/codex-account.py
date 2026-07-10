@@ -16,9 +16,9 @@ Commands:
                   latest snapshot, else now+5h / now+7d) — no manual clear needed
   clear <name>    forget the account's ledger entry (admin use)
 
-Exit codes: 0 ok · 1 error · 2 usage/no-account · 3 hot (5h>=85 or weekly>=95)
-· 4 store missing (single-account mode) · 5 no usable snapshot · 6 refused:
-codex processes running (switch would yank auth from under them; --force overrides)
+Exit codes: 0 ok · 1 error · 2 usage / no eligible account · 3 hot (5h>=85 or
+weekly>=95) · 4 store missing (single-account mode) · 5 no usable snapshot ·
+6 refused, retry when clear (codex processes running, or switch lock held)
 
 The ledger (~/.codex-switcher/usage-ledger.json) is a sidecar this script owns;
 codex-switcher never reads it. It holds last-known usage per account so an
@@ -153,13 +153,14 @@ class SwitchLock:
                 return self
             except FileExistsError:
                 try:
-                    if time.time() - os.path.getmtime(LOCK_PATH) > 30:
-                        os.unlink(LOCK_PATH)  # stale
+                    if time.time() - os.path.getmtime(LOCK_PATH) > 10:
+                        os.unlink(LOCK_PATH)  # stale (reclaim within the wait window)
                         continue
                 except OSError:
                     continue
                 if time.time() > deadline:
-                    die("another switch is in progress (lock held >10s)", 2)
+                    die("another switch is in progress (lock held >10s) — "
+                        "transient, retry shortly", 6)
                 time.sleep(0.2)
 
     def __exit__(self, *exc):
@@ -238,7 +239,7 @@ def write_auth(account):
     atomic_write(AUTH_PATH, auth)
 
 
-def log_delegation_event(target, task):
+def log_delegation_event(target, task, account=None):
     """Best-effort quota-event line into the delegation log (never fails a switch)."""
     try:
         try:  # same project identity as delegation-log.py: git toplevel first
@@ -251,7 +252,7 @@ def log_delegation_event(target, task):
             project = os.path.basename(os.getcwd())
         entry = {"ts": int(time.time()),
                  "project": project,
-                 "kind": "quota", "target": target, "account": None,
+                 "kind": "quota", "target": target, "account": account,
                  "outcome": "n/a", "task": task}
         path = os.path.expanduser("~/.claude/delegation-log.jsonl")
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -280,7 +281,8 @@ def do_switch(store, target):
         ledger.setdefault("_meta", {})["last_switch_ts"] = int(time.time())
         save_ledger(ledger)
     prev = " (tokens synced back)" if synced else ""
-    log_delegation_event("rotate", f"switched account -> {target['name']}")
+    log_delegation_event("rotate", f"switched account -> {target['name']}",
+                         account=target["name"])
     print(f"switched to {target['name']}{prev}")
 
 
@@ -442,6 +444,8 @@ def cmd_status():
     p_pct = p.get("used_percent", p.get("used_percentage", "?"))
     s_pct = s.get("used_percent", s.get("used_percentage", "?"))
     print(f"account={name} 5h={p_pct}% weekly={s_pct}% snapshot_age={snap['age_s']}s")
+    if not isinstance(p_pct, (int, float)):
+        sys.exit(5)  # snapshot present but unusable: usage unknown, not healthy
     # record the observation for the active account
     if act is not None and isinstance(p_pct, (int, float)):
         with LedgerLock():
@@ -482,7 +486,8 @@ def cmd_mark(name, event):
     if event in ("5h", "weekly"):
         # prefer the real reset time — the quota-failing run just wrote a snapshot
         # (but only if it postdates the last switch: never another account's reset)
-        snap = latest_rate_limits()
+        # snapshot resets belong to the ACTIVE account only
+        snap = latest_rate_limits() if a["id"] == store.get("active_account_id") else None
         last_switch = load_ledger().get("_meta", {}).get("last_switch_ts", 0)
         resets = None
         if snap and time.time() - snap["age_s"] >= last_switch:
@@ -503,7 +508,7 @@ def cmd_mark(name, event):
             e["weekly_resets_at"] = expires
         save_ledger(ledger)
     until = "" if expires == 0 else f" (self-expires {datetime.fromtimestamp(expires, timezone.utc).isoformat()})"
-    log_delegation_event(f"mark-{event}", f"{name} marked {event}")
+    log_delegation_event(f"mark-{event}", f"{name} marked {event}", account=name)
     print(f"marked {name}: {event}{until}")
 
 

@@ -1,0 +1,65 @@
+goal:
+  slug: delegate-skill-review-r8
+  status: active
+  mode: specific
+agents: bundled_not_installed
+visual_board: none
+tasks:
+  - id: T001
+    type: scout
+    assignee: Scout
+    status: done
+    objective: "Dispatch 4-model adversarial review panel (terra, luna, grok, fable-medium) against SKILL.md + both scripts + delegation-status; collect all four reviews."
+    constraints: ["read-only; reviewers edit nothing"]
+    expected_output: ["four review reports"]
+    receipt:
+      result: done
+      summary: "4 receipts: fable-medium 3 flaws (converged verdict); terra 3 (exit-0 repro); grok 3 (lock/stale mismatch, auto-log account null); luna 4 (mark inactive-account reset inheritance). No re-litigation."
+  - id: T002
+    type: judge
+    assignee: Judge
+    status: done
+    objective: "Consolidate the four reviews via the necessity test: accepted fixes (with locations), rejections (with reasons), allowed_files, verify commands for the Worker."
+    expected_output: ["Decision", "Exact Worker objective", "allowed_files", "verify", "stop_if"]
+    receipt:
+      result: done
+      decision: "Accept 8 (exit-5 unusable snapshot; lock timeout exit 6 + stale 10s; sol-lane pick clause; mark active-only snapshot; auto-log account; empty-log message + status-skill trim; failure-policy reword; exit-code doc). Reject 1 (sub-second ownership precision: same-second window, self-correcting)."
+      next_allowed_task: T003
+  - id: T003
+    type: worker
+    assignee: Worker
+    status: done
+    objective: "Apply accepted fixes to the canonical skill files; run the verify commands."
+    allowed_files:
+      - "~/.claude/skills/delegate-to-other-agents/**"
+      - "~/.claude/skills/delegation-status/**"
+    verify:
+      - "python3 ~/.claude/skills/delegate-to-other-agents/scripts/codex-account.py status; list --json parses"
+      - "python3 ~/.claude/skills/delegate-to-other-agents/scripts/delegation-log.py status runs clean"
+    stop_if:
+      - "A fix requires files outside allowed_files"
+      - "Verification fails twice"
+      - "A fix contradicts a prior-round arbitration without new evidence"
+    receipt:
+      result: done
+      changed_files: ["scripts/codex-account.py", "scripts/delegation-log.py", "SKILL.md", "../delegation-status/SKILL.md"]
+      commands:
+        - {cmd: "status/list/log regression", status: pass}
+        - {cmd: "malformed snapshot -> exit 5", status: pass}
+        - {cmd: "held lock -> exit 6", status: pass}
+        - {cmd: "inactive mark -> fallback expiry", status: pass}
+        - {cmd: "auto-log account populated", status: pass}
+      summary: "All 8 accepted fixes applied and verified."
+  - id: T004
+    type: pm
+    assignee: PM
+    status: queued
+    objective: "Sync canonical -> repo mirror, commit, push to origin-private."
+    receipt: null
+  - id: T999
+    type: judge
+    assignee: Judge
+    status: queued
+    objective: "Audit: does the completed round satisfy the original request end-to-end?"
+    expected_output: ["complete | not_complete", "full_outcome_complete: true | false"]
+    receipt: null
