@@ -205,6 +205,9 @@ def sync_back(store):
             owner = a
             break
     if owner is None:
+        if live_acct_id:
+            return False  # foreign tokens for an unknown account: never sync
+        # account_id absent entirely → best guess is the active account
         owner = active_account(store)
         if owner is None or owner["auth_data"].get("type") != "chat_g_p_t":
             return False
@@ -238,8 +241,16 @@ def write_auth(account):
 def log_delegation_event(target, task):
     """Best-effort quota-event line into the delegation log (never fails a switch)."""
     try:
+        try:  # same project identity as delegation-log.py: git toplevel first
+            out = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                                 capture_output=True, text=True, timeout=5)
+            project = (os.path.basename(out.stdout.strip())
+                       if out.returncode == 0 and out.stdout.strip()
+                       else os.path.basename(os.getcwd()))
+        except Exception:
+            project = os.path.basename(os.getcwd())
         entry = {"ts": int(time.time()),
-                 "project": os.path.basename(os.getcwd()),
+                 "project": project,
                  "kind": "quota", "target": target, "account": None,
                  "outcome": "n/a", "task": task}
         path = os.path.expanduser("~/.claude/delegation-log.jsonl")
@@ -255,7 +266,7 @@ def guard_live_processes(force):
     if pids and not force:
         die("refusing to switch: codex processes running (pids "
             + ",".join(pids) + ") — switching would yank auth from under them; "
-            "wait, use per-lane CODEX_HOME, or --force", 6)
+            "wait for lanes to finish (--force only for guard false-positives)", 6)
 
 
 def do_switch(store, target):
@@ -276,6 +287,8 @@ def do_switch(store, target):
 def is_eligible(a, led, masked, now):
     if a["id"] in masked:
         return False
+    if a["auth_data"].get("type") == "api_key":
+        return False  # usage-based billing: explicit `switch` only, never auto-picked
     sub = a.get("subscription_expires_at")
     if sub:
         try:
@@ -283,7 +296,9 @@ def is_eligible(a, led, masked, now):
                 return False
         except ValueError:
             pass
-    if active_flags(led.get("flags", {}), now):
+    blocking = {k: v for k, v in active_flags(led.get("flags", {}), now).items()
+                if k != "no-sol"}  # capability, not quota: blocks sol lanes only
+    if blocking:
         return False
     h5, h5_reset = led.get("h5"), led.get("h5_resets_at")
     eff_h5 = 0.0 if (h5 is not None and h5_reset and now > h5_reset) else h5
@@ -370,7 +385,7 @@ def latest_rate_limits():
                       recursive=True)
     if not files:
         return None
-    for path in sorted(files, key=os.path.getmtime, reverse=True)[:5]:
+    for path in sorted(files, key=os.path.getmtime, reverse=True)[:20]:
         try:
             with open(path, "rb") as f:
                 lines = f.read().decode(errors="replace").splitlines()
@@ -453,7 +468,7 @@ def account_by_name(store, name):
     a = next((a for a in store["accounts"] if a["name"] == name), None)
     if a is None:
         die(f"account '{name}' not found; have: "
-            + ", ".join(x["name"] for x in store["accounts"]))
+            + ", ".join(x["name"] for x in store["accounts"]), 2)
     return a
 
 
@@ -466,9 +481,13 @@ def cmd_mark(name, event):
     expires = 0  # never (no-sol, auth-failed: cleared manually or by re-add)
     if event in ("5h", "weekly"):
         # prefer the real reset time — the quota-failing run just wrote a snapshot
+        # (but only if it postdates the last switch: never another account's reset)
         snap = latest_rate_limits()
-        window = "primary" if event == "5h" else "secondary"
-        resets = (snap["rl"].get(window) or {}).get("resets_at") if snap else None
+        last_switch = load_ledger().get("_meta", {}).get("last_switch_ts", 0)
+        resets = None
+        if snap and time.time() - snap["age_s"] >= last_switch:
+            window = "primary" if event == "5h" else "secondary"
+            resets = (snap["rl"].get(window) or {}).get("resets_at")
         if not resets or resets <= now:
             resets = now + (5 * 3600 if event == "5h" else 7 * 86400)
         expires = resets
