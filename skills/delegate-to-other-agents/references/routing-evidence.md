@@ -58,6 +58,8 @@ Verdict: Opus 4.8 becomes default orchestrator; Sonnet 5 default subagent worker
 
 ## How to update this skill
 
+Review cadence: adversarial review rounds are **event-driven, not scheduled** — run one only on a new model/harness, an observed routing failure, or a major skill change. 8 rounds (2026-07-08 → 07-10) took the file from architecture flaws to 1–3-line residuals; the panel declared it converged. Scheduled re-reviews of a converged file produce churn, not fixes.
+
 1. Re-run research. Copy-paste prompt for the research agent (Grok Heavy or similar) is below — swap in the current model/harness names first.
 2. From results, update in SKILL.md: §3 Executor pick table; §2 keep/delegate checks + LOC/ambiguity bar; §1 model shift rows; §4 subagent tiers + classifier caveat.
 3. Update this file: lineup table, evidence snapshot (keep dated), and prune stale claims.
