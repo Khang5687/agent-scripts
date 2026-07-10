@@ -70,6 +70,16 @@ Preflight: `git status -sb`; record the baseline — `BASE=$(git rev-parse HEAD)
 
 Executors start with zero session context. Spec = the frozen plan (§2) + constraints, non-goals, proof expected, output shape. Proof = the required verification commands, or one concrete manual check (no-run only for docs/comment/rename changes with listed paths). Every prompt states scope and includes: "You may edit only <named files/areas> and run local commands/tests; leave all changes uncommitted. Do not commit, push, release, tag, open/merge PRs, publish, or mutate remote state." (Recon: "do not edit files.") Never include credentials, tokens, or content from session tools in an executor spec.
 
+### Skills propagation
+
+Executors never see Claude's skills — the orchestrator selects and packages them into the spec; never tell an executor to browse a skills directory. Package every spec to the Grok floor (no skill mechanism); Codex's `~/.codex/skills` discovery is a bonus, never the contract.
+
+- **Behavioral skills** (style/method, e.g. ponytail) → inline-distill into Constraints: ≤8 bullets / ≤120 words, only diff-changing rules (decision ladder, hard bans, safety floors, intensity). Strip triggers, frontmatter, examples, session language. Name the source ("Constraints (ponytail full): ...") so review can check compliance. Path-only is never the sole channel.
+- **Reference skills** (in-repo API docs, e.g. `.agents/skills/<name>/`) → ≤3 exact paths, conditional and observable: "Before touching widget config, consult `.agents/skills/appintents/SKILL.md`." Always add the fence: "Do not browse the skills directory; read only the listed paths." Need >3 → task too broad: split lanes or Claude synthesizes an integration brief first. Inline only a task-critical excerpt/checklist ≤15 lines; never paste indexes.
+- **Precedence**: spec > repo AGENTS.md/conventions > skill philosophy. All conflicts (including skill-vs-skill) are resolved by the orchestrator at freeze time — never left to the executor. Claude-only frontmatter (`context: fork`, `agent:`) never reaches a spec.
+- Paths must be readable from the executor cwd (repo-relative preferred); plugin-only skills → distill the needed fact or keep the work in Claude. Parallel lanes: each lane gets only its own skills. Recon lanes usually get none. Zero skills is valid — under-include over speculate.
+- Verify fails because guidance was ignored → resume with "you violated constraint X; re-read <path> and fix" — never dump full skill bodies on retry.
+
 Record the emitted session id after every executor run — required for any resume.
 
 **Codex multi-account** (needs the codex-switcher store `~/.codex-switcher/accounts.json`; exit 4 = no store, exit 2 = no other account → single-account mode, skip this block). Mechanics: `scripts/codex-account.py` — `status` (probe + record; exit 3 when hot: 5h ≥85% or weekly ≥95%), `list --json` (plans + last-known usage + flags), `switch <name>`/`next`, `mark <name> 5h|weekly|no-sol|auth-failed`, `clear <name>`. Decisions are yours:
