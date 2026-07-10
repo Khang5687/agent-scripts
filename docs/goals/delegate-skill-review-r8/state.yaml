@@ -1,6 +1,6 @@
 goal:
   slug: delegate-skill-review-r8
-  status: active
+  status: done
   mode: specific
 agents: bundled_not_installed
 visual_board: none
@@ -53,13 +53,19 @@ tasks:
   - id: T004
     type: pm
     assignee: PM
-    status: queued
+    status: done
     objective: "Sync canonical -> repo mirror, commit, push to origin-private."
-    receipt: null
+    receipt:
+      result: done
+      summary: "Synced canonical -> mirror, committed bc05cfb, pushed to origin-private."
   - id: T999
     type: judge
     assignee: Judge
-    status: queued
+    status: done
     objective: "Audit: does the completed round satisfy the original request end-to-end?"
     expected_output: ["complete | not_complete", "full_outcome_complete: true | false"]
-    receipt: null
+    receipt:
+      result: done
+      decision: complete
+      full_outcome_complete: true
+      summary: "Original request satisfied end-to-end: 4-model panel ran (4 receipts), consolidation applied the necessity test (8 accepted incl. one 3-of-4 consensus, 1 rejected with reason, no re-litigation), fixes applied to canonical + mirror, 5 verify checks green, pushed as bc05cfb. Panel verdict this round: converged; findings were 1-3 line residuals."
