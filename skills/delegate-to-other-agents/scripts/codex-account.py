@@ -235,6 +235,21 @@ def write_auth(account):
     atomic_write(AUTH_PATH, auth)
 
 
+def log_delegation_event(target, task):
+    """Best-effort quota-event line into the delegation log (never fails a switch)."""
+    try:
+        entry = {"ts": int(time.time()),
+                 "project": os.path.basename(os.getcwd()),
+                 "kind": "quota", "target": target, "account": None,
+                 "outcome": "n/a", "task": task}
+        path = os.path.expanduser("~/.claude/delegation-log.jsonl")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+
+
 def guard_live_processes(force):
     pids = live_codex_pids()
     if pids and not force:
@@ -254,6 +269,7 @@ def do_switch(store, target):
         ledger.setdefault("_meta", {})["last_switch_ts"] = int(time.time())
         save_ledger(ledger)
     prev = " (tokens synced back)" if synced else ""
+    log_delegation_event("rotate", f"switched account -> {target['name']}")
     print(f"switched to {target['name']}{prev}")
 
 
@@ -468,6 +484,7 @@ def cmd_mark(name, event):
             e["weekly_resets_at"] = expires
         save_ledger(ledger)
     until = "" if expires == 0 else f" (self-expires {datetime.fromtimestamp(expires, timezone.utc).isoformat()})"
+    log_delegation_event(f"mark-{event}", f"{name} marked {event}")
     print(f"marked {name}: {event}{until}")
 
 
