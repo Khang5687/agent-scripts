@@ -9,3 +9,4 @@ bin/*
 !bin/git
 !bin/rm
 skills/.system/
+skills/im-lazy-workspace/

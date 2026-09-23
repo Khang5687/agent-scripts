@@ -1,0 +1,94 @@
+{
+  "skill_name": "im-lazy",
+  "evals": [
+    {
+      "id": 0,
+      "prompt": "/im-lazy run --dry-run \u2014 the repo is the fixture directory. Do not create worktrees or write files; show me what you would ticket and in what order.",
+      "expected_output": "Lists plan_auth-tokens then plan_audit-log in that order; excludes plan_dark-mode (draft), plan_rate-limit (implemented), plan_billing (depends on a draft) with reasons; checks for to-tickets/code-review; writes nothing.",
+      "files": [
+        "files/fixture-repo"
+      ],
+      "assertions": [
+        "lists plan_auth-tokens before plan_audit-log",
+        "excludes plan_dark-mode with reason 'draft'",
+        "excludes plan_rate-limit with reason 'implemented'",
+        "excludes plan_billing with reason 'depends on draft'",
+        "mentions the to-tickets / code-review prerequisite check and that to-tickets is human-run",
+        "writes no files in the repo (STATE.md unchanged, no worktrees)"
+      ]
+    },
+    {
+      "id": 1,
+      "prompt": "/im-lazy discuss I want users to export their audit log as CSV from the settings page. Keep it small. Assume I answer 'CSV only, no XLSX' and 'last 30 days by default' to any product questions.",
+      "expected_output": "A new docs/plan_audit-export.md with the Status/Depends on header, scout evidence citing src/audit.ts, numbered decisions with reasons, not-in-scope, tests, ordered implementation, Depends on naming plan_audit-log, and no feature code written.",
+      "files": [
+        "files/fixture-repo"
+      ],
+      "assertions": [
+        "creates docs/plan_<slug>.md whose first three lines are title, Status:, Depends on:",
+        "Depends on names plan_audit-log",
+        "cites src/audit.ts with current behaviour",
+        "has numbered decisions each with a reason",
+        "has Not in scope, Tests, and ordered Implementation sections",
+        "writes no code under src/"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "/im-lazy run \u2014 I deleted .im-lazy.md from the repo on purpose. See what happens.",
+      "expected_output": "Stops before ticketing, offers to create .im-lazy.md from the example, does not guess the main branch, spawns no workers.",
+      "files": [
+        "files/fixture-repo"
+      ],
+      "assertions": [
+        "stops before ticketing",
+        "offers to create .im-lazy.md from the example and asks the user",
+        "does not state or assume a main branch",
+        "does not create .im-lazy.md or worktrees"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "/im-lazy run \u2014 the repo is the fixture directory. I will NOT say go; just take me up to the gate.",
+      "expected_output": "Preflight passes, asks the human to run /to-tickets for plan_auth-tokens first, and waits. No worktrees, no in-progress rows, nothing emulating to-tickets.",
+      "files": [
+        "files/fixture-repo"
+      ],
+      "assertions": [
+        "asks the human to run /to-tickets docs/plan_auth-tokens.md and waits",
+        "does not invoke or emulate to-tickets itself",
+        "creates no worktrees",
+        "state file has no in-progress rows"
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "/im-lazy run \u2014 the repo is the fixture directory, but first replace .scratch/orchestration/STATE.md with the one in files/state-resume.md. There is no worktree on disk.",
+      "expected_output": "Resume rule: the in-progress row for plan_rate-limit ticket 02 is reset to open with note 'worktree gone', the branch (if any) removed, the table printed, and the chat waits for go.",
+      "files": [
+        "files/fixture-repo",
+        "files/state-resume.md"
+      ],
+      "assertions": [
+        "resets the in-progress row to open",
+        "notes that the worktree was gone",
+        "does not start the ticket automatically",
+        "waits for go"
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "/im-lazy run --dry-run \u2014 the repo is the fixture directory, but first replace .scratch/orchestration/STATE.md with files/state-parked.md.",
+      "expected_output": "Ticket 03 of plan_auth-tokens is reported blocked by parked 02; plan_audit-log is skipped because it depends on plan_auth-tokens; nothing written.",
+      "files": [
+        "files/fixture-repo",
+        "files/state-parked.md"
+      ],
+      "assertions": [
+        "ticket 03 marked blocked by parked 02",
+        "plan_audit-log skipped with reason 'depends on plan_auth-tokens'",
+        "writes nothing"
+      ]
+    }
+  ]
+}
