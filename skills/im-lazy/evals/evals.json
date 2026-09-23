@@ -85,8 +85,8 @@
         "files/state-parked.md"
       ],
       "assertions": [
-        "ticket 03 marked blocked by parked 02",
-        "plan_audit-log skipped with reason 'depends on plan_auth-tokens'",
+        "reports ticket 03 as not runnable because ticket 02 is parked (any wording)",
+        "reports plan_audit-log as not eligible this run because it depends on plan_auth-tokens (any wording: skipped, blocked, waiting)",
         "writes nothing"
       ]
     }

@@ -16,9 +16,10 @@ No argument: ask which.
 ## Before either mode
 
 1. Read `.im-lazy.md` at the repo root (format: `references/config.md`). If
-   it is missing, derive `test` and `setup` from the repo's AGENTS.md or
-   package scripts, show every value you would write, and wait for a yes.
-   Never guess `main_branch`; never write a default `test`.
+   it is missing, start from `assets/im-lazy.example.md`, derive `test` and
+   `setup` from the repo's AGENTS.md or package scripts, show every value you
+   would write, and wait for a yes. Never guess `main_branch`; never write a
+   default `test`.
 2. Check the companion skills are installed: `to-tickets`, `code-review`,
    `tdd`. Find them with `find ~/.claude -name SKILL.md -path '*<name>*'`;
    never pin a version path. Run mode stops without the first two. If any is
