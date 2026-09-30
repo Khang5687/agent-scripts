@@ -1,0 +1,7 @@
+{
+  "id": "pxpipe",
+  "description": "Runs pxpipe, routes chosen providers through it, and shows its savings",
+  "requirements": {
+    "paseo": ">=0.10.1"
+  }
+}
