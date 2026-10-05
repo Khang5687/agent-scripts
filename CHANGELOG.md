@@ -4,6 +4,11 @@ summary: Timeline of guardrail helper changes mirrored from Sweetistics and rela
 
 # Changelog
 
+## 2026-10-05 — Delegation Skill Refresh
+- Refreshed `delegate-to-other-agents` routing to the current lineup (Codex GPT-6.1 Sol default / GPT-6 Luna cheap lane / GPT-6 Astra escalation with scope fences; Grok 4.7 demoted to overflow; Opus 5.5 default orchestrator, Sonnet 5.5 near-opus implementer, Fable 5.1 for multi-day runs with the narrowed, visible safeguard fallback) backed by a dated 2026-10 evidence snapshot in `references/routing-evidence.md`.
+- Restructured the skill per `writing-for-agents`: SKILL.md keeps the decision flow; invoke commands, Codex multi-account rotation, and spec packaging moved to `references/executors.md`, `references/codex-accounts.md`, `references/spec.md`; added Claude Code / omp harness mapping for subagent spawn and follow-up.
+- Renamed the Codex account capability flag `no-sol` → `no-astra` in `codex-account.py` and updated `delegation-log.py` target names (`codex-sol/luna/astra`).
+
 ## 2026-07-04 — npm Session Cache
 - Cached newly created npm registry sessions back to the Molty 1Password item through a verified JSON-only update, eliminating repeated TOTP logins across Macs without exposing the token in arguments or logs.
 

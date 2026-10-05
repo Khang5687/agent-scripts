@@ -7,9 +7,9 @@ Commands:
   log <kind> <target> [--account A] [--outcome ok|fail|recovered|n/a]
       [--project P] -- <task text...>
         kind   = executor | subagent | kept | quota
-        target = codex-terra, codex-luna, codex-sol, grok, sonnet, opus,
-                 fable, claude (for kept), or a quota event like
-                 rotate/mark-5h/mark-weekly/mark-auth-failed
+        target = codex-sol (GPT-6.1 Sol), codex-luna, codex-astra, grok,
+                 sonnet, opus, fable (subagents), claude (for kept), or a quota
+                 event like rotate/mark-5h/mark-weekly/mark-auth-failed
   status [--all] [--days N] [--recent N]
         summary + recent view; current project by default, --all for global
 

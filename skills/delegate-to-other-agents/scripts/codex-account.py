@@ -11,7 +11,7 @@ Commands:
   list [--json]   all accounts; --json adds plan, observations, flags, eligible
   next [--force]  rotate to the least-recently-used ELIGIBLE account
   switch <name> [--force]   switch to the named account
-  mark <name> <5h|weekly|no-sol|auth-failed>   record a quota/capability event;
+  mark <name> <5h|weekly|no-astra|auth-failed>   record a quota/capability event;
                   5h/weekly marks self-expire at the window reset (from the
                   latest snapshot, else now+5h / now+7d) — no manual clear needed
   clear <name>    forget the account's ledger entry (admin use)
@@ -72,7 +72,7 @@ def load(path):
 LOCK_PATH = os.path.expanduser("~/.codex-switcher/.switch.lock")
 LEDGER_PATH = os.path.expanduser("~/.codex-switcher/usage-ledger.json")
 NOT_INSTALLED = 4  # exit code: no store — caller should treat as single-account mode
-VALID_MARKS = ("5h", "weekly", "no-sol", "auth-failed")
+VALID_MARKS = ("5h", "weekly", "no-astra", "auth-failed")
 
 
 def load_ledger():
@@ -299,7 +299,7 @@ def is_eligible(a, led, masked, now):
         except ValueError:
             pass
     blocking = {k: v for k, v in active_flags(led.get("flags", {}), now).items()
-                if k != "no-sol"}  # capability, not quota: blocks sol lanes only
+                if k != "no-astra"}  # capability, not quota: blocks Astra lanes only
     if blocking:
         return False
     h5, h5_reset = led.get("h5"), led.get("h5_resets_at")
@@ -482,7 +482,7 @@ def cmd_mark(name, event):
     store = load_store()
     a = account_by_name(store, name)
     now = int(time.time())
-    expires = 0  # never (no-sol, auth-failed: cleared manually or by re-add)
+    expires = 0  # never (no-astra, auth-failed: cleared manually or by re-add)
     if event in ("5h", "weekly"):
         # prefer the real reset time — the quota-failing run just wrote a snapshot
         # (but only if it postdates the last switch: never another account's reset)
@@ -540,7 +540,7 @@ def main():
         cmd_switch(names[0], force="--force" in args)
     elif cmd == "mark":
         if len(args) < 3:
-            die("usage: mark <name> <5h|weekly|no-sol|auth-failed>", 2)
+            die("usage: mark <name> <5h|weekly|no-astra|auth-failed>", 2)
         cmd_mark(args[1], args[2])
     elif cmd == "clear":
         if len(args) < 2:
