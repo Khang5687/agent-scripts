@@ -7,6 +7,7 @@
       "description": "Skills for agent instructions, transcript handling, skill hygiene, and reusable workflow design.",
       "skills": [
         "agent-transcript",
+        "clone-website",
         "create-cli",
         "frontend-design",
         "markdown-converter",
