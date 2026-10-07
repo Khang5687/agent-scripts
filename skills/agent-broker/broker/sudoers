@@ -1,0 +1,7 @@
+# Agent broker (installed by agent-scripts/skills/agent-broker/broker/install.sh). __USER__ = the Mac owner.
+# Agents run the broker as _deployer without a password; the admin command needs the password.
+# sudo asks for the password every time (no 5-minute reuse an agent in the same terminal could borrow).
+Defaults:__USER__ timestamp_timeout=0
+Defaults!/opt/agent-broker/bin/agent-broker.mjs env_reset
+__USER__ ALL=(_deployer) NOPASSWD: /opt/agent-broker/bin/agent-broker.mjs
+__USER__ ALL=(_deployer) /opt/agent-broker/bin/agent-broker-admin.mjs

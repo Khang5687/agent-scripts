@@ -1,0 +1,3 @@
+#!/bin/bash
+# agent-broker: runs the broker as _deployer (sudo rule: no password for this one program). Guide: agent-scripts/skills/agent-broker/SKILL.md
+exec /usr/bin/sudo -n -u _deployer /opt/agent-broker/bin/agent-broker.mjs "$@"

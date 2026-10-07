@@ -1,0 +1,17 @@
+{
+  "name": "agent-broker",
+  "private": true,
+  "type": "module",
+  "description": "Runs Netlify/Vercel/Supabase/Apify actions for agents without showing them tokens. Installed to /opt/agent-broker by install.sh.",
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@netlify/blobs": "11.1.3",
+    "apify-cli": "1.10.0",
+    "netlify-cli": "27.6.0",
+    "pg": "8.23.1",
+    "supabase": "2.117.0",
+    "vercel": "62.7.0"
+  }
+}
