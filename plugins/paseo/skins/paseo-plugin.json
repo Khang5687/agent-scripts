@@ -1,0 +1,8 @@
+{
+  "id": "paseo-skins",
+  "name": "Paseo Skins",
+  "description": "Browse and install background skins from the paseo-skins catalog",
+  "requirements": {
+    "paseo": ">=0.10.1"
+  }
+}
