@@ -48,7 +48,7 @@ test('stream scrubbing catches a token split across chunks', async () => {
   assert.equal(out, 'deploying with [secret] done\nnext line');
 });
 
-test('project copy skips links out of the project, env files and git data, and prunes removed files', async () => {
+test('project copy skips links out of the project, unreadable files, env files and git data, and prunes removed files', async () => {
   const src = await fs.mkdtemp(path.join(os.tmpdir(), 'agent-broker-src-'));
   const outside = path.join(dev, 'outside-secret.txt');
   await fs.writeFile(outside, 'not for the copy');
@@ -63,12 +63,15 @@ test('project copy skips links out of the project, env files and git data, and p
   await fs.symlink(outside, path.join(src, 'dist/leak.txt'));
   await fs.symlink('../../..', path.join(src, 'dist/up'));
   await fs.symlink('index.html', path.join(src, 'dist/alias.html'));
+  await fs.writeFile(path.join(src, 'private.yaml'), 'owner only', { mode: 0o000 });
+  await fs.mkdir(path.join(src, 'private-dir'), { mode: 0o000 });
   const dest = path.join(dev, 'work-copy');
 
   const first = await lib.syncProject(src, dest, [TOKEN]);
-  assert.deepEqual(first.skipped.sort(), ['dist/leak.txt', 'dist/up']);
+  assert.deepEqual(first.skipped.sort(), ['dist/leak.txt', 'dist/up', 'private-dir/', 'private.yaml']);
   assert.equal(await fs.readFile(path.join(dest, 'dist/alias.html'), 'utf8'), '<p>ok</p>');
-  for (const gone of ['.env', '.git', 'data', 'dist/leak.txt', 'dist/up']) assert.equal(await fs.lstat(path.join(dest, gone)).catch(() => null), null, gone);
+  for (const gone of ['.env', '.git', 'data', 'dist/leak.txt', 'dist/up', 'private.yaml']) assert.equal(await fs.lstat(path.join(dest, gone)).catch(() => null), null, gone);
+  await fs.chmod(path.join(src, 'private-dir'), 0o700);
 
   await fs.rm(path.join(src, 'dist/sub/old.txt'));
   const second = await lib.syncProject(src, dest, [TOKEN]);

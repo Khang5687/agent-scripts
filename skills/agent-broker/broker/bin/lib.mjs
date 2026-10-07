@@ -202,9 +202,10 @@ const isEnvFile = (name) => name === '.env' || name.startsWith('.env.');
  * Copies the project folder into the broker's work folder (only changed files; removed files are deleted).
  * The project folder belongs to the agents, so nothing in it is trusted:
  *  - symlinks that point outside the project are skipped (a link to a token file must never be followed);
+ *  - files and folders the broker user cannot read (the owner's private files) are skipped;
  *  - files are opened without following links;
  *  - every changed file is checked for stored secret values, and the sync fails if one is found.
- * Returns { changed: count of copied files, skipped: links left out }.
+ * Returns { changed: count of copied files, skipped: links and unreadable entries left out }.
  */
 export async function syncProject(src, dest, secretValues) {
   const root = await fs.realpath(src);
@@ -213,9 +214,18 @@ export async function syncProject(src, dest, secretValues) {
   const skipped = [];
   const seen = new Set();
 
+  const unreadable = (e) => e?.code === 'EACCES' || e?.code === 'EPERM';
+
   async function walk(rel) {
     const from = path.join(root, rel);
-    const entries = await fs.readdir(from, { withFileTypes: true });
+    let entries;
+    try {
+      entries = await fs.readdir(from, { withFileTypes: true });
+    } catch (e) {
+      if (!unreadable(e)) throw e;
+      skipped.push(`${rel}/`);
+      return;
+    }
     for (const e of entries) {
       const r = path.join(rel, e.name);
       if (SKIP_ANY.has(e.name) || isEnvFile(e.name) || (rel === '' && SKIP_ROOT.has(e.name))) continue;
@@ -247,7 +257,15 @@ export async function syncProject(src, dest, secretValues) {
         const dst = await fs.lstat(d).catch(() => null);
         if (dst?.isFile() && dst.size === st.size && Math.abs(dst.mtimeMs - st.mtimeMs) < 2) continue; // utimes keeps ~1 ms
         if (dst && !dst.isFile()) await fs.rm(d, { recursive: true, force: true });
-        const fh = await fs.open(s, constants.O_RDONLY | constants.O_NOFOLLOW);
+        let fh;
+        try {
+          fh = await fs.open(s, constants.O_RDONLY | constants.O_NOFOLLOW);
+        } catch (e) {
+          if (!unreadable(e)) throw e;
+          seen.delete(r);
+          skipped.push(r);
+          continue;
+        }
         try {
           const fst = await fh.stat();
           if (!fst.isFile()) { skipped.push(r); continue; }

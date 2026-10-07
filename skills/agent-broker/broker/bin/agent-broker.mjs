@@ -56,7 +56,7 @@ async function workCopy(name, ctx) {
   if (!ctx.project.path) fail(`project ${name} has no folder (owner: agent-broker-admin project ${name} --path DIR)`);
   const dest = path.join(DIR.work, name);
   const { changed, skipped } = await syncProject(ctx.project.path, dest, ctx.values);
-  process.stderr.write(`agent-broker: copied ${changed} changed file(s) from ${ctx.project.path}${skipped.length ? `; skipped ${skipped.length} link(s) or special file(s) pointing outside the project` : ''}\n`);
+  process.stderr.write(`agent-broker: copied ${changed} changed file(s) from ${ctx.project.path}${skipped.length ? `; left out ${skipped.length} (links outside the project, or files only you can read): ${skipped.slice(0, 5).join(', ')}${skipped.length > 5 ? ', ...' : ''}` : ''}\n`);
   return dest;
 }
 
