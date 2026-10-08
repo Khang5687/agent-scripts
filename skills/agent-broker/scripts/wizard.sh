@@ -190,21 +190,34 @@ finish() {
 # Replace the example below. Set the two totals to match the stages you write.
 # ──────────────────────────────────────────────────────────────────────────
 
-# Agent broker wizard: keeps Netlify / Vercel / Supabase / Apify tokens where agents cannot read them.
-#   wizard.sh               first time on this Mac: vault, install the broker, add projects, log out global logins
-#   wizard.sh add-project   later: add (or finish) projects only
-# Run it in your own Terminal: it asks for your Mac password, and tokens are typed hidden straight into the broker
-# (agent-broker-admin). Nothing is written to .env files. Guide: ../SKILL.md
+# Agent broker wizard: account stacks and projects, with tokens that agents cannot read.
+# Run it in your own Terminal (the Terminal app, not an agent). Each save asks for Touch ID / your Mac password once.
+# Tokens are typed hidden and go straight into the broker. Guide: ../SKILL.md
+#   wizard.sh            menu (first run: setup first)
 
-ENV_FILE=/dev/null # no values are remembered in files; tokens live only in the broker and your vault
+ENV_FILE=/dev/null # nothing is remembered in files: tokens live only in the broker and your vault
 SKILL_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 BROKER_SRC="$SKILL_DIR/broker"
 VAULT_DIR="$HOME/Secrets"
-MODE=${1:-setup}
+GUARD_DIR=/opt/agent-broker/guard
 DONE=()
-dir="" move="" conn="" P_PATH="" P_NAME="" P_REF="" site="" org="" vproj="" # filled by ask/ask_default (printf -v)
+# filled by ask / ask_default / pick (printf -v)
+P_PATH="" P_NAME="" P_REF="" STACK="" STACK_NEW="" choice="" site="" dir="" move="" conn="" svc=""
+LOOKUP="{}" PROJECT_LINES="" ARGS=()
+# Tokens typed in this run (read indirectly as ${!var}); cleared as soon as they are saved.
+# shellcheck disable=SC2034
+clear_tokens() { T_NETLIFY="" T_SUPABASE="" T_APIFY="" T_VERCEL=""; }
+clear_tokens
 
 die() { printf '\n  %s✗ %s%s\n\n' "$RED" "$1" "$RESET" >&2; exit 1; }
+ok() { printf '  %s✓ %s%s\n' "$GREEN" "$1" "$RESET"; DONE+=("$1"); }
+
+# begin "Title" <stages> <minutes> — start one menu action with its own progress counter.
+begin() {
+  TOTAL_STAGES=$2 TOTAL_MINUTES=$3 _STAGE_INDEX=0 _MINUTES_ELAPSED=0
+  _clear
+  printf '\n%s%s  %s%s  %s(%s steps · about %s min)%s\n' "$BOLD" "$BLUE" "$1" "$RESET" "$DIM" "$2" "$3" "$RESET"
+}
 
 # ask_default VAR "Prompt" default — visible input; Enter keeps the default.
 ask_default() {
@@ -214,7 +227,7 @@ ask_default() {
   printf -v "$1" '%s' "${input:-$3}"
 }
 
-# confirm_yes "question" — Y/n gate; returns success unless the answer starts with n.
+# confirm_yes "question" — Y/n gate; yes unless the answer starts with n.
 confirm_yes() {
   local reply=""
   printf '  %s? %s [Y/n] ' "$YELLOW" "$1"
@@ -222,55 +235,246 @@ confirm_yes() {
   [[ ! "$reply" =~ ^[Nn] ]]
 }
 
-# json_field FILE FIELD — a top-level field of a JSON file, or nothing.
-json_field() {
-  node -e 'try { const v = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))[process.argv[2]]; if (v) console.log(v) } catch {}' "$1" "$2" 2>/dev/null || true
+# js EXPR — run a JS expression on the JSON from stdin (as `d`); prints the result (strings as-is).
+js() {
+  node -e 'let s = ""; process.stdin.on("data", (c) => (s += c)).on("end", () => {
+    const d = JSON.parse(s || "null"); const r = new Function("d", `return (${process.argv[1]})`)(d);
+    if (r !== undefined && r !== null) process.stdout.write(typeof r === "string" ? r : JSON.stringify(r)); })' "$1"
 }
 
-# stored_keys PROJECT — names of the keys the broker holds for a project (never values).
-stored_keys() {
-  agent-broker projects 2>/dev/null | node -e 'let s = ""; process.stdin.on("data", (d) => (s += d)).on("end", () => {
-    const p = JSON.parse(s || "[]").find((x) => x.project === process.argv[1]); console.log((p?.keys ?? []).join(" ")) })' "$1" 2>/dev/null || true
+# pick VAR "Title" "lines" [extra] — numbered menu of "label<TAB>value" lines; VAR = chosen value.
+# extra "new<TAB>Label" adds a lettered option whose value is returned as-is.
+pick() {
+  local var=$1 title=$2 lines=$3 extra=${4:-} n=0 i input
+  local values=()
+  printf '\n  %s%s%s\n' "$BOLD" "$title" "$RESET"
+  while IFS=$'\t' read -r label value; do
+    [[ -z "$label" ]] && continue
+    n=$((n + 1)); values+=("$value")
+    printf '   %s%2d%s  %s\n' "$BLUE" "$n" "$RESET" "$label"
+  done <<<"$lines"
+  [[ -n "$extra" ]] && printf '   %s n%s  %s\n' "$BLUE" "$RESET" "${extra#*$'\t'}"
+  while :; do
+    printf '  %sNumber:%s ' "$BOLD" "$RESET"
+    read -r input || true
+    if [[ -n "$extra" && "$input" == n ]]; then printf -v "$var" '%s' "${extra%%$'\t'*}"; return; fi
+    if [[ "$input" =~ ^[0-9]+$ ]] && (( input >= 1 && input <= n )); then
+      i=$((input - 1)); printf -v "$var" '%s' "${values[$i]}"; return
+    fi
+    warn "Type a number from the list."
+  done
 }
-has_key() { [[ " $(stored_keys "$1") " == *" $2 "* ]]; }
 
-# secret_looking_keys FILE — keys whose name or value looks like a secret (names only are printed).
-secret_looking_keys() {
-  awk '/^[A-Za-z_][A-Za-z0-9_]*=/ {
-    i = index($0, "="); k = substr($0, 1, i - 1); v = substr($0, i + 1)
-    if (k ~ /(ANON|PUBLISHABLE|PUBLIC)/) next
-    if (k ~ /(TOKEN|SECRET|PASSWORD|PASSWD|SERVICE_ROLE|PRIVATE|API_KEY|ACCESS_KEY)/ || v ~ /:\/\/[^\/:@]+:[^@]+@/) printf "%s ", k
-  }' "$1"
-}
-
-# admin ARGS... — agent-broker-admin; on failure (wrong password, bad value) offer one retry.
+# admin ARGS... (stdin passed through) — agent-broker-admin with one retry (wrong password, Touch ID cancelled).
 admin() {
-  agent-broker-admin "$@" && return 0
+  local input
+  input=$(cat)
+  printf '%s' "$input" | agent-broker-admin "$@" && return 0
   warn "That did not work (see the message above)."
-  if confirm "Try again?"; then agent-broker-admin "$@" && return 0; fi
-  SKIPPED+=("agent-broker-admin $1 ${2:-}")
+  if confirm "Try again?" </dev/tty; then printf '%s' "$input" | agent-broker-admin "$@" && return 0; fi
   return 1
 }
 
-# save_token PROJECT KEY URL "how to get it" — open the token page, then store the token hidden in the broker.
-save_token() {
-  local project="$1" key="$2" url="$3" how="$4"
-  if has_key "$project" "$key"; then note "$key is already stored for $project (skip)."; return; fi
-  printf '\n  %s%s%s\n' "$BOLD" "$key" "$RESET"
-  open_url "$url"
-  step "$how"
-  step "Save the token in KeePassXC first (entry name: $project $key)."
-  pause "Press Enter when it is in KeePassXC and in your clipboard"
-  say "Paste it at the hidden prompt below; then type your Mac password."
-  admin set "$project" "$key" && DONE+=("$project: $key stored")
+# real_cli NAME — the real netlify / supabase / apify / vercel, not the agent-broker guard.
+real_cli() {
+  local d
+  local IFS=:
+  for d in $PATH; do
+    [[ "$d" == "$GUARD_DIR" || -z "$d" ]] && continue
+    [[ -x "$d/$1" ]] && { printf '%s' "$d/$1"; return 0; }
+  done
+  return 1
 }
 
-# read_only_db_user PROJECT REF — create a read-only Supabase user and store its connection URL as SUPABASE_READ_URL.
-read_only_db_user() {
-  local project="$1" ref="$2" pw conn url
+token_var() { case "$1" in netlify) echo T_NETLIFY ;; supabase) echo T_SUPABASE ;; apify) echo T_APIFY ;; vercel) echo T_VERCEL ;; esac; }
+token_key() { case "$1" in netlify) echo NETLIFY_AUTH_TOKEN ;; supabase) echo SUPABASE_ACCESS_TOKEN ;; apify) echo APIFY_TOKEN ;; vercel) echo VERCEL_TOKEN ;; esac; }
+service_title() { case "$1" in netlify) echo Netlify ;; supabase) echo Supabase ;; apify) echo Apify ;; vercel) echo Vercel ;; esac; }
+
+# ask_token SERVICE — open the token page, read the token hidden into T_<SERVICE>.
+ask_token() {
+  local s=$1 url how
+  case "$s" in
+    netlify) url="https://app.netlify.com/user/applications#personal-access-tokens"; how="New access token. Name: agent-broker. Expiry: your choice." ;;
+    supabase) url="https://supabase.com/dashboard/account/tokens"; how="Generate new token. Name: agent-broker." ;;
+    apify) url="https://console.apify.com/settings/integrations"; how="Copy the API token (or create a new one)." ;;
+    vercel) url="https://vercel.com/account/settings/tokens"; how="Create token. Scope: the team that owns the projects." ;;
+  esac
+  printf '\n  %s%s token%s\n' "$BOLD" "$(service_title "$s")" "$RESET"
+  step "Log in to the RIGHT $(service_title "$s") account first."
+  open_url "$url"
+  step "$how"
+  step "Save it in KeePassXC too."
+  ask_secret "$(token_var "$s")" "Paste the token (hidden):"
+}
+
+# lookup_tokens — LOOKUP = accounts, sites and databases for the T_* tokens typed in this run.
+lookup_tokens() {
+  local lines="" s v
+  for s in netlify supabase apify vercel; do
+    v=$(token_var "$s"); [[ -n "${!v}" ]] && lines+="$(token_key "$s")=${!v}"$'\n'
+  done
+  [[ -z "$lines" ]] && return 0
+  say "Checking the token(s)..."
+  local found
+  found=$(printf '%s' "$lines" | node "$SKILL_DIR/scripts/lookup.mjs") || die "Could not check the tokens (network?)."
+  LOOKUP=$(printf '%s\n%s' "$LOOKUP" "$found" | node -e 'let s = ""; process.stdin.on("data", (c) => (s += c)).on("end", () => {
+    const [a, b] = s.split("\n"); console.log(JSON.stringify({ ...JSON.parse(a), ...JSON.parse(b) })) })')
+}
+
+# show_accounts — one line per service: who the token belongs to. Fails on a bad token.
+show_accounts() {
+  local lines
+  lines=$(printf '%s' "$LOOKUP" | js 'Object.entries(d).map(([s, r]) => r.error ? `ERROR\t${s}: ${r.error}` : `${s}\t${[r.account?.name, r.account?.email && "<" + r.account.email + ">"].filter(Boolean).join(" ")}${r.account?.teams?.length ? "  teams: " + r.account.teams.join(", ") : r.account?.orgs?.length ? "  orgs: " + r.account.orgs.join(", ") : ""}`).join("\n")')
+  while IFS=$'\t' read -r s who; do
+    [[ -z "$s" ]] && continue
+    if [[ "$s" == ERROR ]]; then warn "$who"; return 1; fi
+    printf '   %s%-9s%s %s\n' "$BOLD" "$s" "$RESET" "$who"
+  done <<<"$lines"
+}
+
+stack_lines() { agent-broker stacks | js 'd.map((s) => `${s.stack}   ${Object.entries(s.accounts).map(([k, a]) => `${k}: ${a.email ?? a.name ?? (a.orgs ?? []).join(", ")}`).join(" · ") || "no tokens yet"}   (projects: ${s.projects.join(", ") || "none"})\t${s.stack}`).join("\n")'; }
+project_lines() { agent-broker projects | js 'd.map((p) => `${p.project}   ${p.stack ? "stack " + p.stack : "no stack"}   ${p.folders.join(", ")}\t${p.project}`).join("\n")'; }
+
+# choose_stack — STACK (+ STACK_NEW=1 and typed tokens for a new stack). Fills LOOKUP for its tokens.
+choose_stack() {
+  STACK="" STACK_NEW="" LOOKUP="{}"
+  clear_tokens
+  local stacks
+  stacks=$(stack_lines)
+  if [[ -n "$stacks" ]]; then
+    pick STACK "Which account stack? (a stack = one login per service)" "$stacks" $'new\tNew stack (new logins)'
+  else
+    say "No stacks yet: let's make the first one."
+    STACK=new
+  fi
+  if [[ "$STACK" == new ]]; then
+    STACK_NEW=1
+    while :; do
+      ask_default STACK "Name the stack after its login (e.g. thedoor, studio):" ""
+      [[ "$STACK" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]] && break
+      warn "Lowercase letters, digits, - and _ only."
+    done
+    for svc in netlify supabase apify vercel; do
+      if confirm "Does this stack have a $(service_title "$svc") login?"; then ask_token "$svc"; fi
+    done
+    lookup_tokens
+    say "These tokens belong to:"
+    show_accounts || die "A token did not work. Run the wizard again with a fresh token."
+    confirm_yes "Are these the right accounts?" || die "Stopped: nothing was saved."
+  else
+    say "Reading stack $STACK (Touch ID)..."
+    LOOKUP=$(agent-broker-admin lookup "$STACK") || die "Could not read stack $STACK."
+    show_accounts || warn "One of the stack's tokens did not work: replace it (menu: Replace a token)."
+  fi
+}
+
+# stack_value_lines — stack:KEY=VALUE lines for tokens typed in this run.
+stack_value_lines() {
+  local s v
+  for s in netlify supabase apify vercel; do
+    v=$(token_var "$s"); [[ -n "${!v}" ]] && printf 'stack:%s=%s\n' "$(token_key "$s")" "${!v}"
+  done
+  return 0
+}
+
+# choose_pins FOLDER — ask which services the project uses and pick its site / database from lists. Adds to ARGS.
+choose_pins() {
+  local folder=$1 found list ref org pid publish
+  for svc in netlify supabase vercel apify; do
+    local has_token=""
+    [[ -n "$(printf '%s' "$LOOKUP" | js "d.$svc && !d.$svc.error ? 'y' : ''")" ]] && has_token=1
+    if [[ -n "$has_token" ]]; then confirm_yes "Does this project use $(service_title "$svc")?" || continue
+    else confirm "Does this project use $(service_title "$svc")?" || continue
+    fi
+    if [[ -z "$has_token" ]]; then
+      say "Stack $STACK has no $(service_title "$svc") token yet."
+      ask_token "$svc"
+      lookup_tokens
+      show_accounts || die "The token did not work."
+    fi
+    case "$svc" in
+      netlify)
+        found=$(node -e 'try { console.log(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).siteId ?? "") } catch {}' "$folder/.netlify/state.json")
+        list=$(printf '%s' "$LOOKUP" | js "(d.netlify.sites ?? []).map((s) => \`\${s.name}   \${s.url}\${s.id === '$found' ? '   ← this folder' : ''}\t\${s.id}\`).join('\n')")
+        [[ -n "$list" ]] || die "This Netlify account has no sites. Create the site in Netlify first."
+        pick site "Which Netlify site?" "$list"
+        publish=$(sed -nE 's/^[[:space:]]*publish[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "$folder/netlify.toml" 2>/dev/null | head -1)
+        ask_default dir "Folder with the built files:" "${publish:-dist}"
+        ARGS+=(--netlify-site "$site" --netlify-dir "$dir")
+        ;;
+      supabase)
+        list=$(printf '%s' "$LOOKUP" | js "(d.supabase.projects ?? []).map((p) => \`\${p.name}   \${p.ref}   (\${p.org}, \${p.status})\t\${p.ref}\`).join('\n')")
+        [[ -n "$list" ]] || die "This Supabase account has no projects."
+        pick ref "Which Supabase project?" "$list"
+        ARGS+=(--supabase-ref "$ref")
+        P_REF=$ref
+        ;;
+      vercel)
+        list=$(printf '%s' "$LOOKUP" | js "(d.vercel.projects ?? []).map((p) => \`\${p.name}   (\${p.scope})\t\${p.org_id} \${p.id}\`).join('\n')")
+        [[ -n "$list" ]] || die "This Vercel account has no projects."
+        pick pid "Which Vercel project?" "$list"
+        org=${pid%% *}
+        ARGS+=(--vercel-org "$org" --vercel-project "${pid#* }")
+        ;;
+      apify)
+        ask_default dir "Folder with the actor (.actor/actor.json), inside the project:" "."
+        ARGS+=(--apify --apify-dir "$dir")
+        ;;
+    esac
+  done
+}
+
+# env_secrets FOLDER — offer to move .env secrets; appends project:KEY=VALUE to PROJECT_LINES; MOVED = "file:keys" list.
+MOVED=()
+env_secrets() {
+  local folder=$1 f suggested k line
+  local files=()
+  # Collect first: the loop body prompts, so it must read the keyboard, not this list.
+  while IFS= read -r f; do files+=("$f"); done < <(find "$folder" -maxdepth 1 -type f -name '.env*' ! -name '*.example' ! -name '*.sample' ! -name '*.template' 2>/dev/null | sort)
+  for f in ${files[@]+"${files[@]}"}; do
+    printf '\n  %s%s%s\n' "$BOLD" "$f" "$RESET"
+    note "Keys: $(grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' "$f" | tr -d '=' | tr '\n' ' ')"
+    suggested=$(awk '/^[A-Za-z_][A-Za-z0-9_]*=/ { i = index($0, "="); k = substr($0, 1, i - 1); v = substr($0, i + 1)
+      if (k ~ /(ANON|PUBLISHABLE|PUBLIC)/) next
+      if (k ~ /(TOKEN|SECRET|PASSWORD|PASSWD|SERVICE_ROLE|PRIVATE|API_KEY|ACCESS_KEY)/ || v ~ /:\/\/[^\/:@]+:[^@]+@/) printf "%s ", k }' "$f")
+    say "Agents can read this file. Move secrets into the broker. Keep public values (URLs, anon keys, ids)."
+    ask_default move "Keys to move (space between them; - = none):" "${suggested% }"
+    [[ -z "$move" || "$move" == - ]] && continue
+    step "Save these in KeePassXC first (they leave this file)."
+    if confirm "Show the values here once, to copy them?"; then
+      for k in $move; do grep -m1 "^$k=" "$f" | sed 's/^/    /' || true; done
+      pause "Press Enter when saved"
+      _clear
+    fi
+    for k in $move; do
+      line=$(grep -m1 "^$k=" "$f" || true)
+      [[ -n "$line" ]] || { warn "$k is not in $f: skipped"; continue; }
+      PROJECT_LINES+="project:$line"$'\n'
+    done
+    MOVED+=("$f:$move")
+  done
+}
+
+# remove_moved — delete the moved keys from their .env files (after the broker saved them).
+remove_moved() {
+  local entry f keys pattern kept
+  for entry in ${MOVED[@]+"${MOVED[@]}"}; do
+    f=${entry%%:*} keys=${entry#*:}
+    # shellcheck disable=SC2086 # one key per word
+    pattern=$(printf '^%s=|' $keys)
+    kept=$(grep -vE "${pattern%|}" "$f" || true)
+    printf '%s\n' "$kept" >"$f"
+    ok "removed $keys from $(basename "$f")"
+  done
+  MOVED=()
+}
+
+# read_only_user REF — a read-only database user for `agent-broker supabase query`; adds project:SUPABASE_READ_URL.
+read_only_user() {
+  local ref=$1 pw url
   pw=$(openssl rand -hex 24)
   pbcopy <<SQL
--- agent_reader: read-only database user for agent queries (agent-broker supabase query).
+-- agent_reader: read-only database user for agents (agent-broker supabase query).
 do \$\$ begin
   if not exists (select 1 from pg_roles where rolname = 'agent_reader') then create role agent_reader login; end if;
 end \$\$;
@@ -282,256 +486,238 @@ grant select on all tables in schema public to agent_reader;
 alter default privileges in schema public grant select on tables to agent_reader;
 SQL
   open_url "https://supabase.com/dashboard/project/$ref/sql/new"
-  step "The SQL is in your clipboard. Paste it into the SQL editor and click Run."
-  note "It creates agent_reader: it can read every table in schema public and cannot change anything."
-  pause "Press Enter when it ran without an error"
+  step "The SQL is in your clipboard. Paste it. Click Run."
+  pause "Press Enter when it ran with no error"
   printf '' | pbcopy
   open_url "https://supabase.com/dashboard/project/$ref"
-  step "Click Connect (top of the page), choose Session pooler, and copy the connection string."
-  note "It looks like postgresql://postgres.$ref:[YOUR-PASSWORD]@aws-....pooler.supabase.com:5432/postgres"
-  ask conn "Paste the connection string:"
+  step "Click Connect (top). Pick Session pooler. Copy the connection string."
+  ask conn "Paste it:"
   url=${conn/postgres.$ref:/agent_reader.$ref:}
   url=${url/\[YOUR-PASSWORD\]/$pw}
-  if [[ "$url" == "$conn" || "$url" != *"agent_reader.$ref:$pw@"* ]]; then
-    warn "That does not look like the Session pooler string for project $ref; skipped."
-    SKIPPED+=("$project: read-only database user (re-run: wizard.sh add-project)")
+  if [[ "$url" != *"agent_reader.$ref:$pw@"* ]]; then
+    warn "That is not the Session pooler string for $ref. Skipped: agents cannot run SQL until you add it."
     return
   fi
-  say "Storing it in the broker (type your Mac password)."
-  printf '%s\n' "$url" | admin set "$project" SUPABASE_READ_URL && DONE+=("$project: SUPABASE_READ_URL stored (user agent_reader)")
-  if confirm "Show the URL once so you can save it in KeePassXC?"; then say "$url"; pause "Press Enter when it is saved"; fi
+  PROJECT_LINES+="project:SUPABASE_READ_URL=$url"$'\n'
 }
 
-# ── Before the stages ────────────────────────────────────────────────────
-case "$MODE" in setup|add-project) ;; *) die "usage: wizard.sh [setup|add-project]" ;; esac
-[[ -t 0 && -t 1 ]] || die "Run this in your own Terminal app, not through an agent."
-[[ "$(uname)" == Darwin ]] || die "This wizard is for macOS."
-command -v node >/dev/null || die "Node is missing (the broker copies your Node). Install it first."
-[[ "$MODE" == setup ]] && { command -v brew >/dev/null || die "Homebrew is missing (needed for KeePassXC)."; }
-[[ "$MODE" == add-project ]] && { command -v agent-broker >/dev/null || die "The broker is not installed yet: run wizard.sh (setup) first."; }
+# tell_agents PROJECT FOLDER — write the AGENTS.md block, copy it, show whoami.
+tell_agents() {
+  local p=$1 folder=$2 target=""
+  "$SKILL_DIR/scripts/snippet.sh" "$p" | pbcopy
+  for f in AGENTS.md AGENTS.MD CLAUDE.md; do [[ -f "$folder/$f" ]] && { target="$folder/$f"; break; }; done
+  target=${target:-$folder/AGENTS.md}
+  if confirm_yes "Put the agent instructions in $(basename "$target")? (also in your clipboard)"; then
+    "$SKILL_DIR/scripts/snippet.sh" "$p" --write "$target" >/dev/null && ok "$p: instructions in $(basename "$target")"
+  fi
+  say "What an agent in this folder sees:"
+  (cd "$folder" && agent-broker whoami) | js '`   project ${d.project} · stack ${d.stack ?? "-"} · ${Object.entries(d.services).map(([s, c]) => `${s} ${c.site_name ?? c.name ?? ""}${c.token ? "" : " (no token!)"}`.trim()).join(" · ") || "no services"}`'
+  printf '\n'
+}
 
-printf '\n  How many projects do you want to add in this run? (a project = one code folder) [1] '
-read -r PROJECT_COUNT || true
-PROJECT_COUNT=${PROJECT_COUNT:-1}
-[[ "$PROJECT_COUNT" =~ ^[0-9]$ ]] || die "Give a number from 0 to 9."
+# ── Actions ──────────────────────────────────────────────────────────────
 
-if [[ "$MODE" == setup ]]; then
-  TOTAL_STAGES=$((5 + 4 * PROJECT_COUNT))
-  TOTAL_MINUTES=$((13 + 11 * PROJECT_COUNT))
-else
-  TOTAL_STAGES=$((2 + 4 * PROJECT_COUNT))
-  TOTAL_MINUTES=$((2 + 11 * PROJECT_COUNT))
-fi
+action_add_project() {
+  begin "Add a project" 6 10
+  ARGS=() PROJECT_LINES="" P_REF="" MOVED=()
 
-banner "Agent broker — tokens that agents cannot read"
+  stage "Folder" 1
+  ask_default P_PATH "Project folder:" "$( [[ "$PWD" != "$HOME" ]] && printf '%s' "$PWD")"
+  P_PATH=${P_PATH/#\~/$HOME}; P_PATH=${P_PATH%/}
+  [[ -d "$P_PATH" ]] || die "No such folder: $P_PATH"
+  P_PATH=$(cd "$P_PATH" && pwd -P)
+  local default_name
+  default_name=$(basename "$P_PATH" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_\n-' '-')
+  while :; do
+    ask_default P_NAME "Project name:" "$default_name"
+    [[ "$P_NAME" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]] || { warn "Lowercase letters, digits, - and _ only."; continue; }
+    [[ -z "$(agent-broker projects | js "d.find((p) => p.project === '$P_NAME') ? 'y' : ''")" ]] && break
+    warn "$P_NAME already exists. Pick another name (or use menu: Add a folder)."
+  done
 
-stage "What happens" 1
-say "Agents use your Netlify, Vercel, Supabase and Apify accounts only through the broker."
-say "The broker keeps the tokens under a separate macOS user (_deployer). Agents cannot read them."
-if [[ "$MODE" == setup ]]; then
-  step "1. Make a KeePassXC vault: your own copy of every token."
-  step "2. Install the broker (needs your Mac password)."
-fi
-step "Add $PROJECT_COUNT project(s): folder, services, secrets in .env files, account tokens, instructions for its agents."
-[[ "$MODE" == setup ]] && step "Then log out the global logins, so no command falls back to a random account."
-note "Each step that changes the broker asks for your Mac password. That is on purpose."
-pause
+  stage "Account stack" 3
+  choose_stack
 
-if [[ "$MODE" == setup ]]; then
-  stage "Your vault (KeePassXC)" 5
-  say "KeePassXC keeps your own copy of every token. Agents never use it."
+  stage "What it uses" 2
+  choose_pins "$P_PATH"
+
+  stage ".env secrets" 2
+  env_secrets "$P_PATH"
+  if [[ -n "$P_REF" ]] && confirm_yes "Make a read-only database user, so agents can read the database?"; then read_only_user "$P_REF"; fi
+
+  stage "Save (Touch ID)" 1
+  ARGS=(apply --project "$P_NAME" --new-project --path "$P_PATH" --stack "$STACK" ${STACK_NEW:+--new-stack} ${ARGS[@]+"${ARGS[@]}"})
+  if { stack_value_lines; printf '%s' "$PROJECT_LINES"; } | admin "${ARGS[@]}"; then
+    ok "project $P_NAME saved (stack $STACK)"
+    remove_moved
+  else
+    die "Nothing was saved."
+  fi
+  clear_tokens
+  PROJECT_LINES=""
+
+  stage "Tell its agents" 1
+  tell_agents "$P_NAME" "$P_PATH"
+  pause
+}
+
+action_replace_token() {
+  begin "Replace a token" 3 3
+  local stacks
+  stacks=$(stack_lines)
+  [[ -n "$stacks" ]] || { warn "No stacks yet."; pause; return; }
+  stage "Which token" 1
+  pick STACK "Which stack?" "$stacks"
+  pick svc "Which service?" $'Netlify\tnetlify\nSupabase\tsupabase\nApify\tapify\nVercel\tvercel'
+  clear_tokens
+  LOOKUP="{}"
+  stage "New token" 1
+  ask_token "$svc"
+  lookup_tokens
+  say "The new token belongs to:"
+  show_accounts || die "The token did not work."
+  agent-broker stacks | js "const a = d.find((s) => s.stack === '$STACK')?.accounts?.$svc; a ? '   before: ' + [a.name, a.email].filter(Boolean).join(' ') : ''"
+  printf '\n'
+  confirm_yes "Same account as before? Save it for every project on stack $STACK?" || die "Stopped: nothing was saved."
+  stage "Save (Touch ID)" 1
+  stack_value_lines | admin apply --stack "$STACK" && ok "stack $STACK: new $(service_title "$svc") token"
+  clear_tokens
+  step "Now delete the old token on the $(service_title "$svc") website, and update KeePassXC."
+  pause
+}
+
+action_move_project() {
+  begin "Move a project to another stack" 4 6
+  ARGS=() PROJECT_LINES="" P_REF=""
+  local projects
+  projects=$(project_lines)
+  [[ -n "$projects" ]] || { warn "No projects yet."; pause; return; }
+  stage "Project" 1
+  pick P_NAME "Which project?" "$projects"
+  P_PATH=$(agent-broker projects | js "d.find((p) => p.project === '$P_NAME').folders[0]")
+  stage "New stack" 2
+  choose_stack
+  stage "Its site and database in that account" 2
+  choose_pins "$P_PATH"
+  stage "Save (Touch ID)" 1
+  ARGS=(apply --project "$P_NAME" --stack "$STACK" ${STACK_NEW:+--new-stack} ${ARGS[@]+"${ARGS[@]}"})
+  stack_value_lines | admin "${ARGS[@]}" && ok "project $P_NAME now on stack $STACK"
+  clear_tokens
+  tell_agents "$P_NAME" "$P_PATH"
+  pause
+}
+
+action_add_folder() {
+  begin "Add a folder to a project" 2 2
+  local projects
+  projects=$(project_lines)
+  [[ -n "$projects" ]] || { warn "No projects yet."; pause; return; }
+  stage "Folder" 1
+  note "For a second copy of the same repo (a clone or git worktree). Worktrees of a registered repo work already."
+  pick P_NAME "Which project?" "$projects"
+  ask P_PATH "Extra folder:"
+  P_PATH=${P_PATH/#\~/$HOME}
+  [[ -d "$P_PATH" ]] || die "No such folder: $P_PATH"
+  stage "Save (Touch ID)" 1
+  printf '' | admin apply --project "$P_NAME" --add-path "$P_PATH" && ok "$P_NAME: added $P_PATH"
+  pause
+}
+
+action_agents_text() {
+  begin "AGENTS.md text" 1 1
+  local projects
+  projects=$(project_lines)
+  [[ -n "$projects" ]] || { warn "No projects yet."; pause; return; }
+  stage "Project" 1
+  pick P_NAME "Which project?" "$projects"
+  "$SKILL_DIR/scripts/snippet.sh" "$P_NAME" | sed 's/^/    /'
+  tell_agents "$P_NAME" "$(agent-broker projects | js "d.find((p) => p.project === '$P_NAME').folders[0]")"
+  pause
+}
+
+action_setup() {
+  begin "Set up / update the broker" 4 12
+  stage "Your vault (KeePassXC)" 4
+  say "KeePassXC = your own copy of every token. Agents never use it."
   if [[ ! -d /Applications/KeePassXC.app ]]; then
-    if confirm_yes "Install KeePassXC with Homebrew now?"; then brew install --cask keepassxc; else SKIPPED+=("install KeePassXC"); fi
+    if confirm_yes "Install KeePassXC now (Homebrew)?"; then brew install --cask keepassxc; fi
   fi
   mkdir -p "$VAULT_DIR" && chmod 700 "$VAULT_DIR"
   open -a KeePassXC 2>/dev/null || true
   if compgen -G "$VAULT_DIR/*.kdbx" >/dev/null; then
-    step "Unlock your vault in KeePassXC ($(basename "$(compgen -G "$VAULT_DIR/*.kdbx" | head -1)"))."
+    step "Unlock your vault in KeePassXC."
   else
-    step "In KeePassXC click 'Create new database' (or menu Database → New Database)."
-    step "Choose a strong master password that you will not forget."
-    step "Save the file as $VAULT_DIR/tokens.kdbx"
+    step "KeePassXC: Create new database. Strong master password."
+    step "Save it as $VAULT_DIR/tokens.kdbx"
   fi
-  note "Back up the vault later (Syncthing). Without the master password the file is useless to anyone."
   pause "Press Enter when the vault is open"
 
-  stage "Install the broker" 5
-  say "This creates the hidden user _deployer, copies the broker and its own CLIs to /opt/agent-broker,"
-  say "adds the commands agent-broker and agent-broker-admin, and a sudo rule. It downloads about 300 MB."
-  command -v agent-broker >/dev/null && note "Already installed: this updates it."
-  (cd "$BROKER_SRC" && node --test test/*.test.mjs >/dev/null 2>&1) || die "The broker's own tests fail: ask your agent to fix them first."
-  if confirm_yes "Install (or update) now? It asks for your Mac password."; then
-    (cd "$BROKER_SRC" && sudo ./install.sh) || die "The install failed (see above). Fix it, then run the wizard again."
-    agent-broker help >/dev/null || die "agent-broker does not run after the install."
-    DONE+=("broker installed in /opt/agent-broker")
-  else
-    die "The next steps need the broker. Run the wizard again when you are ready."
-  fi
-fi
+  stage "Install the broker (Touch ID)" 5
+  say "Installs the broker, its own CLIs (~300 MB) and the CLI guard. Safe to repeat."
+  (cd "$BROKER_SRC" && node --test test/*.test.mjs >/dev/null 2>&1) || die "The broker's tests fail: ask your agent to fix them."
+  confirm_yes "Install / update now?" || return
+  (cd "$BROKER_SRC" && sudo ./install.sh) || die "The install failed (see above)."
+  ok "broker installed"
 
-for ((i = 1; i <= PROJECT_COUNT; i++)); do
-  # ── Project: folder and services ──
-  stage "Project $i of $PROJECT_COUNT — folder and services" 2
-  say "A project is one code folder. Each service in it uses one account."
-  while :; do
-    ask P_PATH "Project folder (full path):"
-    P_PATH=${P_PATH/#\~/$HOME}
-    P_PATH=${P_PATH%/}
-    [[ -d "$P_PATH" ]] && break
-    warn "No such folder: $P_PATH"
-  done
-  default_name=$(basename "$P_PATH" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_\n-' '-')
-  while :; do
-    ask_default P_NAME "Project name for the broker:" "$default_name"
-    [[ "$P_NAME" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]] && break
-    warn "Use lowercase letters, digits, - and _ only."
-  done
-  args=(project "$P_NAME" --path "$P_PATH")
-  P_SERVICES=()
-  P_REF=""
-
-  site=$(json_field "$P_PATH/.netlify/state.json" siteId)
-  if { [[ -n "$site" ]] && confirm_yes "Netlify: found site $site. Use it?"; } || { [[ -z "$site" ]] && confirm "Does this project deploy to Netlify?"; }; then
-    if [[ -z "$site" ]]; then
-      open_url "https://app.netlify.com"
-      step "Open the project → Project configuration → General → Project details, and copy the Project ID."
-      ask site "Paste the Netlify Project ID:"
-    fi
-    ask_default dir "Folder with the built files, inside the project (e.g. dist, web/dist):" "dist"
-    args+=(--netlify-site "$site" --netlify-dir "$dir")
-    P_SERVICES+=(netlify)
-  fi
-
-  org=$(json_field "$P_PATH/.vercel/project.json" orgId)
-  vproj=$(json_field "$P_PATH/.vercel/project.json" projectId)
-  if { [[ -n "$vproj" ]] && confirm_yes "Vercel: found project $vproj. Use it?"; } || { [[ -z "$vproj" ]] && confirm "Does this project deploy to Vercel?"; }; then
-    if [[ -z "$vproj" ]]; then
-      open_url "https://vercel.com/dashboard"
-      step "Open the project → Settings → General, and copy the Project ID."
-      ask vproj "Paste the Vercel Project ID:"
-      step "Open the team (or personal account) → Settings → General, and copy the Team ID (starts with team_)."
-      ask org "Paste the Team ID:"
-      note "If a label differs on the page, look for the ID fields in those Settings pages."
-    fi
-    args+=(--vercel-org "$org" --vercel-project "$vproj")
-    P_SERVICES+=(vercel)
-  fi
-
-  if confirm "Does this project use a Supabase project?"; then
-    open_url "https://supabase.com/dashboard/projects"
-    step "Open the Supabase project. Its ref is the part after /project/ in the address bar."
-    ask P_REF "Paste the project ref:"
-    args+=(--supabase-ref "$P_REF")
-    P_SERVICES+=(supabase)
-  fi
-
-  actors=$(find "$P_PATH" -maxdepth 3 -path '*/.actor/actor.json' -not -path '*/node_modules/*' 2>/dev/null | wc -l | tr -d ' ')
-  if { [[ "$actors" != 0 ]] && confirm_yes "Apify: found $actors actor folder(s). Use Apify?"; } || { [[ "$actors" == 0 ]] && confirm "Does this project push or run Apify actors?"; }; then
-    args+=(--apify)
-    P_SERVICES+=(apify)
-  fi
-
-  say "Saving the project in the broker (type your Mac password)."
-  services="${P_SERVICES[*]+${P_SERVICES[*]}}"
-  admin "${args[@]}" && DONE+=("project $P_NAME (${services:-no services})")
-  pause
-
-  # ── Project: secrets already in .env files ──
-  stage "Project $P_NAME — secrets already in .env files" 3
-  env_files=()
-  while IFS= read -r f; do env_files+=("$f"); done < <(find "$P_PATH" -maxdepth 1 -type f -name '.env*' ! -name '*.example' ! -name '*.sample' ! -name '*.template' 2>/dev/null | sort)
-  if (( ${#env_files[@]} == 0 )); then
-    say "No .env files in $P_PATH. Nothing to move."
-    pause
-  fi
-  for f in ${env_files[@]+"${env_files[@]}"}; do
-    printf '\n  %s%s%s\n' "$BOLD" "$f" "$RESET"
-    note "Keys: $(grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' "$f" | tr -d '=' | tr '\n' ' ')"
-    suggested=$(secret_looking_keys "$f")
-    say "Agents can read these files. Move the secrets into the broker; keep public values (URLs, anon keys, ids)."
-    ask_default move "Keys to move (space-separated; '-' = none):" "${suggested% }"
-    [[ -z "$move" || "$move" == "-" ]] && continue
-    if confirm_yes "Show their values here so you can copy them into KeePassXC?"; then
-      for k in $move; do grep -m1 "^$k=" "$f" | sed 's/^/    /' || warn "$k is not in $f"; done
-    fi
-    step "Save each value in KeePassXC (entry name: $P_NAME <KEY>)."
-    pause "Press Enter when all of them are in KeePassXC"
-    _clear
-    warn "Code that reads these keys from $f stops working on this Mac (run it on GitHub Actions instead)."
-    if confirm_yes "Move $move into the broker now? They are deleted from $(basename "$f")."; then
-      # shellcheck disable=SC2086 # one argument per key
-      admin import "$P_NAME" "$f" $move && DONE+=("$P_NAME: moved $move out of $(basename "$f")")
-    fi
+  stage "Projects from before stacks" 2
+  local legacy p
+  legacy=$(agent-broker projects | js 'd.filter((p) => !p.stack && p.keys.some((k) => ["NETLIFY_AUTH_TOKEN", "SUPABASE_ACCESS_TOKEN", "APIFY_TOKEN", "VERCEL_TOKEN"].includes(k))).map((p) => p.project).join("\n")')
+  if [[ -z "$legacy" ]]; then say "None. Nothing to move."; fi
+  local p projects=()
+  while IFS= read -r p; do [[ -n "$p" ]] && projects+=("$p"); done <<<"$legacy"
+  for p in ${projects[@]+"${projects[@]}"}; do
+    say "Project $p holds its own account token. Move it into a stack (so other projects can share it)."
+    ask_default STACK "Stack name (name it after the login):" "$p"
+    printf '' | admin apply --stack "$STACK" --new-stack --stack-from-project "$p" --project "$p" && ok "$p: token moved to stack $STACK"
+    tell_agents "$p" "$(agent-broker projects | js "d.find((x) => x.project === '$p').folders[0]")"
   done
 
-  # ── Project: account tokens ──
-  stage "Project $P_NAME — account tokens" 5
-  if (( ${#P_SERVICES[@]} == 0 )); then say "No services for this project, so no account tokens."; pause; fi
-  for svc in ${P_SERVICES[@]+"${P_SERVICES[@]}"}; do
-    case "$svc" in
-      netlify) save_token "$P_NAME" NETLIFY_AUTH_TOKEN "https://app.netlify.com/user/applications#personal-access-tokens" \
-        "Log in to the Netlify account that owns this project. Personal access tokens → New access token; name it agent-broker $P_NAME; pick an expiry if offered." ;;
-      vercel) save_token "$P_NAME" VERCEL_TOKEN "https://vercel.com/account/settings/tokens" \
-        "Create a token; Scope = the team that owns this project; pick an expiry." ;;
-      apify) save_token "$P_NAME" APIFY_TOKEN "https://console.apify.com/settings/integrations" \
-        "Log in to the Apify account that owns the actors, and copy its API token (or create a new one)." ;;
-      supabase)
-        save_token "$P_NAME" SUPABASE_ACCESS_TOKEN "https://supabase.com/dashboard/account/tokens" \
-          "Generate new token; name it agent-broker $P_NAME; if you can limit it to one project, choose this one."
-        if has_key "$P_NAME" SUPABASE_READ_URL; then
-          note "SUPABASE_READ_URL is already stored for $P_NAME (skip)."
-        elif confirm_yes "Create a read-only database user, so agents can run read-only SQL (agent-broker supabase query)?"; then
-          read_only_db_user "$P_NAME" "$P_REF"
-        fi
-        ;;
-    esac
-  done
-  pause
-
-  # ── Project: instructions for agents working in it ──
-  stage "Project $P_NAME — tell its agents" 1
-  if (( ${#P_SERVICES[@]} == 0 )); then
-    say "No services, so agents in this project need no broker instructions."
-  else
-    # shellcheck disable=SC2068 # one argument per service
-    block=$("$SKILL_DIR/scripts/snippet.sh" "$P_NAME" ${P_SERVICES[@]})
-    printf '%s' "$block" | pbcopy
-    say "Agents working in this folder need to know which commands to use. This block is in your clipboard:"
-    printf '%s\n' "$block" | sed -n '1,8p' | sed 's/^/    /'
-    note "    ... ($(printf '%s\n' "$block" | wc -l | tr -d ' ') lines)"
-    target=""
-    for candidate in AGENTS.md AGENTS.MD CLAUDE.md; do [[ -f "$P_PATH/$candidate" ]] && { target="$P_PATH/$candidate"; break; }; done
-    target=${target:-$P_PATH/AGENTS.md}
-    if confirm_yes "Add it to $target? (running again replaces the old block)"; then
-      # shellcheck disable=SC2068
-      "$SKILL_DIR/scripts/snippet.sh" "$P_NAME" ${P_SERVICES[@]} --write "$target" && DONE+=("$P_NAME: agent instructions in $(basename "$target")")
-    else
-      SKIPPED+=("$P_NAME: paste the agent instructions (scripts/snippet.sh $P_NAME) into its AGENTS.md or CLAUDE.md")
-    fi
-  fi
-  pause
-done
-
-stage "Check" 1
-agent-broker projects || warn "agent-broker projects failed"
-say "Each project shows its key names. Values never show here or anywhere else."
-pause
-
-if [[ "$MODE" == setup ]]; then
   stage "Log out the global logins" 1
-  say "After this, a Netlify, Supabase or Apify command run without the broker fails instead of using"
-  say "whatever account happens to be logged in. gh (GitHub) stays logged in."
-  if confirm_yes "Log out of Netlify, Supabase and Apify now?"; then
-    if command -v netlify >/dev/null; then netlify logout || SKIPPED+=("netlify logout"); fi
-    if command -v supabase >/dev/null; then supabase logout --yes || SKIPPED+=("supabase logout"); fi
-    if command -v apify >/dev/null; then apify logout || SKIPPED+=("apify logout"); fi
-    DONE+=("global logins removed (Netlify, Supabase, Apify)")
-  else
-    SKIPPED+=("log out: netlify logout; supabase logout; apify logout")
+  say "Then no command can fall back to whatever account is logged in. gh (GitHub) stays."
+  if confirm_yes "Log out of Netlify, Supabase and Apify?"; then
+    local bin
+    if bin=$(real_cli netlify); then "$bin" logout >/dev/null 2>&1 || true; fi
+    if bin=$(real_cli supabase); then "$bin" logout --yes >/dev/null 2>&1 || true; fi
+    if bin=$(real_cli apify); then "$bin" logout >/dev/null 2>&1 || true; fi
+    ok "logged out of Netlify, Supabase, Apify"
   fi
+  note "Open a new Terminal tab: the CLI guard starts in new shells."
+  pause
+}
+
+# ── Menu ─────────────────────────────────────────────────────────────────
+[[ -t 0 && -t 1 ]] || die "Run this in your own Terminal app, not through an agent."
+[[ "$(uname)" == Darwin ]] || die "This wizard is for macOS."
+command -v node >/dev/null || die "Node is missing. Install it first."
+
+if ! command -v agent-broker >/dev/null || ! agent-broker stacks >/dev/null 2>&1; then
+  command -v brew >/dev/null || die "Homebrew is missing (needed for KeePassXC)."
+  action_setup
 fi
+
+while :; do
+  _clear
+  printf '\n%s%s  Agent broker%s  %s(tokens agents cannot read)%s\n\n' "$BOLD" "$BLUE" "$RESET" "$DIM" "$RESET"
+  printf '   %s1%s  Add a project            %s(new folder; new or existing stack)%s\n' "$BLUE" "$RESET" "$DIM" "$RESET"
+  printf '   %s2%s  Replace a token          %s(one place, every project on the stack)%s\n' "$BLUE" "$RESET" "$DIM" "$RESET"
+  printf '   %s3%s  Move a project           %s(to another stack)%s\n' "$BLUE" "$RESET" "$DIM" "$RESET"
+  printf '   %s4%s  Add a folder             %s(second copy of a project)%s\n' "$BLUE" "$RESET" "$DIM" "$RESET"
+  printf '   %s5%s  AGENTS.md text           %s(for a project)%s\n' "$BLUE" "$RESET" "$DIM" "$RESET"
+  printf '   %s6%s  Set up / update          %s(vault, install, log out)%s\n' "$BLUE" "$RESET" "$DIM" "$RESET"
+  printf '   %s0%s  Done\n\n' "$BLUE" "$RESET"
+  printf '  %sNumber:%s ' "$BOLD" "$RESET"
+  read -r choice || choice=0
+  case "$choice" in
+    1) action_add_project ;;
+    2) action_replace_token ;;
+    3) action_move_project ;;
+    4) action_add_folder ;;
+    5) action_agents_text ;;
+    6) action_setup ;;
+    0 | q | "") break ;;
+  esac
+done
 
 finish
 for d in ${DONE[@]+"${DONE[@]}"}; do note "✓ $d"; done
-printf '\n  Tell your agent "done": it tests the broker with your accounts. Add more projects later with:\n'
-printf '  %s/scripts/wizard.sh add-project\n\n' "$SKILL_DIR"
+printf '\n'

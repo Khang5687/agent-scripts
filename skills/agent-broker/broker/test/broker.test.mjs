@@ -1,8 +1,9 @@
-// Security invariants of the broker: token values never reach output, the project copy never follows links out of
-// the project or carries a stored secret, and only allow-listed actions and paths are accepted.
+// Security and routing invariants of the broker: token values never reach output; the project copy never follows
+// links out of the project or carries a stored secret; the agent's folder (not a name it types) picks the project,
+// and the project picks its account stack; only allow-listed actions and paths are accepted.
 // Runs without sudo: AGENT_BROKER_DEV_ROOT puts the broker's home in a temp folder.
 import assert from 'node:assert/strict';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -15,8 +16,15 @@ const lib = await import('../bin/lib.mjs');
 const BIN = path.resolve(import.meta.dirname, '../bin');
 const TOKEN = 'nfp_TESTtokenVALUE0123456789abcdef';
 
-const broker = (args, input) => spawnSync(process.execPath, [path.join(BIN, 'agent-broker.mjs'), ...args], { env: { ...process.env, AGENT_BROKER_DEV_ROOT: dev }, input, encoding: 'utf8' });
-const admin = (args, input) => spawnSync(process.execPath, [path.join(BIN, 'agent-broker-admin.mjs'), ...args], { env: { ...process.env, AGENT_BROKER_DEV_ROOT: dev }, input, encoding: 'utf8' });
+const env = { ...process.env, AGENT_BROKER_DEV_ROOT: dev, AGENT_BROKER_SKIP_VERIFY: '1' };
+const broker = (args, cwd = dev) => spawnSync(process.execPath, [path.join(BIN, 'agent-broker.mjs'), ...args], { cwd, env, encoding: 'utf8' });
+const admin = (args, input) => spawnSync(process.execPath, [path.join(BIN, 'agent-broker-admin.mjs'), ...args], { env, input, encoding: 'utf8' });
+const ok = (r) => { assert.equal(r.status, 0, r.stderr); return r; };
+const folder = async (...parts) => {
+  const d = path.join(await fs.realpath(dev), 'repos', ...parts);
+  await fs.mkdir(d, { recursive: true });
+  return d;
+};
 
 test.after(() => fs.rm(dev, { recursive: true, force: true }));
 
@@ -87,23 +95,82 @@ test('project copy refuses a file that contains a stored secret', async () => {
   await fs.rm(src, { recursive: true, force: true });
 });
 
-test('admin stores keys; agents see key names only, and paths/actions outside the allow-list are refused', () => {
-  const projectDir = execFileSync('mktemp', ['-d']).toString().trim();
-  assert.equal(admin(['project', 'demo', '--path', projectDir, '--netlify-site', 'site-123', '--netlify-dir', 'web/dist']).status, 0);
-  assert.equal(admin(['set', 'demo', 'NETLIFY_AUTH_TOKEN'], `${TOKEN}\n`).status, 0);
-  assert.equal(admin(['import', 'demo'], 'OTHER_KEY=other-secret-value\n').status, 0);
+test('a stack holds the account token once; every project on it uses it; output shows names, never values', async () => {
+  const shop = await folder('shop');
+  const blog = await folder('blog');
+  ok(admin(['apply', '--stack', 'studio', '--new-stack', '--project', 'shop', '--new-project', '--path', shop, '--netlify-site', 'site-shop', '--netlify-dir', 'dist'],
+    `stack:NETLIFY_AUTH_TOKEN=${TOKEN}\nproject:SUPABASE_READ_URL=postgresql://r.x:dbpass-secret@h:5432/postgres\n`));
+  ok(admin(['apply', '--stack', 'studio', '--project', 'blog', '--new-project', '--path', blog, '--netlify-site', 'site-blog']));
 
-  const listed = broker(['projects']);
-  assert.equal(listed.status, 0);
-  assert.deepEqual(JSON.parse(listed.stdout)[0].keys, ['NETLIFY_AUTH_TOKEN', 'OTHER_KEY']);
-  assert.ok(!listed.stdout.includes(TOKEN) && !listed.stdout.includes('other-secret-value'));
+  assert.equal((await lib.projectSecrets('blog', await lib.loadProject('blog'))).NETLIFY_AUTH_TOKEN, TOKEN);
+  assert.deepEqual(Object.keys(await lib.loadSecrets('blog')), []); // the token is not copied into the project
+  const stacks = JSON.parse(ok(broker(['stacks'])).stdout);
+  assert.deepEqual(stacks[0].projects, ['blog', 'shop']);
+  for (const out of [ok(broker(['stacks'])).stdout, ok(broker(['projects'])).stdout, ok(broker(['whoami'], shop)).stdout]) {
+    assert.ok(!out.includes(TOKEN) && !out.includes('dbpass-secret'), out);
+  }
+  assert.ok((await lib.allSecretValues()).includes(TOKEN)); // stack values are scrubbed too
 
-  const escape = broker(['netlify', 'deploy', 'demo', '--dir', '../..']);
+  // Replacing the stack token once changes it for both projects.
+  ok(admin(['apply', '--stack', 'studio'], 'stack:NETLIFY_AUTH_TOKEN=nfp_rotated_value_0000000000000000\n'));
+  for (const p of ['shop', 'blog']) assert.equal((await lib.projectSecrets(p, await lib.loadProject(p))).NETLIFY_AUTH_TOKEN, 'nfp_rotated_value_0000000000000000');
+  // A project-only value is refused as a stack token.
+  assert.match(admin(['apply', '--stack', 'studio'], 'stack:SUPABASE_READ_URL=x\n').stderr, /not an account token/);
+});
+
+test('the folder picks the project: subfolders, deepest folder, worktrees; wrong folder and old syntax are refused', async () => {
+  const shop = await folder('shop');
+  const sub = await folder('shop', 'src', 'deep');
+  assert.equal(JSON.parse(ok(broker(['whoami'], sub)).stdout).project, 'shop');
+
+  // Nested project folder: the deepest registered folder wins.
+  const inner = await folder('shop', 'admin-app');
+  ok(admin(['apply', '--stack', 'studio', '--project', 'shop-admin', '--new-project', '--path', inner]));
+  assert.equal(JSON.parse(ok(broker(['whoami'], inner)).stdout).project, 'shop-admin');
+  assert.equal(JSON.parse(ok(broker(['whoami'], sub)).stdout).project, 'shop');
+
+  // A git worktree of a registered repository counts as that project; the copy comes from the worktree.
+  await fs.mkdir(path.join(shop, '.git', 'worktrees', 'feat'), { recursive: true });
+  const wt = await folder('shop-feat');
+  await fs.writeFile(path.join(wt, '.git'), `gitdir: ${path.join(shop, '.git', 'worktrees', 'feat')}\n`);
+  const who = JSON.parse(ok(broker(['whoami'], await folder('shop-feat', 'src'))).stdout);
+  assert.equal(who.project, 'shop');
+  assert.equal(who.folder, wt);
+
+  const outside = broker(['netlify', 'status'], await folder('elsewhere'));
+  assert.equal(outside.status, 2);
+  assert.match(outside.stderr, /is not inside a registered project/);
+  const old = broker(['netlify', 'deploy', 'blog'], shop);
+  assert.match(old.stderr, /the project comes from the folder you run in \(here: shop\)/);
+  const other = broker(['netlify', 'status', '--project', 'blog'], shop);
+  assert.match(other.stderr, /belongs to project shop/);
+});
+
+test('one folder holding two projects asks for --project, and accepts only those two', async () => {
+  const mono = await folder('mono');
+  ok(admin(['apply', '--stack', 'studio', '--project', 'web', '--new-project', '--path', mono, '--netlify-site', 'site-web', '--netlify-dir', 'apps/web/dist']));
+  ok(admin(['apply', '--stack', 'studio', '--project', 'api', '--new-project', '--path', mono, '--netlify-site', 'site-api', '--netlify-dir', 'apps/api/dist']));
+  assert.match(broker(['whoami'], mono).stderr, /holds 2 projects: (api, web|web, api).*--project/s);
+  assert.equal(JSON.parse(ok(broker(['whoami', '--project', 'web'], mono)).stdout).project, 'web');
+  assert.match(broker(['whoami', '--project', 'shop'], mono).stderr, /holds 2 projects/);
+});
+
+test('a project that held its own account token moves it into a new stack', async () => {
+  const legacy = await folder('legacy');
+  ok(admin(['apply', '--project', 'legacy', '--new-project', '--path', legacy, '--netlify-site', 'site-legacy'],
+    'project:NETLIFY_AUTH_TOKEN=nfp_legacy_value_00000000000000000\nproject:SUPABASE_READ_URL=postgresql://a:b@c/d\n'));
+  ok(admin(['apply', '--stack', 'thedoor', '--new-stack', '--stack-from-project', 'legacy', '--project', 'legacy']));
+  assert.deepEqual(Object.keys(await lib.loadSecrets('legacy')), ['SUPABASE_READ_URL']);
+  assert.equal((await lib.loadStackSecrets('thedoor')).NETLIFY_AUTH_TOKEN, 'nfp_legacy_value_00000000000000000');
+  assert.equal((await lib.loadProject('legacy')).stack, 'thedoor');
+});
+
+test('only allow-listed actions, options and paths inside the project', async () => {
+  const shop = await folder('shop');
+  const escape = broker(['netlify', 'deploy', '--dir', '../..'], shop);
   assert.equal(escape.status, 2);
   assert.match(escape.stderr, /must be a path inside the project/);
-  const unknown = broker(['netlify', 'env:list', 'demo']);
-  assert.equal(unknown.status, 2);
-  assert.match(unknown.stderr, /has no action "env:list"/);
-  const flag = broker(['netlify', 'deploy', 'demo', '--debug']);
-  assert.match(flag.stderr, /unknown option --debug/);
+  assert.match(broker(['netlify', 'env:list'], shop).stderr, /has no action "env:list"/);
+  assert.match(broker(['netlify', 'deploy', '--debug'], shop).stderr, /unknown option --debug/);
+  assert.match(broker(['supabase', 'query', 'select 1'], shop).stderr, /does not use supabase/);
 });

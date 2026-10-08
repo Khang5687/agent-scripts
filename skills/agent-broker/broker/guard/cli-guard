@@ -1,0 +1,64 @@
+#!/bin/bash
+# CLI guard, installed as netlify / supabase / apify / vercel in /opt/agent-broker/guard (first in PATH, see
+# install.sh). Local work passes through to the real CLI; anything that needs an account (login, deploy, link, remote
+# database, secrets) stops with a pointer to agent-broker, so no command falls back to whatever account is logged in.
+# The real CLI is the next one with this name in PATH. Guide: agent-scripts/skills/agent-broker/SKILL.md
+set -euo pipefail
+name=$(basename "$0")
+here=$(cd "$(dirname "$0")" && pwd -P)
+
+real=""
+IFS=: read -r -a dirs <<<"$PATH"
+for d in "${dirs[@]}"; do
+  [[ -z "$d" ]] && continue
+  [[ "$(cd "$d" 2>/dev/null && pwd -P)" == "$here" ]] && continue
+  if [[ -x "$d/$name" && ! -d "$d/$name" ]]; then real="$d/$name"; break; fi
+done
+
+block() {
+  {
+    echo "$name $*: needs an account, which agents reach only through the agent broker on this Mac."
+    echo "  Run it from the project folder:  agent-broker whoami   then   agent-broker help"
+  } >&2
+  exit 2
+}
+
+args=("$@")
+first=${1:-}
+case "$name" in
+  netlify)
+    case "$first" in
+      dev | build | serve | functions:build | functions:serve | functions:create | completion | help | -h | --help | -v | --version | "") ;;
+      *) block "${args[@]}" ;;
+    esac
+    ;;
+  supabase)
+    case "$first" in
+      start | stop | status | init | test | completion | help | -h | --help | -v | --version | "") ;;
+      migration)
+        case "${2:-}" in new | squash | list | up | down | repair | fetch) [[ " ${args[*]} " == *" --local "* || "${2:-}" == new ]] || block "${args[@]}" ;; *) block "${args[@]}" ;; esac
+        ;;
+      db | gen | functions | seed | inspect)
+        if [[ "$first ${2:-}" == "functions new" || "$first ${2:-}" == "functions serve" ]]; then :;
+        elif [[ " ${args[*]} " == *" --local "* ]]; then :;
+        else block "${args[@]}"; fi
+        ;;
+      *) block "${args[@]}" ;;
+    esac
+    ;;
+  apify)
+    case "$first" in
+      create | init | run | validate-schema | templates | help | -h | --help | -v | --version | "") ;;
+      *) block "${args[@]}" ;;
+    esac
+    ;;
+  vercel)
+    case "$first" in
+      build | dev | help | -h | --help | -v | --version | "") ;;
+      *) block "${args[@]}" ;;
+    esac
+    ;;
+esac
+
+[[ -n "$real" ]] || { echo "$name is not installed (only the agent-broker guard is)" >&2; exit 127; }
+exec "$real" "$@"

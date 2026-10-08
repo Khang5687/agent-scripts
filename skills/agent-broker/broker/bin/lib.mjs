@@ -1,4 +1,5 @@
-// Agent broker: shared paths, project registry, token files, output scrubbing and the project copy.
+// Agent broker: shared paths, the registry (account stacks + projects), token files, output scrubbing, the project
+// copy and folder -> project resolution.
 // Runs as the _deployer user (sudo). Agents (the normal user) cannot read _deployer's home, where the tokens live.
 // Guide: agent-scripts/skills/agent-broker/SKILL.md
 import { spawn } from 'node:child_process';
@@ -15,13 +16,19 @@ if (DEV && os.userInfo().username === '_deployer') throw new Error('AGENT_BROKER
 export const ROOT = DEV ? path.join(DEV, 'opt') : '/opt/agent-broker';
 export const HOME = DEV ? path.join(DEV, 'home') : '/Users/_deployer';
 export const DIR = {
-  projects: path.join(HOME, 'projects'), // <project>.json   configuration (no secrets)
-  secrets: path.join(HOME, 'secrets'), //   <project>.env    KEY=VALUE, one per line
-  work: path.join(HOME, 'work'), //         <project>/       copies of the project folders that CLIs run in
-  queue: path.join(HOME, 'queue'), //       <id>.json        admin queries waiting for approval
-  log: path.join(HOME, 'log'), //           broker.log       one line per call, no secret values
+  stacks: path.join(HOME, 'stacks'), //               <stack>.json     one login per service (no secrets)
+  stackSecrets: path.join(HOME, 'stack-secrets'), //  <stack>.env      account tokens, KEY=VALUE per line
+  projects: path.join(HOME, 'projects'), //           <project>.json   folders, stack, pinned site/ref (no secrets)
+  secrets: path.join(HOME, 'secrets'), //             <project>.env    per-project values (database URLs, ...)
+  work: path.join(HOME, 'work'), //                   <project>/       copies of the project folders that CLIs run in
+  queue: path.join(HOME, 'queue'), //                 <id>.json        admin queries waiting for approval
+  log: path.join(HOME, 'log'), //                     broker.log       one line per call, no secret values
   tmp: path.join(HOME, 'tmp'),
 };
+
+/** Account tokens live in the stack; a project value of the same name overrides it (e.g. a project-scoped token). */
+export const ACCOUNT_KEYS = ['NETLIFY_AUTH_TOKEN', 'SUPABASE_ACCESS_TOKEN', 'APIFY_TOKEN', 'VERCEL_TOKEN'];
+export const SERVICES = ['netlify', 'vercel', 'supabase', 'apify'];
 export const CA_FILE = path.join(path.dirname(new URL(import.meta.url).pathname), 'supabase-ca.pem');
 const TOOL_PATH = DEV
   ? process.env.PATH
@@ -47,28 +54,38 @@ export async function mkdirs() {
 
 // ---- Registry ----------------------------------------------------------------------------------------------------
 
-export async function loadProject(name) {
-  checkName(name);
+async function readJson(dir, name, what) {
   try {
-    return JSON.parse(await fs.readFile(path.join(DIR.projects, `${name}.json`), 'utf8'));
+    return JSON.parse(await fs.readFile(path.join(dir, `${checkName(name, what)}.json`), 'utf8'));
   } catch (e) {
-    if (e.code === 'ENOENT') fail(`unknown project: ${name} (list them with: agent-broker projects)`);
+    if (e.code === 'ENOENT') fail(`unknown ${what}: ${name} (list them with: agent-broker ${what === 'stack' ? 'stacks' : 'projects'})`);
     throw e;
   }
 }
 
-export async function saveProject(name, config) {
-  await writePrivate(path.join(DIR.projects, `${checkName(name)}.json`), `${JSON.stringify(config, null, 2)}\n`);
-}
-
-export async function listProjects() {
-  const files = await fs.readdir(DIR.projects).catch(() => []);
+async function listNames(dir) {
+  const files = await fs.readdir(dir).catch(() => []);
   return files.filter((f) => f.endsWith('.json')).map((f) => f.slice(0, -5)).sort();
 }
 
+/** A project: { stack?, paths: [realpath...], netlify?, vercel?, supabase?, apify?, note? }. */
+export async function loadProject(name) {
+  const p = await readJson(DIR.projects, name, 'project');
+  if (p.path && !p.paths) { p.paths = [p.path]; delete p.path; } // registered before folders became a list
+  p.paths ??= [];
+  return p;
+}
+export const saveProject = (name, config) => writePrivate(path.join(DIR.projects, `${checkName(name)}.json`), `${JSON.stringify(config, null, 2)}\n`);
+export const listProjects = () => listNames(DIR.projects);
+
+/** A stack: { accounts: { netlify: { slug, email }, supabase: { orgs }, ... }, note? }. */
+export const loadStack = (name) => readJson(DIR.stacks, name, 'stack');
+export const saveStack = (name, config) => writePrivate(path.join(DIR.stacks, `${checkName(name, 'stack')}.json`), `${JSON.stringify(config, null, 2)}\n`);
+export const listStacks = () => listNames(DIR.stacks);
+
 /** Token file: KEY=VALUE per line, the value taken literally (no quotes, no expansion). */
-export async function loadSecrets(name) {
-  const text = await fs.readFile(path.join(DIR.secrets, `${checkName(name)}.env`), 'utf8').catch((e) => (e.code === 'ENOENT' ? '' : Promise.reject(e)));
+async function readEnv(file) {
+  const text = await fs.readFile(file, 'utf8').catch((e) => (e.code === 'ENOENT' ? '' : Promise.reject(e)));
   const out = {};
   for (const line of text.split('\n')) {
     const i = line.indexOf('=');
@@ -76,17 +93,92 @@ export async function loadSecrets(name) {
   }
   return out;
 }
-
-export async function saveSecrets(name, secrets) {
+async function writeEnv(file, secrets) {
   const body = Object.keys(secrets).sort().map((k) => `${k}=${secrets[k]}`).join('\n');
-  await writePrivate(path.join(DIR.secrets, `${checkName(name)}.env`), body ? `${body}\n` : '');
+  await writePrivate(file, body ? `${body}\n` : '');
+}
+export const loadSecrets = (name) => readEnv(path.join(DIR.secrets, `${checkName(name)}.env`));
+export const saveSecrets = (name, secrets) => writeEnv(path.join(DIR.secrets, `${checkName(name)}.env`), secrets);
+export const loadStackSecrets = (name) => readEnv(path.join(DIR.stackSecrets, `${checkName(name, 'stack')}.env`));
+export const saveStackSecrets = (name, secrets) => writeEnv(path.join(DIR.stackSecrets, `${checkName(name, 'stack')}.env`), secrets);
+
+/** The values a project runs with: its stack's account tokens, overridden by the project's own values. */
+export async function projectSecrets(name, project) {
+  return { ...(project.stack ? await loadStackSecrets(project.stack) : {}), ...(await loadSecrets(name)) };
 }
 
-/** Values of every project's tokens: the scrubber removes all of them from output, not only the current project's. */
+/** Every stored value of every stack and project: the scrubber removes all of them, not only the caller's. */
 export async function allSecretValues() {
   const values = [];
+  for (const name of await listStacks()) values.push(...Object.values(await loadStackSecrets(name)));
   for (const name of await listProjects()) values.push(...Object.values(await loadSecrets(name)));
   return values;
+}
+
+// ---- Folder -> project -------------------------------------------------------------------------------------------
+
+const within = (dir, root) => dir === root || dir.startsWith(root.endsWith(path.sep) ? root : root + path.sep);
+
+/** For a git worktree (its .git is a file pointing into <main>/.git/worktrees/<n>): { worktreeRoot, mainRoot }. */
+async function worktreeOf(dir) {
+  for (let d = dir; ; d = path.dirname(d)) {
+    const st = await fs.lstat(path.join(d, '.git')).catch(() => null);
+    if (st?.isDirectory()) return null;
+    if (st?.isFile()) {
+      const text = await fs.readFile(path.join(d, '.git'), 'utf8').catch(() => '');
+      const m = text.match(/^gitdir:\s*(.+?)\s*$/m);
+      const main = m && path.resolve(d, m[1]).match(/^(.+)\/\.git\/worktrees\/[^/]+$/);
+      return main ? { worktreeRoot: d, mainRoot: await fs.realpath(main[1]).catch(() => main[1]) } : null;
+    }
+    if (d === path.dirname(d)) return null;
+  }
+}
+
+/** Projects whose registered folder holds `dir`, deepest folder first: [{ name, project, folder }]. */
+async function matches(dir) {
+  const found = [];
+  for (const name of await listProjects()) {
+    const project = await loadProject(name);
+    for (const folder of project.paths) if (within(dir, folder)) found.push({ name, project, folder });
+  }
+  return found.sort((a, b) => b.folder.length - a.folder.length);
+}
+
+/**
+ * The project for the folder an agent runs in. The deepest registered folder holding `cwd` wins; a git worktree
+ * of a registered repository counts as that repository. `explicit` (--project) only picks between projects that
+ * share the deepest folder. Returns { name, project, root }: root is the folder to copy (the worktree's own files
+ * for a worktree).
+ */
+export async function resolveProject(cwd, explicit) {
+  const dir = await fs.realpath(cwd).catch(() => cwd);
+  let found = await matches(dir);
+  let rootFor = (folder) => folder;
+  if (!found.length) {
+    const wt = await worktreeOf(dir);
+    if (wt) {
+      found = (await matches(path.join(wt.mainRoot, path.relative(wt.worktreeRoot, dir)))).filter((m) => within(m.folder, wt.mainRoot));
+      rootFor = (folder) => path.join(wt.worktreeRoot, path.relative(wt.mainRoot, folder));
+    }
+  }
+  if (!found.length) {
+    const all = [];
+    for (const name of await listProjects()) all.push(`${name} -> ${(await loadProject(name)).paths.join(', ')}`);
+    fail(`${dir} is not inside a registered project.\n  registered: ${all.join('; ') || 'none'}\n`
+      + '  cd into a project folder, or ask the owner to run the wizard ("Add a project" / "Add a folder").');
+  }
+  const deepest = found.filter((m) => m.folder.length === found[0].folder.length);
+  let pick = deepest[0];
+  if (deepest.length > 1) {
+    pick = deepest.find((m) => m.name === explicit);
+    if (!pick) {
+      fail(`this folder holds ${deepest.length} projects: ${deepest.map((m) => m.name).join(', ')}.\n`
+        + `  cd into one of their folders, or add ${deepest.map((m) => `--project ${m.name}`).join(' | ')}.`);
+    }
+  } else if (explicit && explicit !== pick.name) {
+    fail(`--project ${explicit} does not match this folder: it belongs to project ${pick.name}. The folder decides the project; cd into ${explicit}'s folder instead.`);
+  }
+  return { name: pick.name, project: pick.project, root: rootFor(pick.folder) };
 }
 
 async function writePrivate(file, body) {

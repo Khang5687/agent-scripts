@@ -6,15 +6,15 @@ set -euo pipefail
 ADMIN=(/usr/bin/sudo -u _deployer /opt/agent-broker/bin/agent-broker-admin.mjs)
 
 case "${1:-}" in
-  set)
-    [ $# -eq 3 ] || { echo "usage: agent-broker-admin set <project> <KEY>" >&2; exit 2; }
+  set | set-stack)
+    [ $# -eq 3 ] || { echo "usage: agent-broker-admin $1 <name> <KEY>" >&2; exit 2; }
     if [ -t 0 ]; then
       IFS= read -rsp "Value for $3 (hidden, paste then Enter): " value
       echo
     else
       IFS= read -r value || true # piped in (e.g. by the wizard); sudo still asks for the password on the terminal
     fi
-    printf '%s' "$value" | "${ADMIN[@]}" set "$2" "$3"
+    printf '%s' "$value" | "${ADMIN[@]}" "$1" "$2" "$3"
     ;;
   import)
     # import <project> <env-file> <KEY>...: moves the keys into the broker, then deletes those lines from the file.

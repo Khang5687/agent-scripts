@@ -1,62 +1,66 @@
 #!/opt/agent-broker/node/bin/node
 // agent-broker: the only way agents use Netlify, Vercel, Supabase and Apify accounts on this Mac.
-// Runs as _deployer through `sudo -n -u _deployer` (wrapper /usr/local/bin/agent-broker). Agents name a project; the
-// broker picks that project's account, runs a fixed action and returns output with secrets removed.
+// Runs as _deployer through `sudo -n -u _deployer` (wrapper /usr/local/bin/agent-broker). The folder the agent runs
+// in decides the project; the project decides its account stack and the one site / database it may touch. Agents
+// never name an account, a site or a database. Output has secrets removed.
 // Guide: agent-scripts/skills/agent-broker/SKILL.md
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {
-  CA_FILE, DIR, UsageError, allSecretValues, assertNoSecret, audit, checkName, checkRelative, fail, listProjects,
-  loadProject, loadSecrets, makeScrubber, mkdirs, parseArgs, run, syncProject,
+  CA_FILE, DIR, NAME, SERVICES, UsageError, allSecretValues, assertNoSecret, audit, checkName, checkRelative, fail,
+  listProjects, listStacks, loadProject, loadSecrets, loadStack, loadStackSecrets, makeScrubber, mkdirs, parseArgs,
+  projectSecrets, resolveProject, run, syncProject,
 } from './lib.mjs';
 
-const HELP = `agent-broker <service> <action> <project> [options]
+const HELP = `agent-broker <service> <action> [options]      run inside the project's folder: the folder picks the project
 
-  agent-broker projects                 projects, their services and stored key names (never values)
-  agent-broker result <id>              result of an approved Supabase admin query
+  agent-broker whoami        this folder's project, account stack, site and database
+  agent-broker projects      all projects and their folders     agent-broker stacks   all account stacks
+  agent-broker result <id>   result of an approved Supabase admin query
 
-netlify  deploy <p> [--prod] [--message M] [--dir D]   deploy files that are already built (no build step)
-         status <p> | deploys <p>                      site and recent deploys
-         logs <p> [--since 1h] [--function NAME]...    function logs
-         blobs-list <p> <store> [--prefix P]           Netlify Blobs: keys
-         blobs-get <p> <store> <key>                   Netlify Blobs: value bytes to stdout
-         blobs-meta <p> <store> <key>                  Netlify Blobs: metadata
-vercel   deploy <p> [--prod]                           deploy .vercel/output built with \`vercel build\`
-         settings <p>                                  print .vercel/project.json (no environment values)
-         deploys <p> | logs <p> <deployment-url-or-id>
-supabase query <p> "<SQL>"                             read-only database user
-         migrate <p> [--dry-run] [--include-all]       apply supabase/migrations
-         admin-query <p> "<SQL>"                       full rights; waits for the owner's approval
-apify    push <p> [--dir D] [--force] [--version V] [--build-tag T]
-         pull <p> <actor>                              actor source as a tar stream on stdout
-         info <p> <actor> | builds <p> <actor> | build-log <p> <build-id>
-         runs <p> <actor> | run-info <p> <run-id> | logs <p> <run-id>
-         call <p> <actor> [--input-file F | --input JSON] [--build B] [--memory MB] [--timeout S]
+netlify  deploy [--prod] [--message M] [--dir D]        deploy files already built (no build step); draft unless --prod
+         status | deploys | logs [--since 1h] [--function NAME]...
+         blobs-list <store> [--prefix P] | blobs-get <store> <key> | blobs-meta <store> <key>
+vercel   deploy [--prod]                                deploy .vercel/output built with \`vercel build\`
+         settings                                       .vercel/project.json for \`vercel build\` (no environment values)
+         deploys | logs <deployment-url-or-id>
+supabase query "<SQL>"                                  read-only database user
+         migrate [--dry-run] [--include-all]            apply supabase/migrations
+         admin-query "<SQL>"                            full rights; waits for the owner's approval
+apify    push [--dir D] [--force] [--version V] [--build-tag T]
+         pull <actor>                                   actor source as a tar stream on stdout
+         info <actor> | builds <actor> | build-log <build-id> | runs <actor> | run-info <run-id> | logs <run-id>
+         call <actor> [--input-file F | --input JSON] [--build B] [--memory MB] [--timeout S]
 
+--project NAME only chooses between projects that share one folder (a repo root holding two projects).
 Commands that print keys, passwords or environment values are not offered.`;
 
 const ACTOR = /^[A-Za-z0-9][A-Za-z0-9~/._-]{0,200}$/;
 const ID = /^[A-Za-z0-9._-]{1,200}$/;
 const checkId = (v, what) => (ID.test(v ?? '') ? v : fail(`invalid ${what}: ${v ?? '(missing)'}`));
 const checkActor = (v) => (ACTOR.test(v ?? '') ? v : fail(`invalid actor: ${v ?? '(missing)'}`));
+const none = (rest) => { if (rest.length) fail(`unexpected arguments: ${rest.join(' ')}`); };
 const json = (v) => process.stdout.write(`${JSON.stringify(v, null, 2)}\n`);
 
-async function context(projectName, service, needs) {
-  const project = await loadProject(projectName);
-  const config = project[service];
-  if (!config) fail(`project ${projectName} has no ${service} account (owner: agent-broker-admin project ${projectName} ...)`);
-  const secrets = await loadSecrets(projectName);
-  for (const k of needs) if (!secrets[k]) fail(`project ${projectName} has no ${k} stored (owner: agent-broker-admin set ${projectName} ${k})`);
+const KEY_FOR = { netlify: 'NETLIFY_AUTH_TOKEN', vercel: 'VERCEL_TOKEN', supabase: 'SUPABASE_ACCESS_TOKEN', apify: 'APIFY_TOKEN' };
+
+/** P = { name, project, root } from resolveProject. */
+async function context(P, service, needs) {
+  const config = P.project[service];
+  if (!config) fail(`project ${P.name} does not use ${service} (owner: wizard -> "Add a project" to add it)`);
+  const secrets = await projectSecrets(P.name, P.project);
+  for (const k of needs) {
+    if (!secrets[k]) fail(`project ${P.name} has no ${k}${P.project.stack ? ` (stack ${P.project.stack})` : ''}: ask the owner to run the wizard`);
+  }
   const values = await allSecretValues();
-  return { project, config, secrets, values, scrub: makeScrubber(values) };
+  return { project: P.project, config, secrets, values, scrub: makeScrubber(values) };
 }
 
-async function workCopy(name, ctx) {
-  if (!ctx.project.path) fail(`project ${name} has no folder (owner: agent-broker-admin project ${name} --path DIR)`);
-  const dest = path.join(DIR.work, name);
-  const { changed, skipped } = await syncProject(ctx.project.path, dest, ctx.values);
-  process.stderr.write(`agent-broker: copied ${changed} changed file(s) from ${ctx.project.path}${skipped.length ? `; left out ${skipped.length} (links outside the project, or files only you can read): ${skipped.slice(0, 5).join(', ')}${skipped.length > 5 ? ', ...' : ''}` : ''}\n`);
+async function workCopy(P, ctx) {
+  const dest = path.join(DIR.work, P.name);
+  const { changed, skipped } = await syncProject(P.root, dest, ctx.values);
+  process.stderr.write(`agent-broker: copied ${changed} changed file(s) from ${P.root}${skipped.length ? `; left out ${skipped.length} (links outside the project, or files only you can read): ${skipped.slice(0, 5).join(', ')}${skipped.length > 5 ? ', ...' : ''}` : ''}\n`);
   return dest;
 }
 
@@ -80,55 +84,58 @@ async function blobStore(ctx, name) {
 }
 
 const checkKey = (k) => (k && k.length <= 600 && !/[\0-\x1f]/.test(k) ? k : fail(`invalid blob key: ${k ?? '(missing)'}`));
+const netlifyEnv = (ctx) => ({ NETLIFY_AUTH_TOKEN: ctx.secrets.NETLIFY_AUTH_TOKEN, NETLIFY_SITE_ID: ctx.config.site_id });
 
 const netlify = {
-  async deploy(name, args) {
+  async deploy(P, args) {
     const { opts, positional } = parseArgs(args, { prod: 'bool', message: 'string', dir: 'string' });
-    if (positional.length) fail(`unexpected arguments: ${positional.join(' ')}`);
-    const ctx = await context(name, 'netlify', ['NETLIFY_AUTH_TOKEN']);
+    none(positional);
+    const ctx = await context(P, 'netlify', ['NETLIFY_AUTH_TOKEN']);
     const dir = checkRelative(opts.dir ?? ctx.config.dir, '--dir');
-    const work = await workCopy(name, ctx);
+    const work = await workCopy(P, ctx);
     if (!(await fs.stat(path.join(work, dir)).catch(() => null))?.isDirectory()) fail(`${dir} does not exist: build the project first`);
     const cli = ['deploy', '--no-build', '--dir', dir, '--site', ctx.config.site_id];
     if (opts.prod) cli.push('--prod');
     if (opts.message) cli.push('--message', opts.message);
-    return run('netlify', cli, { cwd: work, env: { NETLIFY_AUTH_TOKEN: ctx.secrets.NETLIFY_AUTH_TOKEN, NETLIFY_SITE_ID: ctx.config.site_id }, scrub: ctx.scrub });
+    return run('netlify', cli, { cwd: work, env: netlifyEnv(ctx), scrub: ctx.scrub });
   },
-  async status(name) {
-    const ctx = await context(name, 'netlify', ['NETLIFY_AUTH_TOKEN']);
+  async status(P, args) {
+    none(args);
+    const ctx = await context(P, 'netlify', ['NETLIFY_AUTH_TOKEN']);
     const s = await netlifyApi(ctx, `/sites/${ctx.config.site_id}`);
     const d = s.published_deploy ?? {};
     json({ name: s.name, url: s.ssl_url ?? s.url, admin_url: s.admin_url, account: s.account_slug,
       published_deploy: { id: d.id, state: d.state, published_at: d.published_at, title: d.title } });
     return 0;
   },
-  async deploys(name) {
-    const ctx = await context(name, 'netlify', ['NETLIFY_AUTH_TOKEN']);
+  async deploys(P, args) {
+    none(args);
+    const ctx = await context(P, 'netlify', ['NETLIFY_AUTH_TOKEN']);
     const list = await netlifyApi(ctx, `/sites/${ctx.config.site_id}/deploys?per_page=10`);
     json(list.map((d) => ({ id: d.id, state: d.state, context: d.context, created_at: d.created_at, title: d.title, url: d.deploy_ssl_url })));
     return 0;
   },
-  async logs(name, args) {
+  async logs(P, args) {
     const { opts, positional } = parseArgs(args, { since: 'string', function: 'list' });
-    if (positional.length) fail(`unexpected arguments: ${positional.join(' ')}`);
+    none(positional);
     const since = opts.since ?? '1h';
     if (!/^\d{1,4}[smhd]$/.test(since)) fail('--since must look like 30m, 1h, 2d');
     const fns = (opts.function ?? []).map((f) => checkName(f, 'function'));
-    const ctx = await context(name, 'netlify', ['NETLIFY_AUTH_TOKEN']);
+    const ctx = await context(P, 'netlify', ['NETLIFY_AUTH_TOKEN']);
     const cli = ['logs', '--source', 'functions', '--since', since, ...(fns.length ? ['--function', ...fns] : [])];
-    return run('netlify', cli, { cwd: await scratch(), env: { NETLIFY_AUTH_TOKEN: ctx.secrets.NETLIFY_AUTH_TOKEN, NETLIFY_SITE_ID: ctx.config.site_id }, scrub: ctx.scrub });
+    return run('netlify', cli, { cwd: await scratch(), env: netlifyEnv(ctx), scrub: ctx.scrub });
   },
-  async 'blobs-list'(name, args) {
+  async 'blobs-list'(P, args) {
     const { opts, positional: [store, ...rest] } = parseArgs(args, { prefix: 'string' });
-    if (rest.length) fail(`unexpected arguments: ${rest.join(' ')}`);
-    const ctx = await context(name, 'netlify', ['NETLIFY_AUTH_TOKEN']);
+    none(rest);
+    const ctx = await context(P, 'netlify', ['NETLIFY_AUTH_TOKEN']);
     const { blobs } = await (await blobStore(ctx, store)).list(opts.prefix ? { prefix: opts.prefix } : {});
     for (const b of blobs) process.stdout.write(`${JSON.stringify({ key: b.key, etag: b.etag })}\n`);
     return 0;
   },
-  async 'blobs-get'(name, [store, key, ...rest]) {
-    if (rest.length) fail(`unexpected arguments: ${rest.join(' ')}`);
-    const ctx = await context(name, 'netlify', ['NETLIFY_AUTH_TOKEN']);
+  async 'blobs-get'(P, [store, key, ...rest]) {
+    none(rest);
+    const ctx = await context(P, 'netlify', ['NETLIFY_AUTH_TOKEN']);
     const body = await (await blobStore(ctx, store)).get(checkKey(key), { type: 'arrayBuffer' });
     if (body == null) { process.stderr.write(`agent-broker: no blob ${store}/${key}\n`); return 3; }
     const buf = Buffer.from(body);
@@ -136,9 +143,9 @@ const netlify = {
     await new Promise((resolve, reject) => process.stdout.write(buf, (e) => (e ? reject(e) : resolve())));
     return 0;
   },
-  async 'blobs-meta'(name, [store, key, ...rest]) {
-    if (rest.length) fail(`unexpected arguments: ${rest.join(' ')}`);
-    const ctx = await context(name, 'netlify', ['NETLIFY_AUTH_TOKEN']);
+  async 'blobs-meta'(P, [store, key, ...rest]) {
+    none(rest);
+    const ctx = await context(P, 'netlify', ['NETLIFY_AUTH_TOKEN']);
     const meta = await (await blobStore(ctx, store)).getMetadata(checkKey(key));
     if (!meta) { process.stderr.write(`agent-broker: no blob ${store}/${key}\n`); return 3; }
     process.stdout.write(`${ctx.scrub(JSON.stringify({ etag: meta.etag, metadata: meta.metadata }))}\n`);
@@ -151,18 +158,19 @@ const netlify = {
 const vercelEnv = (ctx) => ({ VERCEL_TOKEN: ctx.secrets.VERCEL_TOKEN, VERCEL_ORG_ID: ctx.config.org_id, VERCEL_PROJECT_ID: ctx.config.project_id });
 
 const vercel = {
-  async deploy(name, args) {
+  async deploy(P, args) {
     const { opts, positional } = parseArgs(args, { prod: 'bool' });
-    if (positional.length) fail(`unexpected arguments: ${positional.join(' ')}`);
-    const ctx = await context(name, 'vercel', ['VERCEL_TOKEN']);
-    const work = await workCopy(name, ctx);
-    if (!(await fs.stat(path.join(work, '.vercel', 'output')).catch(() => null))) fail('.vercel/output does not exist: run `vercel build` first (use `agent-broker vercel settings` for .vercel/project.json)');
+    none(positional);
+    const ctx = await context(P, 'vercel', ['VERCEL_TOKEN']);
+    const work = await workCopy(P, ctx);
+    if (!(await fs.stat(path.join(work, '.vercel', 'output')).catch(() => null))) fail('.vercel/output does not exist: run `vercel build` first (`agent-broker vercel settings > .vercel/project.json` gives its settings)');
     const cli = ['deploy', '--prebuilt', '--yes'];
     if (opts.prod) cli.push('--prod');
     return run('vercel', cli, { cwd: work, env: vercelEnv(ctx), scrub: ctx.scrub });
   },
-  async settings(name) {
-    const ctx = await context(name, 'vercel', ['VERCEL_TOKEN']);
+  async settings(P, args) {
+    none(args);
+    const ctx = await context(P, 'vercel', ['VERCEL_TOKEN']);
     const dir = await scratch();
     try {
       const code = await run('vercel', ['pull', '--yes', '--environment', 'production'],
@@ -174,18 +182,19 @@ const vercel = {
       await fs.rm(dir, { recursive: true, force: true }); // .vercel/.env.*.local holds environment values
     }
   },
-  async deploys(name) {
-    const ctx = await context(name, 'vercel', ['VERCEL_TOKEN']);
+  async deploys(P, args) {
+    none(args);
+    const ctx = await context(P, 'vercel', ['VERCEL_TOKEN']);
     const q = new URLSearchParams({ projectId: ctx.config.project_id, limit: '10', ...(ctx.config.org_id?.startsWith('team_') ? { teamId: ctx.config.org_id } : {}) });
     const res = await fetch(`https://api.vercel.com/v6/deployments?${q}`, { headers: { Authorization: `Bearer ${ctx.secrets.VERCEL_TOKEN}` } });
     if (!res.ok) fail(`Vercel API ${res.status}: ${ctx.scrub(await res.text()).slice(0, 500)}`);
     json((await res.json()).deployments.map((d) => ({ id: d.uid, state: d.state ?? d.readyState, target: d.target, created: new Date(d.created).toISOString(), url: d.url })));
     return 0;
   },
-  async logs(name, [deployment, ...rest]) {
-    if (rest.length) fail(`unexpected arguments: ${rest.join(' ')}`);
+  async logs(P, [deployment, ...rest]) {
+    none(rest);
     if (!/^[A-Za-z0-9._:/-]{1,300}$/.test(deployment ?? '')) fail('give a deployment URL or id');
-    const ctx = await context(name, 'vercel', ['VERCEL_TOKEN']);
+    const ctx = await context(P, 'vercel', ['VERCEL_TOKEN']);
     return run('vercel', ['inspect', deployment, '--logs'], { cwd: await scratch(), env: vercelEnv(ctx), scrub: ctx.scrub });
   },
 };
@@ -195,9 +204,9 @@ const vercel = {
 const ROW_LIMIT = 2000;
 
 const supabase = {
-  async query(name, args) {
-    if (args.length !== 1) fail('give the SQL as one argument: agent-broker supabase query <project> "select ..."');
-    const ctx = await context(name, 'supabase', ['SUPABASE_READ_URL']);
+  async query(P, args) {
+    if (args.length !== 1) fail('give the SQL as one argument: agent-broker supabase query "select ..."');
+    const ctx = await context(P, 'supabase', ['SUPABASE_READ_URL']);
     const { default: pg } = await import('pg');
     const client = new pg.Client({
       connectionString: ctx.secrets.SUPABASE_READ_URL,
@@ -223,11 +232,11 @@ const supabase = {
       await client.end().catch(() => {});
     }
   },
-  async migrate(name, args) {
+  async migrate(P, args) {
     const { opts, positional } = parseArgs(args, { 'dry-run': 'bool', 'include-all': 'bool' });
-    if (positional.length) fail(`unexpected arguments: ${positional.join(' ')}`);
-    const ctx = await context(name, 'supabase', ['SUPABASE_ACCESS_TOKEN']);
-    const work = await workCopy(name, ctx);
+    none(positional);
+    const ctx = await context(P, 'supabase', ['SUPABASE_ACCESS_TOKEN']);
+    const work = await workCopy(P, ctx);
     const env = { SUPABASE_ACCESS_TOKEN: ctx.secrets.SUPABASE_ACCESS_TOKEN };
     const linked = await run('supabase', ['link', '--project-ref', ctx.config.project_ref, '--yes'], { cwd: work, env, scrub: ctx.scrub });
     if (linked) return linked;
@@ -236,11 +245,11 @@ const supabase = {
     if (opts['include-all']) cli.push('--include-all');
     return run('supabase', cli, { cwd: work, env, scrub: ctx.scrub });
   },
-  async 'admin-query'(name, args) {
-    if (args.length !== 1) fail('give the SQL as one argument: agent-broker supabase admin-query <project> "..."');
-    await context(name, 'supabase', ['SUPABASE_ACCESS_TOKEN']);
+  async 'admin-query'(P, args) {
+    if (args.length !== 1) fail('give the SQL as one argument: agent-broker supabase admin-query "..."');
+    await context(P, 'supabase', ['SUPABASE_ACCESS_TOKEN']);
     const id = new Date().toISOString().replace(/[-:]/g, '').slice(0, 15) + '-' + randomUUID().slice(0, 6);
-    await fs.writeFile(path.join(DIR.queue, `${id}.json`), JSON.stringify({ id, project: name, sql: args[0], created_at: new Date().toISOString(), status: 'pending' }, null, 2), { mode: 0o600 });
+    await fs.writeFile(path.join(DIR.queue, `${id}.json`), JSON.stringify({ id, project: P.name, sql: args[0], created_at: new Date().toISOString(), status: 'pending' }, null, 2), { mode: 0o600 });
     process.stdout.write(`Waiting for approval: ${id}\nAsk the owner to run in their own Terminal:  agent-broker-admin approve ${id}\nThen read the result with:  agent-broker result ${id}\n`);
     return 0;
   },
@@ -251,11 +260,11 @@ const supabase = {
 const apifyRun = (ctx, args, cwd) => run('apify', args, { cwd, env: { APIFY_TOKEN: ctx.secrets.APIFY_TOKEN }, scrub: ctx.scrub });
 
 const apify = {
-  async push(name, args) {
+  async push(P, args) {
     const { opts, positional } = parseArgs(args, { dir: 'string', force: 'bool', version: 'string', 'build-tag': 'string' });
-    if (positional.length) fail(`unexpected arguments: ${positional.join(' ')}`);
-    const ctx = await context(name, 'apify', ['APIFY_TOKEN']);
-    const work = await workCopy(name, ctx);
+    none(positional);
+    const ctx = await context(P, 'apify', ['APIFY_TOKEN']);
+    const work = await workCopy(P, ctx);
     const dir = path.join(work, checkRelative(opts.dir ?? ctx.config.dir ?? '.', '--dir'));
     const cli = ['push'];
     if (opts.force) cli.push('--force');
@@ -263,9 +272,9 @@ const apify = {
     if (opts['build-tag']) cli.push('--build-tag', checkId(opts['build-tag'], 'build tag'));
     return apifyRun(ctx, cli, dir);
   },
-  async pull(name, [actor, ...rest]) {
-    if (rest.length) fail(`unexpected arguments: ${rest.join(' ')}`);
-    const ctx = await context(name, 'apify', ['APIFY_TOKEN']);
+  async pull(P, [actor, ...rest]) {
+    none(rest);
+    const ctx = await context(P, 'apify', ['APIFY_TOKEN']);
     const dir = await scratch();
     try {
       const out = path.join(dir, 'actor');
@@ -281,46 +290,45 @@ const apify = {
       await fs.rm(dir, { recursive: true, force: true });
     }
   },
-  async info(name, [actor, ...rest]) {
-    if (rest.length) fail(`unexpected arguments: ${rest.join(' ')}`);
-    const ctx = await context(name, 'apify', ['APIFY_TOKEN']);
+  async info(P, [actor, ...rest]) {
+    none(rest);
+    const ctx = await context(P, 'apify', ['APIFY_TOKEN']);
     return apifyRun(ctx, ['actors', 'info', checkActor(actor), '--json'], await scratch());
   },
-  async builds(name, [actor, ...rest]) {
-    if (rest.length) fail(`unexpected arguments: ${rest.join(' ')}`);
-    const ctx = await context(name, 'apify', ['APIFY_TOKEN']);
+  async builds(P, [actor, ...rest]) {
+    none(rest);
+    const ctx = await context(P, 'apify', ['APIFY_TOKEN']);
     return apifyRun(ctx, ['builds', 'ls', checkActor(actor), '--json'], await scratch());
   },
-  async 'build-log'(name, [build, ...rest]) {
-    if (rest.length) fail(`unexpected arguments: ${rest.join(' ')}`);
-    const ctx = await context(name, 'apify', ['APIFY_TOKEN']);
+  async 'build-log'(P, [build, ...rest]) {
+    none(rest);
+    const ctx = await context(P, 'apify', ['APIFY_TOKEN']);
     return apifyRun(ctx, ['builds', 'log', checkId(build, 'build id')], await scratch());
   },
-  async runs(name, [actor, ...rest]) {
-    if (rest.length) fail(`unexpected arguments: ${rest.join(' ')}`);
-    const ctx = await context(name, 'apify', ['APIFY_TOKEN']);
+  async runs(P, [actor, ...rest]) {
+    none(rest);
+    const ctx = await context(P, 'apify', ['APIFY_TOKEN']);
     return apifyRun(ctx, ['runs', 'ls', checkActor(actor), '--json'], await scratch());
   },
-  async 'run-info'(name, [runId, ...rest]) {
-    if (rest.length) fail(`unexpected arguments: ${rest.join(' ')}`);
-    const ctx = await context(name, 'apify', ['APIFY_TOKEN']);
+  async 'run-info'(P, [runId, ...rest]) {
+    none(rest);
+    const ctx = await context(P, 'apify', ['APIFY_TOKEN']);
     return apifyRun(ctx, ['runs', 'info', checkId(runId, 'run id'), '--json'], await scratch());
   },
-  async logs(name, [runId, ...rest]) {
-    if (rest.length) fail(`unexpected arguments: ${rest.join(' ')}`);
-    const ctx = await context(name, 'apify', ['APIFY_TOKEN']);
+  async logs(P, [runId, ...rest]) {
+    none(rest);
+    const ctx = await context(P, 'apify', ['APIFY_TOKEN']);
     return apifyRun(ctx, ['runs', 'log', checkId(runId, 'run id')], await scratch());
   },
-  async call(name, args) {
+  async call(P, args) {
     const { opts, positional: [actor, ...rest] } = parseArgs(args, { 'input-file': 'string', input: 'string', build: 'string', memory: 'string', timeout: 'string' });
-    if (rest.length) fail(`unexpected arguments: ${rest.join(' ')}`);
-    const ctx = await context(name, 'apify', ['APIFY_TOKEN']);
+    none(rest);
+    const ctx = await context(P, 'apify', ['APIFY_TOKEN']);
     const dir = await scratch();
     const cli = ['call', checkActor(actor)];
     if (opts['input-file']) {
-      if (!ctx.project.path) fail('--input-file needs the project folder (agent-broker-admin project --path)');
       const file = path.join(dir, 'input.json');
-      const work = await workCopy(name, ctx);
+      const work = await workCopy(P, ctx);
       await fs.copyFile(path.join(work, checkRelative(opts['input-file'], '--input-file')), file);
       cli.push('--input-file', file);
     } else if (opts.input) {
@@ -334,15 +342,41 @@ const apify = {
   },
 };
 
-const SERVICES = { netlify, vercel, supabase, apify };
+const ACTIONS = { netlify, vercel, supabase, apify };
 
-// ---- Main --------------------------------------------------------------------------------------------------------
+// ---- Overview commands (no secrets, only names) --------------------------------------------------------------
+
+/** What one project uses: stack, folders, pinned site / database, stored key names. */
+async function describe(name, project) {
+  const keys = new Set(Object.keys(await loadSecrets(name)));
+  if (project.stack) for (const k of Object.keys(await loadStackSecrets(project.stack))) keys.add(k);
+  const services = {};
+  for (const s of SERVICES) if (project[s]) services[s] = { ...project[s], token: keys.has(KEY_FOR[s]) };
+  return { project: name, stack: project.stack ?? null, folders: project.paths, services, keys: [...keys].sort(), note: project.note };
+}
+
+async function whoami(cwd, explicit) {
+  const P = await resolveProject(cwd, explicit);
+  const d = await describe(P.name, P.project);
+  const accounts = P.project.stack ? (await loadStack(P.project.stack)).accounts ?? {} : {};
+  json({ ...d, folder: P.root, accounts, use: 'agent-broker <service> <action> from inside this folder; agent-broker help' });
+  return 0;
+}
 
 async function projectsList() {
   const out = [];
-  for (const name of await listProjects()) {
-    const p = await loadProject(name);
-    out.push({ project: name, path: p.path ?? null, services: Object.keys(SERVICES).filter((s) => p[s]), keys: Object.keys(await loadSecrets(name)).sort(), note: p.note });
+  for (const name of await listProjects()) out.push(await describe(name, await loadProject(name)));
+  json(out);
+  return 0;
+}
+
+async function stacksList() {
+  const out = [];
+  const projects = await Promise.all((await listProjects()).map(async (n) => [n, (await loadProject(n)).stack]));
+  for (const name of await listStacks()) {
+    const s = await loadStack(name);
+    out.push({ stack: name, accounts: s.accounts ?? {}, keys: Object.keys(await loadStackSecrets(name)).sort(),
+      projects: projects.filter(([, st]) => st === name).map(([n]) => n), note: s.note });
   }
   json(out);
   return 0;
@@ -352,22 +386,46 @@ async function result(id) {
   checkId(id, 'request id');
   const req = JSON.parse(await fs.readFile(path.join(DIR.queue, `${id}.json`), 'utf8').catch(() => fail(`no request ${id}`)));
   const values = await allSecretValues();
-  process.stdout.write(`${makeScrubber(values)(JSON.stringify({ id, status: req.status, sql: req.sql, output: req.output }, null, 2))}\n`);
+  process.stdout.write(`${makeScrubber(values)(JSON.stringify({ id, status: req.status, project: req.project, sql: req.sql, output: req.output }, null, 2))}\n`);
   return 0;
 }
 
+// ---- Main --------------------------------------------------------------------------------------------------------
+
+/** Takes --project NAME / --project=NAME out of the arguments. */
+function takeProject(args) {
+  let explicit;
+  const rest = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--project') explicit = args[++i] ?? fail('--project needs a value');
+    else if (args[i].startsWith('--project=')) explicit = args[i].slice('--project='.length);
+    else rest.push(args[i]);
+  }
+  if (explicit !== undefined) checkName(explicit);
+  return { explicit, rest };
+}
+
 async function main(argv) {
+  const cwd = process.cwd(); // the caller's folder (sudo keeps it): it decides the project
   await mkdirs();
   process.chdir(DIR.tmp);
-  const [service, action, project, ...rest] = argv;
+  const [service, action, ...args] = argv;
   if (!service || service === 'help' || service === '--help') { process.stdout.write(`${HELP}\n`); return 0; }
   if (service === 'projects') return projectsList();
+  if (service === 'stacks') return stacksList();
   if (service === 'result') return result(action);
-  const actions = SERVICES[service] ?? fail(`unknown service: ${service} (netlify, vercel, supabase, apify)`);
+  if (service === 'whoami') return whoami(cwd, takeProject([action, ...args].filter((a) => a !== undefined)).explicit);
+  const actions = ACTIONS[service] ?? fail(`unknown service: ${service} (netlify, vercel, supabase, apify). See: agent-broker help`);
   const fn = Object.hasOwn(actions, action ?? '') ? actions[action] : fail(`${service} has no action "${action ?? ''}". Allowed: ${Object.keys(actions).join(', ')}`);
-  checkName(project);
-  const code = await fn(project, rest);
-  await audit({ service, action, project, code });
+  const { explicit, rest } = takeProject(args);
+  const P = await resolveProject(cwd, explicit);
+  // Old form `agent-broker netlify deploy <project>` (blob store names may look like project names: not checked).
+  if (!action.startsWith('blobs-') && NAME.test(rest[0] ?? '') && (await listProjects()).includes(rest[0])) {
+    fail(`unexpected argument "${rest[0]}": the project comes from the folder you run in (here: ${P.name}). `
+      + 'Site ids, project refs and account names are never passed. See: agent-broker whoami');
+  }
+  const code = await fn(P, rest);
+  await audit({ service, action, project: P.name, code });
   return code;
 }
 
