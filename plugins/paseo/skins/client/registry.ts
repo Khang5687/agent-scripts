@@ -1,6 +1,13 @@
 import type { PluginClientContext, PluginSkinContribution } from "@getpaseo/plugin/client";
 import { catalogThumbnail, contributionId, type InstalledSkin, skinImage } from "../shared/rpc";
 
+/**
+ * Appended to the image hash in each contribution's `version`. Paseo keeps the metadata it cached
+ * with the image until `version` changes, so bump this whenever the contribution's metadata
+ * changes. 2: stopped passing the catalog's per-area opacities.
+ */
+const CONTRIBUTION_REVISION = 2;
+
 /** Tracks which installed skins this client has handed to Paseo, so removal can unregister them. */
 export class SkinRegistry {
   private readonly removers = new Map<string, () => void | Promise<void>>();
@@ -14,10 +21,12 @@ export class SkinRegistry {
     return {
       id: contributionId(skin.id),
       name: skin.name.slice(0, 60),
-      version: skin.version,
+      version: `${skin.version}-r${CONTRIBUTION_REVISION}`,
       appearance: skin.appearance,
       focal: skin.focal,
-      intensity: skin.intensity,
+      // No `intensity`: the catalog's per-area opacities (workspace 0.2) were tuned for a loader
+      // with no contrast limit. Paseo already caps the art for readability, so applying them as
+      // well left chat threads with a fraction of the art shown on Home.
       ...(skin.luminance ? { luminance: skin.luminance } : {}),
       attribution: { author: skin.author, license: skin.license, sourceUrl: skin.sourceUrl ?? undefined },
       loadThumbnail: () => client.rpc(catalogThumbnail, { id: skin.id }),

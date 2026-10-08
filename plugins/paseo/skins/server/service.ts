@@ -115,11 +115,6 @@ export class SkinService {
       sha256: manifest.integrity.sha256,
       appearance: manifest.appearance,
       focal: { x: manifest.art.focusX, y: manifest.art.focusY },
-      intensity: {
-        home: manifest.art.homeOpacity,
-        workspace: manifest.art.workspaceOpacity,
-        utility: manifest.art.utilityOpacity,
-      },
       luminance: measureLuminance(image, info.mimeType),
       author: source.author,
       license: source.license,

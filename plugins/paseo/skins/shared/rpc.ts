@@ -37,7 +37,6 @@ export const InstalledSkinSchema = z.object({
   sha256: z.string(),
   appearance: AppearanceSchema,
   focal: z.object({ x: unit, y: unit }),
-  intensity: z.object({ home: unit, workspace: unit, utility: unit }),
   /** Null when the image format cannot be decoded on the daemon (WebP); the app then assumes black and white. */
   luminance: z.object({ low: unit, high: unit }).nullable(),
   author: z.string(),

@@ -19,7 +19,7 @@
     "pngjs": "^7.0.0"
   },
   "devDependencies": {
-    "@getpaseo/plugin": "file:/Users/khangnguyen/git/paseo-app-skins/packages/plugin",
+    "@getpaseo/plugin": "file:/Users/khangnguyen/git/paseo/packages/plugin",
     "@tanstack/react-query": "^5.90.11",
     "@types/node": "^22.20.4",
     "@types/pngjs": "^6.0.5",
