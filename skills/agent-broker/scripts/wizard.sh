@@ -238,7 +238,11 @@ confirm_yes() {
 # js EXPR — run a JS expression on the JSON from stdin (as `d`); prints the result (strings as-is).
 js() {
   node -e 'let s = ""; process.stdin.on("data", (c) => (s += c)).on("end", () => {
-    const d = JSON.parse(s || "null"); const r = new Function("d", `return (${process.argv[1]})`)(d);
+    const d = JSON.parse(s || "null");
+    let fn;
+    try { fn = new Function("d", `return (${process.argv[1]})`); }
+    catch { fn = new Function("d", process.argv[1]); }
+    const r = fn(d);
     if (r !== undefined && r !== null) process.stdout.write(typeof r === "string" ? r : JSON.stringify(r)); })' "$1"
 }
 
@@ -598,7 +602,7 @@ action_replace_token() {
   lookup_tokens
   say "The new token belongs to:"
   show_accounts || die "The token did not work."
-  agent-broker stacks | js "const a = d.find((s) => s.stack === '$STACK')?.accounts?.$svc; a ? '   before: ' + [a.name, a.email].filter(Boolean).join(' ') : ''"
+  agent-broker stacks | js "const a = d.find((s) => s.stack === '$STACK')?.accounts?.$svc; return a ? '   before: ' + [a.name, a.email].filter(Boolean).join(' ') : '';"
   printf '\n'
   confirm_yes "Same account as before? Save it for every project on stack $STACK?" || die "Stopped: nothing was saved."
   stage "Save (Touch ID)" 1
