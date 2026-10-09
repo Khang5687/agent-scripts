@@ -202,7 +202,7 @@ VAULT_DIR="$HOME/Secrets"
 GUARD_DIR=/opt/agent-broker/guard
 DONE=()
 # filled by ask / ask_default / pick (printf -v)
-P_PATH="" P_NAME="" P_REF="" STACK="" STACK_NEW="" choice="" site="" dir="" move="" conn="" svc=""
+P_PATH="" P_NAME="" STACK="" STACK_NEW="" choice="" site="" dir="" move="" conn="" svc=""
 LOOKUP="{}" PROJECT_LINES="" ARGS=()
 # Tokens typed in this run (read indirectly as ${!var}); cleared as soon as they are saved.
 # shellcheck disable=SC2034
@@ -513,7 +513,6 @@ choose_pins() {
             ARGS+=(--remove-service supabase)
           else
             ARGS+=(--supabase-ref "$ref")
-            P_REF=$ref
           fi
         else
           say "This Supabase account has no projects yet."
@@ -522,7 +521,6 @@ choose_pins() {
             manual)
               ask ref "Supabase project ref:"
               ARGS+=(--supabase-ref "$ref")
-              P_REF=$ref
               ;;
             skip | *)
               ARGS+=(--remove-service supabase)
@@ -665,8 +663,8 @@ action_add_stack() {
 }
 
 action_add_project() {
-  begin "Add a project" 6 10
-  ARGS=() PROJECT_LINES="" P_REF="" MOVED=()
+  begin "Add a project" 4 4
+  ARGS=() PROJECT_LINES="" MOVED=()
 
   stage "Folder" 1
   ask_default P_PATH "Project folder:" "$( [[ "$PWD" != "$HOME" ]] && printf '%s' "$PWD")"
@@ -682,16 +680,11 @@ action_add_project() {
     warn "$P_NAME already exists. Pick another name (or use menu: Add a folder)."
   done
 
-  stage "Account stack" 3
+  stage "Account stack" 2
   choose_stack
 
-  stage "What it uses" 2
-  choose_pins "$P_PATH"
-
-  stage ".env secrets" 2
+  stage ".env secrets (optional)" 1
   env_secrets "$P_PATH"
-  if [[ -n "$P_REF" ]] && confirm_yes "Make a read-only database user, so agents can read the database?"; then read_only_user "$P_REF"; fi
-
   stage "Save (Touch ID)" 1
   ARGS=(apply --project "$P_NAME" --new-project --path "$P_PATH" --stack "$STACK" ${STACK_NEW:+--new-stack} ${ARGS[@]+"${ARGS[@]}"})
   if { stack_value_lines; printf '%s' "$PROJECT_LINES"; } | admin "${ARGS[@]}"; then
@@ -734,20 +727,17 @@ action_replace_token() {
 }
 
 action_move_project() {
-  begin "Move a project to another stack" 4 6
-  ARGS=() PROJECT_LINES="" P_REF=""
-  local projects
+  begin "Move a project to another stack" 2 2
+  ARGS=() PROJECT_LINES=""
   projects=$(project_lines)
   [[ -n "$projects" ]] || { warn "No projects yet."; pause; return; }
   stage "Project" 1
   pick P_NAME "Which project?" "$projects"
   P_PATH=$(agent-broker projects | js "d.find((p) => p.project === '$P_NAME').folders[0]")
-  stage "New stack" 2
+  stage "New stack" 1
   choose_stack
-  stage "Its site and database in that account" 2
-  choose_pins "$P_PATH"
   stage "Save (Touch ID)" 1
-  ARGS=(apply --project "$P_NAME" --stack "$STACK" ${STACK_NEW:+--new-stack} ${ARGS[@]+"${ARGS[@]}"})
+  ARGS=(apply --project "$P_NAME" --stack "$STACK" ${STACK_NEW:+--new-stack})
   stack_value_lines | admin "${ARGS[@]}" && ok "project $P_NAME now on stack $STACK"
   clear_tokens
   tell_agents "$P_NAME" "$P_PATH"

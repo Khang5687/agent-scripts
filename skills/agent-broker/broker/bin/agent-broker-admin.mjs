@@ -115,7 +115,16 @@ async function apply(args) {
     if (opts['new-project'] && known) fail(`project ${opts.project} already exists`);
     if (!opts['new-project'] && !known) fail(`unknown project ${opts.project} (add --new-project to create it)`);
     project = known ? await loadProject(opts.project) : { paths: [] };
-    if (opts.stack) project.stack = opts.stack;
+    if (opts.stack) {
+      if (known && project.stack && project.stack !== opts.stack) {
+        for (const s of SERVICES) {
+          if (project[s] && !opts[`${s}-site`] && !opts[`${s}-new`] && !opts[`${s}-ref`] && !opts[`${s}-project`]) {
+            delete project[s];
+          }
+        }
+      }
+      project.stack = opts.stack;
+    }
     if (opts.note) project.note = opts.note;
     if (opts.path) project.paths = [await realFolder(opts.path)];
     for (const p of opts['add-path'] ?? []) { const r = await realFolder(p); if (!project.paths.includes(r)) project.paths.push(r); }
