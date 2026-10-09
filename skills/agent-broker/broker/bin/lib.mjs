@@ -165,7 +165,8 @@ export async function resolveProject(cwd, explicit) {
     const all = [];
     for (const name of await listProjects()) all.push(`${name} -> ${(await loadProject(name)).paths.join(', ')}`);
     fail(`${dir} is not inside a registered project.\n  registered: ${all.join('; ') || 'none'}\n`
-      + '  cd into a project folder, or ask the owner to run the wizard ("Add a project" / "Add a folder").');
+      + '  If this is a new project: ask the user which account stack it uses (agent-broker stacks), then run\n'
+      + '  agent-broker init --stack <name> here. Otherwise cd into the project\'s folder.');
   }
   const deepest = found.filter((m) => m.folder.length === found[0].folder.length);
   let pick = deepest[0];
@@ -179,6 +180,34 @@ export async function resolveProject(cwd, explicit) {
     fail(`--project ${explicit} does not match this folder: it belongs to project ${pick.name}. The folder decides the project; cd into ${explicit}'s folder instead.`);
   }
   return { name: pick.name, project: pick.project, root: rootFor(pick.folder) };
+}
+
+/** The git repository root holding `dir` (a .git folder or worktree file), or null. */
+export async function gitRoot(dir) {
+  for (let d = dir; ; d = path.dirname(d)) {
+    if (await fs.lstat(path.join(d, '.git')).catch(() => null)) return d;
+    if (d === path.dirname(d)) return null;
+  }
+}
+
+/**
+ * Refuses a folder that already belongs to a project (itself, a parent, or as a git worktree of one) or that holds a
+ * registered project folder: new projects only ever claim unclaimed folders.
+ */
+export async function assertUnclaimed(folder) {
+  let owner = null;
+  try {
+    owner = await resolveProject(folder);
+  } catch (e) {
+    if (!(e instanceof UsageError)) throw e;
+    if (!/is not inside a registered project/.test(e.message)) fail(`${folder} already belongs to projects: ${e.message}`);
+  }
+  if (owner) fail(`${folder} already belongs to project ${owner.name} (stack ${owner.project.stack ?? '-'}). See: agent-broker whoami`);
+  for (const name of await listProjects()) {
+    for (const p of (await loadProject(name)).paths) {
+      if (within(p, folder)) fail(`${folder} holds project ${name} (${p}). Run init in a folder of its own, or ask the owner.`);
+    }
+  }
 }
 
 async function writePrivate(file, body) {

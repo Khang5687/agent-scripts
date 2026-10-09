@@ -1,3 +1,21 @@
 #!/bin/bash
-# agent-broker: runs the broker as _deployer (sudo rule: no password for this one program). Guide: agent-scripts/skills/agent-broker/SKILL.md
-exec /usr/bin/sudo -n -u _deployer /opt/agent-broker/bin/agent-broker.mjs "$@"
+# agent-broker: runs the broker as _deployer (sudo rule: no password for this one program). After `init`, and for
+# `agents-md --write`, it writes the project's AGENTS.md / CLAUDE.md block as YOU (the broker user cannot write in
+# your folders). Guide: agent-scripts/skills/agent-broker/SKILL.md
+BROKER=(/usr/bin/sudo -n -u _deployer /opt/agent-broker/bin/agent-broker.mjs)
+WRITE=(/opt/agent-broker/node/bin/node /opt/agent-broker/bin/write-block.mjs)
+
+case "${1:-}" in
+  init)
+    "${BROKER[@]}" "$@" || exit $?
+    for a in "$@"; do [ "$a" = --list ] && exit 0; done
+    exec "${WRITE[@]}"
+    ;;
+  agents-md)
+    rest=()
+    write=""
+    for a in "${@:2}"; do if [ "$a" = --write ]; then write=1; else rest+=("$a"); fi; done
+    [ -n "$write" ] && exec "${WRITE[@]}" ${rest[@]+"${rest[@]}"}
+    ;;
+esac
+exec "${BROKER[@]}" "$@"

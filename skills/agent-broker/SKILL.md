@@ -34,14 +34,27 @@ agent-broker <service> <action> [options]
 - **Scripts that need a token while running** (nightly jobs, backups) run on GitHub Actions: `gh workflow run ...`.
 - **Tokens stay unread**: `.env` secrets, token files, CLI configs, `~/Secrets/*.kdbx`. Never put one in a file,
   argument, log or reply.
-- **Errors** "not inside a registered project", "no ... token", or a missing action: stop and ask the owner to run the
-  wizard. `--project NAME` exists only for a folder that holds two projects (the error names them).
+- **Errors** "no ... token" or a missing action: stop and ask the owner to run the wizard. `--project NAME` exists
+  only for a folder that holds two projects (the error names them).
 - **`agent-broker-admin`** is the owner's: it makes a Touch ID prompt on their screen. Run it only when asked.
 
-## Project instructions
+## New project
 
-Each project's `AGENTS.md` / `CLAUDE.md` carries a short block (project, stack, commands). Print or refresh it:
-`scripts/snippet.sh <project> [--write <file>]` (the wizard does this).
+"Not inside a registered project" means a new project. Ask the user which stack (`agent-broker stacks`), then in
+the project folder:
+
+```sh
+agent-broker init --stack <name> --list    # the stack's sites / databases, and which are free
+agent-broker init --stack <name> [--netlify-site ID | --netlify-new NAME] [--supabase-ref REF] [--apify]
+agent-broker attach --supabase-ref REF     # later: add a service the project does not have yet
+```
+
+- `init` registers the git repo root (`--here`: this exact folder) and writes the block into the project's
+  `AGENTS.md` / `CLAUDE.md` (refresh: `agent-broker agents-md --write`). No owner approval: it only claims a folder
+  nobody owns, on an existing stack, with a site / database of that stack's account that no other project uses.
+- `--netlify-new` creates a free Netlify site. A new Supabase project costs money: ask the user to create it on
+  supabase.com, then `attach --supabase-ref`. A Supabase ref also gets a read-only database user (`--no-reader` skips).
+- A stack that does not exist yet, or lacks a token: the owner adds it with the wizard (menu 1 or 2).
 
 ## Owner: the wizard
 
@@ -51,14 +64,14 @@ In your own Terminal app:
 ~/git/agent-scripts/skills/agent-broker/scripts/wizard.sh
 ```
 
-Menu: 1 Add a project (new or existing stack; pick the site and database from lists) · 2 Replace a token ·
-3 Move a project to another stack · 4 Add a folder (second clone) · 5 AGENTS.md text · 6 Set up / update.
-Each save asks for Touch ID once. Git worktrees of a registered repo work without adding them.
+Menu: 1 Add an account stack · 2 Replace a token (one place, every project on the stack) · 3 Add a project
+(optional; agents use `init`) · 4 Move a project to another stack · 5 Add a folder (second clone) · 6 AGENTS.md text ·
+7 Set up / update. Each save asks for Touch ID once. Git worktrees of a registered repo work without adding them.
 
 Setup / update installs `broker/` to `/opt/agent-broker` (own Node and CLIs), `/usr/local/bin/agent-broker{,-admin}`,
 the sudo rule `/etc/sudoers.d/agent-broker` (password every time), and the CLI guard (`/opt/agent-broker/guard`, first
 in `PATH` via one line in `~/.zshenv` and `~/.zshrc`). Owner bypass for a real CLI: its full path (`which -a netlify`).
-Changing the broker: edit `broker/`, `cd broker && npm test`, then wizard → 6.
+Changing the broker: edit `broker/`, `cd broker && npm test`, then wizard → 7.
 
 ## Known gaps
 

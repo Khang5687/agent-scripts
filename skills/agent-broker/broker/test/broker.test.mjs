@@ -174,3 +174,64 @@ test('only allow-listed actions, options and paths inside the project', async ()
   assert.match(broker(['netlify', 'deploy', '--debug'], shop).stderr, /unknown option --debug/);
   assert.match(broker(['supabase', 'query', 'select 1'], shop).stderr, /does not use supabase/);
 });
+
+test('init: an agent registers an unclaimed git repo on an existing stack; claimed folders and pins are refused', async () => {
+  ok(admin(['apply', '--stack', 'studio'], `stack:SUPABASE_ACCESS_TOKEN=${['sbp', 'fake', 'value'].join('_')}\n`));
+  const repo = await folder('newapp');
+  await fs.mkdir(path.join(repo, '.git'));
+  const sub = await folder('newapp', 'src');
+  assert.match(broker(['init', '--stack', 'nope'], sub).stderr, /unknown stack: nope/);
+  assert.match(broker(['init'], sub).stderr, /give the account stack/);
+
+  const made = JSON.parse(ok(broker(['init', '--stack', 'studio', '--netlify-site', 'site-new', '--supabase-ref', 'refnew', '--no-reader'], sub)).stdout);
+  assert.equal(made.created, 'newapp');
+  assert.equal(made.folder, repo); // the git root, not the subfolder it ran in
+  assert.equal(made.services.netlify.dir, 'dist');
+  assert.equal(JSON.parse(ok(broker(['whoami'], sub)).stdout).stack, 'studio');
+
+  assert.match(broker(['init', '--stack', 'studio'], repo).stderr, /already belongs to project newapp/);
+  // A folder holding a registered project is refused (it would swallow it).
+  assert.match(broker(['init', '--stack', 'studio', '--here'], path.dirname(repo)).stderr, /holds project/);
+  // A site or database pinned by another project is refused.
+  const other = await folder('otherapp');
+  assert.match(broker(['init', '--stack', 'studio', '--here', '--netlify-site', 'site-new'], other).stderr, /already belongs to project newapp/);
+  assert.match(broker(['init', '--stack', 'studio', '--here', '--supabase-ref', 'refnew', '--no-reader'], other).stderr, /already belongs to project newapp/);
+  // A service the stack has no token for is refused.
+  assert.match(broker(['init', '--stack', 'studio', '--here', '--apify'], other).stderr, /stack studio has no apify token/);
+  assert.equal(await fs.lstat(path.join(dev, 'home', 'projects', 'otherapp.json')).catch(() => null), null);
+});
+
+test('attach adds a missing service only; agents-md gives the block for the folder', async () => {
+  const app = await folder('attachapp');
+  ok(broker(['init', '--stack', 'studio', '--here'], app));
+  assert.equal(JSON.parse(ok(broker(['attach', '--netlify-site', 'site-attach'], app)).stdout).services.netlify.site_id, 'site-attach');
+  assert.match(broker(['attach', '--netlify-site', 'site-other'], app).stderr, /already uses netlify/);
+  assert.match(broker(['attach', '--stack', 'thedoor'], app).stderr, /attach only adds services/);
+
+  const md = JSON.parse(ok(broker(['agents-md', '--json'], app)).stdout);
+  assert.equal(md.folder, app);
+  assert.match(md.block, /broker project `attachapp` on account stack `studio`/);
+  assert.match(md.block, /agent-broker netlify deploy/);
+  assert.doesNotMatch(md.block, /supabase query/);
+});
+
+test('the AGENTS.md block is written once, replaced on rerun, and reaches Claude Code', async () => {
+  const { withBlock, writeBlocks } = await import('../bin/write-block.mjs');
+  const block = (n) => `<!-- agent-broker:start -->\nblock ${n}\n<!-- agent-broker:end -->`;
+  assert.equal(withBlock('# Rules\n', block(1)), `# Rules\n\n${block(1)}\n`);
+  assert.equal(withBlock(withBlock('# Rules\n', block(1)), block(2)), `# Rules\n\n${block(2)}\n`);
+
+  const empty = await folder('md-empty');
+  writeBlocks(empty, block(1));
+  assert.equal(await fs.readFile(path.join(empty, 'CLAUDE.md'), 'utf8'), '@AGENTS.md\n');
+  assert.match(await fs.readFile(path.join(empty, 'AGENTS.md'), 'utf8'), /block 1/);
+
+  const both = await folder('md-both');
+  await fs.writeFile(path.join(both, 'AGENTS.md'), '# A\n');
+  await fs.writeFile(path.join(both, 'CLAUDE.md'), '# C\n');
+  assert.deepEqual(writeBlocks(both, block(1)), ['AGENTS.md', 'CLAUDE.md']);
+  const imports = await folder('md-imports');
+  await fs.writeFile(path.join(imports, 'AGENTS.md'), '# A\n');
+  await fs.writeFile(path.join(imports, 'CLAUDE.md'), '@AGENTS.md\n');
+  assert.deepEqual(writeBlocks(imports, block(1)), ['AGENTS.md']);
+});

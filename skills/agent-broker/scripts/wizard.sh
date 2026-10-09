@@ -348,24 +348,34 @@ choose_stack() {
     STACK=new
   fi
   if [[ "$STACK" == new ]]; then
-    STACK_NEW=1
-    while :; do
-      ask_default STACK "Name the stack after its login (e.g. thedoor, studio):" ""
-      [[ "$STACK" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]] && break
-      warn "Lowercase letters, digits, - and _ only."
-    done
-    for svc in netlify supabase apify vercel; do
-      if confirm "Does this stack have a $(service_title "$svc") login?"; then ask_token "$svc"; fi
-    done
-    lookup_tokens
-    say "These tokens belong to:"
-    show_accounts || die "A token did not work. Run the wizard again with a fresh token."
-    confirm_yes "Are these the right accounts?" || die "Stopped: nothing was saved."
+    choose_stack_new
   else
     say "Reading stack $STACK (Touch ID)..."
     LOOKUP=$(agent-broker-admin lookup "$STACK") || die "Could not read stack $STACK."
     show_accounts || warn "One of the stack's tokens did not work: replace it (menu: Replace a token)."
   fi
+}
+
+# choose_stack_new — name a new stack, type its tokens (hidden), check whose accounts they are.
+choose_stack_new() {
+  STACK_NEW=1 LOOKUP="{}"
+  clear_tokens
+  local taken
+  taken=$(agent-broker stacks 2>/dev/null | js 'd.map((s) => s.stack).join(" ")' || true)
+  while :; do
+    ask_default STACK "Name the stack after its login (e.g. thedoor, studio):" ""
+    [[ "$STACK" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]] || { warn "Lowercase letters, digits, - and _ only."; continue; }
+    [[ " $taken " == *" $STACK "* ]] && { warn "Stack $STACK exists already."; continue; }
+    break
+  done
+  for svc in netlify supabase apify vercel; do
+    if confirm "Does this stack have a $(service_title "$svc") login?"; then ask_token "$svc"; fi
+  done
+  [[ -n "$(stack_value_lines)" ]] || die "No tokens given: nothing to save."
+  lookup_tokens
+  say "These tokens belong to:"
+  show_accounts || die "A token did not work. Run the wizard again with a fresh token."
+  confirm_yes "Are these the right accounts?" || die "Stopped: nothing was saved."
 }
 
 # stack_value_lines — stack:KEY=VALUE lines for tokens typed in this run.
@@ -501,14 +511,12 @@ SQL
   PROJECT_LINES+="project:SUPABASE_READ_URL=$url"$'\n'
 }
 
-# tell_agents PROJECT FOLDER — write the AGENTS.md block, copy it, show whoami.
+# tell_agents PROJECT FOLDER — write the AGENTS.md / CLAUDE.md block (text from the broker), copy it, show whoami.
 tell_agents() {
-  local p=$1 folder=$2 target=""
-  "$SKILL_DIR/scripts/snippet.sh" "$p" | pbcopy
-  for f in AGENTS.md AGENTS.MD CLAUDE.md; do [[ -f "$folder/$f" ]] && { target="$folder/$f"; break; }; done
-  target=${target:-$folder/AGENTS.md}
-  if confirm_yes "Put the agent instructions in $(basename "$target")? (also in your clipboard)"; then
-    "$SKILL_DIR/scripts/snippet.sh" "$p" --write "$target" >/dev/null && ok "$p: instructions in $(basename "$target")"
+  local p=$1 folder=$2
+  (cd "$folder" && agent-broker agents-md --project "$p") | pbcopy
+  if confirm_yes "Put the agent instructions in the project's AGENTS.md / CLAUDE.md? (also in your clipboard)"; then
+    (cd "$folder" && agent-broker agents-md --write --project "$p") && DONE+=("$p: agent instructions written")
   fi
   say "What an agent in this folder sees:"
   (cd "$folder" && agent-broker whoami) | js '`   project ${d.project} · stack ${d.stack ?? "-"} · ${Object.entries(d.services).map(([s, c]) => `${s} ${c.site_name ?? c.name ?? ""}${c.token ? "" : " (no token!)"}`.trim()).join(" · ") || "no services"}`'
@@ -516,6 +524,20 @@ tell_agents() {
 }
 
 # ── Actions ──────────────────────────────────────────────────────────────
+
+action_add_stack() {
+  begin "Add an account stack" 3 6
+  stage "Logins" 4
+  say "A stack = one login per service (Netlify, Supabase, Apify, Vercel). New projects then just say which stack."
+  choose_stack_new
+  stage "Save (Touch ID)" 1
+  stack_value_lines | admin apply --stack "$STACK" --new-stack && ok "stack $STACK saved"
+  clear_tokens
+  stage "Tell your agents" 1
+  say "For a new project, tell the agent:  this project uses stack $STACK"
+  note "The agent runs  agent-broker init --stack $STACK  in the project folder. No wizard needed."
+  pause
+}
 
 action_add_project() {
   begin "Add a project" 6 10
@@ -630,7 +652,7 @@ action_agents_text() {
   [[ -n "$projects" ]] || { warn "No projects yet."; pause; return; }
   stage "Project" 1
   pick P_NAME "Which project?" "$projects"
-  "$SKILL_DIR/scripts/snippet.sh" "$P_NAME" | sed 's/^/    /'
+  (cd "$(agent-broker projects | js "d.find((p) => p.project === '$P_NAME').folders[0]")" && agent-broker agents-md --project "$P_NAME") | sed 's/^/    /'
   tell_agents "$P_NAME" "$(agent-broker projects | js "d.find((p) => p.project === '$P_NAME').folders[0]")"
   pause
 }
@@ -698,22 +720,24 @@ fi
 while :; do
   _clear
   printf '\n%s%s  Agent broker%s  %s(tokens agents cannot read)%s\n\n' "$BOLD" "$BLUE" "$RESET" "$DIM" "$RESET"
-  printf '   %s1%s  Add a project            %s(new folder; new or existing stack)%s\n' "$BLUE" "$RESET" "$DIM" "$RESET"
+  printf '   %s1%s  Add an account stack     %s(new logins; then agents add projects themselves)%s\n' "$BLUE" "$RESET" "$DIM" "$RESET"
   printf '   %s2%s  Replace a token          %s(one place, every project on the stack)%s\n' "$BLUE" "$RESET" "$DIM" "$RESET"
-  printf '   %s3%s  Move a project           %s(to another stack)%s\n' "$BLUE" "$RESET" "$DIM" "$RESET"
-  printf '   %s4%s  Add a folder             %s(second copy of a project)%s\n' "$BLUE" "$RESET" "$DIM" "$RESET"
-  printf '   %s5%s  AGENTS.md text           %s(for a project)%s\n' "$BLUE" "$RESET" "$DIM" "$RESET"
-  printf '   %s6%s  Set up / update          %s(vault, install, log out)%s\n' "$BLUE" "$RESET" "$DIM" "$RESET"
+  printf '   %s3%s  Add a project            %s(optional: agents do it with agent-broker init)%s\n' "$BLUE" "$RESET" "$DIM" "$RESET"
+  printf '   %s4%s  Move a project           %s(to another stack)%s\n' "$BLUE" "$RESET" "$DIM" "$RESET"
+  printf '   %s5%s  Add a folder             %s(second copy of a project)%s\n' "$BLUE" "$RESET" "$DIM" "$RESET"
+  printf '   %s6%s  AGENTS.md text           %s(for a project)%s\n' "$BLUE" "$RESET" "$DIM" "$RESET"
+  printf '   %s7%s  Set up / update          %s(vault, install, log out)%s\n' "$BLUE" "$RESET" "$DIM" "$RESET"
   printf '   %s0%s  Done\n\n' "$BLUE" "$RESET"
   printf '  %sNumber:%s ' "$BOLD" "$RESET"
   read -r choice || choice=0
   case "$choice" in
-    1) action_add_project ;;
+    1) action_add_stack ;;
     2) action_replace_token ;;
-    3) action_move_project ;;
-    4) action_add_folder ;;
-    5) action_agents_text ;;
-    6) action_setup ;;
+    3) action_add_project ;;
+    4) action_move_project ;;
+    5) action_add_folder ;;
+    6) action_agents_text ;;
+    7) action_setup ;;
     0 | q | "") break ;;
   esac
 done

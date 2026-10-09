@@ -7,10 +7,11 @@
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { createNetlifySite, createReadOnlyUser, lookup, verifyPins } from './accounts.mjs';
 import {
-  CA_FILE, DIR, NAME, SERVICES, UsageError, allSecretValues, assertNoSecret, audit, checkName, checkRelative, fail,
-  listProjects, listStacks, loadProject, loadSecrets, loadStack, loadStackSecrets, makeScrubber, mkdirs, parseArgs,
-  projectSecrets, resolveProject, run, syncProject,
+  CA_FILE, DIR, NAME, SERVICES, UsageError, allSecretValues, assertNoSecret, assertUnclaimed, audit, checkName,
+  checkRelative, fail, gitRoot, listProjects, listStacks, loadProject, loadSecrets, loadStack, loadStackSecrets,
+  makeScrubber, mkdirs, parseArgs, projectSecrets, resolveProject, run, saveProject, saveSecrets, syncProject,
 } from './lib.mjs';
 
 const HELP = `agent-broker <service> <action> [options]      run inside the project's folder: the folder picks the project
@@ -18,6 +19,16 @@ const HELP = `agent-broker <service> <action> [options]      run inside the proj
   agent-broker whoami        this folder's project, account stack, site and database
   agent-broker projects      all projects and their folders     agent-broker stacks   all account stacks
   agent-broker result <id>   result of an approved Supabase admin query
+
+New project (a folder not registered yet; the user names the stack; stacks come from the owner's wizard):
+  agent-broker init --stack S --list                     the stack's sites and databases (free or used by a project)
+  agent-broker init --stack S [--name N] [--here]        register this git repo (--here: this exact folder), then
+         [--netlify-site ID | --netlify-new NAME] [--netlify-dir D]     write the AGENTS.md block
+         [--supabase-ref REF [--no-reader]] [--vercel-project ID] [--apify [--apify-dir D]]
+  agent-broker attach [same service options]             add a service the project does not use yet
+  agent-broker agents-md [--write]                       the AGENTS.md block (--write: into AGENTS.md / CLAUDE.md)
+  A new Supabase project costs money: ask the user to create it on supabase.com, then attach --supabase-ref.
+  --netlify-new creates a Netlify site in the stack's account; --supabase-ref creates a read-only database user.
 
 netlify  deploy [--prod] [--message M] [--dir D]        deploy files already built (no build step); draft unless --prod
          status | deploys | logs [--since 1h] [--function NAME]...
@@ -390,6 +401,180 @@ async function result(id) {
   return 0;
 }
 
+// ---- New projects: init / attach (no owner approval: only unclaimed folders, the stack's own sites/databases) ---
+
+const SETUP_OPTS = {
+  stack: 'string', name: 'string', here: 'bool', list: 'bool', 'netlify-site': 'string', 'netlify-new': 'string',
+  'netlify-team': 'string', 'netlify-dir': 'string', 'supabase-ref': 'string', 'no-reader': 'bool',
+  'vercel-project': 'string', apify: 'bool', 'apify-dir': 'string',
+};
+const skipVerify = () => Boolean(process.env.AGENT_BROKER_DEV_ROOT) && process.env.AGENT_BROKER_SKIP_VERIFY === '1'; // tests only
+const idArg = (v, what) => (/^[A-Za-z0-9_-]{1,100}$/.test(v ?? '') ? v : fail(`invalid ${what}: ${v ?? '(missing)'}`));
+
+/** The built-files folder from netlify.toml ([build] publish), else dist. */
+async function publishDir(folder) {
+  const toml = await fs.readFile(path.join(folder, 'netlify.toml'), 'utf8').catch(() => '');
+  return toml.match(/^\s*publish\s*=\s*["']([^"']+)["']/m)?.[1] ?? 'dist';
+}
+
+/** Which project already pins this site / database, if any (each is owned by one project only). */
+async function pinOwner(service, field, value, except) {
+  for (const name of await listProjects()) {
+    if (name !== except && (await loadProject(name))[service]?.[field] === value) return name;
+  }
+  return null;
+}
+
+/**
+ * Adds the requested services to `project` (pinned site / database checked against the stack's accounts and against
+ * every other project). Returns project-only values to store (the read-only database URL). Creates a Netlify site
+ * or a database user only after every check passed.
+ */
+async function addServices(project, name, folder, opts, tokens, stackName) {
+  const values = {};
+  const wants = { netlify: opts['netlify-site'] || opts['netlify-new'], supabase: opts['supabase-ref'], vercel: opts['vercel-project'], apify: opts.apify };
+  if (opts['netlify-site'] && opts['netlify-new']) fail('give --netlify-site or --netlify-new, not both');
+  for (const [s, want] of Object.entries(wants)) {
+    if (!want) continue;
+    if (project[s]) fail(`project ${name} already uses ${s}; changing it is the owner's job (wizard: Move a project)`);
+    if (!tokens[KEY_FOR[s]]) fail(`stack ${stackName} has no ${s} token: the owner adds it with the wizard (Replace a token)`);
+  }
+  if (wants.netlify) {
+    const site = opts['netlify-site'] && idArg(opts['netlify-site'], 'Netlify site id');
+    if (site && await pinOwner('netlify', 'site_id', site, name)) fail(`Netlify site ${site} already belongs to project ${await pinOwner('netlify', 'site_id', site, name)}`);
+    project.netlify = { site_id: site, dir: checkRelative(opts['netlify-dir'] ?? await publishDir(folder), '--netlify-dir') };
+  }
+  if (wants.supabase) {
+    const ref = idArg(opts['supabase-ref'], 'Supabase project ref');
+    const owner = await pinOwner('supabase', 'project_ref', ref, name);
+    if (owner) fail(`Supabase project ${ref} already belongs to project ${owner}`);
+    project.supabase = { project_ref: ref };
+  }
+  if (wants.vercel) {
+    const id = idArg(opts['vercel-project'], 'Vercel project id');
+    const owner = await pinOwner('vercel', 'project_id', id, name);
+    if (owner) fail(`Vercel project ${id} already belongs to project ${owner}`);
+    let org = null;
+    if (!skipVerify()) {
+      const found = (await lookup({ VERCEL_TOKEN: tokens.VERCEL_TOKEN })).vercel;
+      org = found?.projects?.find((p) => p.id === id || p.name === id)?.org_id;
+      if (!org) fail(`Vercel project ${id} is not in stack ${stackName}'s Vercel account`);
+    }
+    project.vercel = { org_id: org ?? 'team_test', project_id: id };
+  }
+  if (wants.apify) project.apify = { dir: checkRelative(opts['apify-dir'] ?? '.', '--apify-dir') };
+
+  if (!skipVerify()) {
+    const check = { ...project, netlify: project.netlify?.site_id ? project.netlify : undefined };
+    const { names } = await verifyPins(check, tokens).catch((e) => fail(e.message));
+    for (const [s, n] of Object.entries(names)) project[s] = { ...project[s], ...n };
+  }
+  if (wants.netlify && !project.netlify.site_id) {
+    if (skipVerify()) fail('--netlify-new needs the real Netlify API');
+    const stack = await loadStack(stackName);
+    const team = opts['netlify-team'] ?? stack.accounts?.netlify?.teams?.[0]
+      ?? (await lookup({ NETLIFY_AUTH_TOKEN: tokens.NETLIFY_AUTH_TOKEN })).netlify?.account?.teams?.[0];
+    if (!team) fail(`could not find a Netlify team for stack ${stackName}; give --netlify-team`);
+    const site = await createNetlifySite(tokens.NETLIFY_AUTH_TOKEN, team, opts['netlify-new']).catch((e) => fail(`creating the Netlify site: ${e.message}`));
+    project.netlify = { ...project.netlify, site_id: site.id, site_name: site.name, site_url: site.url };
+    process.stderr.write(`agent-broker: created Netlify site ${site.name} (${site.url}) in team ${team}\n`);
+  }
+  if (wants.supabase && !opts['no-reader'] && !skipVerify()) {
+    values.SUPABASE_READ_URL = await createReadOnlyUser(tokens.SUPABASE_ACCESS_TOKEN, project.supabase.project_ref)
+      .catch((e) => fail(`creating the read-only database user: ${e.message}. Retry with --no-reader and ask the owner.`));
+    process.stderr.write('agent-broker: created the read-only database user agent_reader (agent-broker supabase query)\n');
+  }
+  return values;
+}
+
+async function init(cwd, args) {
+  const { opts, positional } = parseArgs(args, SETUP_OPTS);
+  none(positional);
+  const stackName = checkName(opts.stack ?? fail('give the account stack: agent-broker init --stack <name> (ask the user which one; list: agent-broker stacks)'), 'stack');
+  await loadStack(stackName);
+  const tokens = await loadStackSecrets(stackName);
+  if (opts.list) {
+    const found = await lookup(tokens);
+    const used = {};
+    for (const n of await listProjects()) {
+      const p = await loadProject(n);
+      if (p.netlify) used[`netlify:${p.netlify.site_id}`] = n;
+      if (p.supabase) used[`supabase:${p.supabase.project_ref}`] = n;
+      if (p.vercel) used[`vercel:${p.vercel.project_id}`] = n;
+    }
+    json({
+      stack: stackName,
+      netlify: found.netlify?.sites?.map((s) => ({ ...s, used_by: used[`netlify:${s.id}`] ?? null })) ?? found.netlify?.error ?? null,
+      supabase: found.supabase?.projects?.map((p) => ({ ...p, used_by: used[`supabase:${p.ref}`] ?? null })) ?? found.supabase?.error ?? null,
+      vercel: found.vercel?.projects?.map((p) => ({ ...p, used_by: used[`vercel:${p.id}`] ?? null })) ?? found.vercel?.error ?? null,
+    });
+    return 0;
+  }
+  const here = await fs.realpath(cwd);
+  const folder = opts.here ? here : (await gitRoot(here)) ?? here;
+  await assertUnclaimed(folder);
+  const name = checkName(opts.name ?? path.basename(folder).toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^[-_]+/, ''));
+  if ((await listProjects()).includes(name)) fail(`a project named ${name} exists already: add --name <other>`);
+  const project = { stack: stackName, paths: [folder] };
+  const values = await addServices(project, name, folder, opts, tokens, stackName);
+  await saveProject(name, project);
+  await saveSecrets(name, values);
+  await audit({ init: name, stack: stackName, folder, services: SERVICES.filter((s) => project[s]) });
+  json({ created: name, stack: stackName, folder, services: Object.fromEntries(SERVICES.filter((s) => project[s]).map((s) => [s, project[s]])) });
+  return 0;
+}
+
+async function attach(cwd, args) {
+  const { explicit, rest } = takeProject(args);
+  const { opts, positional } = parseArgs(rest, SETUP_OPTS);
+  none(positional);
+  if (opts.stack || opts.name || opts.here || opts.list) fail('attach only adds services (stack, name and folder are fixed; the owner changes them with the wizard)');
+  const P = await resolveProject(cwd, explicit);
+  if (!P.project.stack) fail(`project ${P.name} has no stack yet: ask the owner (wizard: Set up / update)`);
+  const values = await addServices(P.project, P.name, P.root, opts, await loadStackSecrets(P.project.stack), P.project.stack);
+  await saveProject(P.name, P.project);
+  await saveSecrets(P.name, { ...(await loadSecrets(P.name)), ...values });
+  await audit({ attach: P.name, services: Object.keys(opts) });
+  json(await describe(P.name, P.project));
+  return 0;
+}
+
+/** The block for a project's AGENTS.md / CLAUDE.md. */
+function agentsBlock(name, project) {
+  const label = { netlify: (c) => c.site_name ?? c.site_id, supabase: (c) => c.name ?? c.project_ref, vercel: (c) => c.name ?? c.project_id, apify: () => 'actors' };
+  const uses = SERVICES.filter((s) => project[s]).map((s) => `${s} ${label[s](project[s])}`).join(', ');
+  const lines = [
+    '<!-- agent-broker:start -->',
+    '## Accounts (agent broker)',
+    '',
+    `This folder is broker project \`${name}\`${project.stack ? ` on account stack \`${project.stack}\`` : ''}${uses ? ` (${uses})` : ''}.`,
+    'Use `agent-broker` from inside this folder: the folder picks the account. Never name an account, site id or',
+    'project ref; never read tokens or `.env` secrets. The plain `netlify`/`supabase`/`apify`/`vercel` commands do local',
+    'work only.',
+    '',
+    '- Check: `agent-broker whoami`. All actions: `agent-broker help`.',
+  ];
+  if (project.netlify) lines.push('- Deploy: build, then `agent-broker netlify deploy --message "..."` (draft). `--prod` only when the owner asks.');
+  if (project.vercel) lines.push('- Deploy: `agent-broker vercel settings > .vercel/project.json`, `vercel build`, `agent-broker vercel deploy`.');
+  if (project.supabase) lines.push('- Database: `agent-broker supabase query "select ..."` (read-only). Changes: `agent-broker supabase migrate --dry-run`, then without; anything else: `agent-broker supabase admin-query "..."` (the owner approves).');
+  if (project.apify) lines.push('- Apify: `agent-broker apify push`, `runs <actor>`, `logs <run-id>`.');
+  lines.push('- Needs a site or database it does not have yet: `agent-broker attach ...` (see `agent-broker help`).');
+  lines.push('- A missing token: stop and ask the owner to run the agent-broker wizard.');
+  lines.push('<!-- agent-broker:end -->');
+  return lines.join('\n');
+}
+
+async function agentsMd(cwd, args) {
+  const { explicit, rest } = takeProject(args);
+  const { opts, positional } = parseArgs(rest, { json: 'bool' });
+  none(positional);
+  const P = await resolveProject(cwd, explicit);
+  const block = agentsBlock(P.name, P.project);
+  if (opts.json) json({ project: P.name, folder: P.root, block });
+  else process.stdout.write(`${block}\n`);
+  return 0;
+}
+
 // ---- Main --------------------------------------------------------------------------------------------------------
 
 /** Takes --project NAME / --project=NAME out of the arguments. */
@@ -414,7 +599,11 @@ async function main(argv) {
   if (service === 'projects') return projectsList();
   if (service === 'stacks') return stacksList();
   if (service === 'result') return result(action);
-  if (service === 'whoami') return whoami(cwd, takeProject([action, ...args].filter((a) => a !== undefined)).explicit);
+  const after = [action, ...args].filter((a) => a !== undefined);
+  if (service === 'whoami') return whoami(cwd, takeProject(after).explicit);
+  if (service === 'init') return init(cwd, after);
+  if (service === 'attach') return attach(cwd, after);
+  if (service === 'agents-md') return agentsMd(cwd, after);
   const actions = ACTIONS[service] ?? fail(`unknown service: ${service} (netlify, vercel, supabase, apify). See: agent-broker help`);
   const fn = Object.hasOwn(actions, action ?? '') ? actions[action] : fail(`${service} has no action "${action ?? ''}". Allowed: ${Object.keys(actions).join(', ')}`);
   const { explicit, rest } = takeProject(args);
