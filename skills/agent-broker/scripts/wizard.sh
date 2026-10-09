@@ -737,11 +737,15 @@ action_move_project() {
   stage "New stack" 1
   choose_stack
   stage "Save (Touch ID)" 1
-  ARGS=(apply --project "$P_NAME" --stack "$STACK" ${STACK_NEW:+--new-stack})
+  local old_services s rm_args=()
+  old_services=$(agent-broker projects | js "const p = d.find((x) => x.project === '$P_NAME'); return p ? Object.keys(p.services).join(' ') : '';")
+  for s in $old_services; do
+    rm_args+=(--remove-service "$s")
+  done
+  ARGS=(apply --project "$P_NAME" --stack "$STACK" ${STACK_NEW:+--new-stack} ${rm_args[@]+"${rm_args[@]}"})
   stack_value_lines | admin "${ARGS[@]}" && ok "project $P_NAME now on stack $STACK"
   clear_tokens
   tell_agents "$P_NAME" "$P_PATH"
-  pause
 }
 
 action_add_folder() {
