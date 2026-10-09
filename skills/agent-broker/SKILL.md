@@ -8,12 +8,11 @@ description: "Use for Netlify, Vercel, Supabase or Apify work (deploys, logs, SQ
 The owner has several logins per service. Tokens live only in the **broker** (macOS user `_deployer`, unreadable to
 agents). Two layers:
 
-- **Account stack**: one login per service (e.g. stack `thedoor` = theDoor's Netlify + Supabase). Tokens stored once.
+- **Account stack**: one login per service (e.g. stack `thedoor` = theDoor's Netlify + Supabase; stack `global` = default fallback for general projects). Tokens stored once.
 - **Project**: a folder, its stack, and the one site / database it may touch (pinned).
 
 **The folder picks the project.** Run `agent-broker` from inside the project folder. Never name an account, site id or
-project ref. `gh` is separate (one GitHub account, logged in normally).
-
+project ref. `gh` is separate (one GitHub account, logged in normally, never touched or logged out by the broker).
 ## Use it
 
 ```sh
@@ -30,7 +29,8 @@ agent-broker <service> <action> [options]
   `agent-broker result <id>`.
 - **Apify**: `push`, `info|builds|runs <actor>`, `logs <run-id>`, `call <actor> --input-file F`, `pull <actor> | tar -x`.
 - **Plain CLIs** (`netlify`, `supabase`, `apify`, `vercel`) do local work only (`netlify dev`, `supabase start`,
-  `vercel build`); account commands stop with a pointer here.
+  `vercel build`); account commands stop with a pointer here. For owner manual CLI work with personal global logins,
+  pass `--global` (e.g. `netlify deploy --global`) or set `export AGENT_BROKER_BYPASS=1`.
 - **Scripts that need a token while running** (nightly jobs, backups) run on GitHub Actions: `gh workflow run ...`.
 - **Tokens stay unread**: `.env` secrets, token files, CLI configs, `~/Secrets/*.kdbx`. Never put one in a file,
   argument, log or reply.
@@ -40,13 +40,13 @@ agent-broker <service> <action> [options]
 
 ## New project
 
-"Not inside a registered project" means a new project. Ask the user which stack (`agent-broker stacks`), then in
-the project folder:
+"Not inside a registered project" means a new project. Ask the user which stack (`agent-broker stacks`); if a stack
+named `global` exists, omitting `--stack` defaults to `global`. In the project folder:
 
 ```sh
-agent-broker init --stack <name> --list    # the stack's sites / databases, and which are free
-agent-broker init --stack <name> [--netlify-site ID | --netlify-new NAME] [--supabase-ref REF] [--apify]
-agent-broker attach --supabase-ref REF     # later: add a service the project does not have yet
+agent-broker init [--stack <name>] --list    # the stack's sites / databases, and which are free
+agent-broker init [--stack <name>] [--netlify-site ID | --netlify-new NAME] [--supabase-ref REF] [--apify]
+agent-broker attach --supabase-ref REF       # later: add a service the project does not have yet
 ```
 
 - `init` registers the git repo root (`--here`: this exact folder) and writes the block into the project's

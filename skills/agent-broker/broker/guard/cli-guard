@@ -14,15 +14,34 @@ for d in "${dirs[@]}"; do
   [[ "$(cd "$d" 2>/dev/null && pwd -P)" == "$here" ]] && continue
   if [[ -x "$d/$name" && ! -d "$d/$name" ]]; then real="$d/$name"; break; fi
 done
+if [[ "${AGENT_BROKER_BYPASS:-}" == "1" ]]; then
+  [[ -n "$real" ]] || { echo "$name is not installed (only the agent-broker guard is)" >&2; exit 127; }
+  exec "$real" "$@"
+fi
+
+has_global=false
+filtered_args=()
+for a in "$@"; do
+  if [[ "$a" == "--global" ]]; then
+    has_global=true
+  else
+    filtered_args+=("$a")
+  fi
+done
+
+if [[ "$has_global" == "true" ]]; then
+  [[ -n "$real" ]] || { echo "$name is not installed (only the agent-broker guard is)" >&2; exit 127; }
+  exec "$real" "${filtered_args[@]}"
+fi
 
 block() {
   {
     echo "$name $*: needs an account, which agents reach only through the agent broker on this Mac."
-    echo "  Run it from the project folder:  agent-broker whoami   then   agent-broker help"
+    echo "  For agents in a project folder:  agent-broker whoami   then   agent-broker help"
+    echo "  For personal/manual CLI use with your global login: pass --global or set AGENT_BROKER_BYPASS=1"
   } >&2
   exit 2
 }
-
 args=("$@")
 first=${1:-}
 case "$name" in

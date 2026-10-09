@@ -235,3 +235,68 @@ test('the AGENTS.md block is written once, replaced on rerun, and reaches Claude
   await fs.writeFile(path.join(imports, 'CLAUDE.md'), '@AGENTS.md\n');
   assert.deepEqual(writeBlocks(imports, block(1)), ['AGENTS.md']);
 });
+
+test('global stack acts as default fallback when project has no explicit stack and in init', async () => {
+  ok(admin(['apply', '--stack', 'global', '--new-stack'], `stack:NETLIFY_AUTH_TOKEN=nfp_global123\nstack:SUPABASE_ACCESS_TOKEN=sbp_global123\n`));
+  const stacks = JSON.parse(ok(broker(['stacks'])).stdout);
+  const glob = stacks.find((s) => s.stack === 'global');
+  assert.ok(glob);
+  assert.equal(glob.is_default, true);
+
+  // init in an unclaimed folder without --stack should pick 'global' automatically
+  const defapp = await folder('defapp');
+  const made = JSON.parse(ok(broker(['init', '--netlify-site', 'site-def', '--here'], defapp)).stdout);
+  assert.equal(made.stack, 'global');
+  const who = JSON.parse(ok(broker(['whoami'], defapp)).stdout);
+  assert.equal(who.stack, 'global');
+  assert.equal(who.services.netlify.token, true);
+
+  // A legacy project without explicit stack should fall back to global
+  const legapp = await folder('legapp');
+  await lib.saveProject('legapp', { paths: [legapp], netlify: { site_id: 'site-leg', dir: 'dist' } });
+  const whoLeg = JSON.parse(ok(broker(['whoami'], legapp)).stdout);
+  assert.equal(whoLeg.stack, 'global (default fallback)');
+  assert.equal(whoLeg.services.netlify.token, true);
+});
+test('cli-guard blocks account commands but allows bypass via AGENT_BROKER_BYPASS and --global', async () => {
+  const guardPath = path.resolve(import.meta.dirname, '../guard/cli-guard');
+  const runGuard = (args, extraEnv = {}) => spawnSync('bash', [guardPath, ...args], {
+    env: { ...process.env, PATH: '/usr/bin:/bin', ...extraEnv },
+    encoding: 'utf8',
+  });
+
+  // Mock real netlify command in realBinDir, guard in guardBinDir
+  const realBinDir = await folder('realbin');
+  const guardBinDir = await folder('guardbin');
+  const mockNetlify = path.join(realBinDir, 'netlify');
+  await fs.writeFile(mockNetlify, '#!/bin/sh\necho "REAL_NETLIFY: $@"\n', { mode: 0o755 });
+
+  const guardNetlify = path.join(guardBinDir, 'netlify');
+  await fs.copyFile(guardPath, guardNetlify);
+  await fs.chmod(guardNetlify, 0o755);
+
+  const runMock = (args, extraEnv = {}) => spawnSync(guardNetlify, args, {
+    env: { ...process.env, PATH: `${guardBinDir}:${realBinDir}:/usr/bin:/bin`, ...extraEnv },
+    encoding: 'utf8',
+  });
+  // deploy should be blocked without bypass
+  const blocked = runMock(['deploy', '--prod']);
+  assert.equal(blocked.status, 2);
+  assert.match(blocked.stderr, /needs an account/);
+  assert.match(blocked.stderr, /pass --global or set AGENT_BROKER_BYPASS=1/);
+
+  // dev (local safe command) should pass through
+  const safe = runMock(['dev']);
+  assert.equal(safe.status, 0);
+  assert.match(safe.stdout, /REAL_NETLIFY: dev/);
+
+  // bypass with env var
+  const byEnv = runMock(['deploy', '--prod'], { AGENT_BROKER_BYPASS: '1' });
+  assert.equal(byEnv.status, 0);
+  assert.match(byEnv.stdout, /REAL_NETLIFY: deploy --prod/);
+
+  // bypass with --global flag
+  const byFlag = runMock(['deploy', '--global', '--prod']);
+  assert.equal(byFlag.status, 0);
+  assert.match(byFlag.stdout, /REAL_NETLIFY: deploy --prod/);
+});

@@ -294,9 +294,57 @@ token_var() { case "$1" in netlify) echo T_NETLIFY ;; supabase) echo T_SUPABASE 
 token_key() { case "$1" in netlify) echo NETLIFY_AUTH_TOKEN ;; supabase) echo SUPABASE_ACCESS_TOKEN ;; apify) echo APIFY_TOKEN ;; vercel) echo VERCEL_TOKEN ;; esac; }
 service_title() { case "$1" in netlify) echo Netlify ;; supabase) echo Supabase ;; apify) echo Apify ;; vercel) echo Vercel ;; esac; }
 
+detect_global_token() {
+  local s=$1 tok=""
+  case "$s" in
+    netlify)
+      local cfg="$HOME/Library/Preferences/netlify/config.json"
+      if [[ -f "$cfg" ]]; then
+        tok=$(node -e 'try { const c = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); const u = c.users?.[c.userId]; console.log(u?.auth?.token ?? ""); } catch {}' "$cfg" 2>/dev/null)
+      fi
+      ;;
+    apify)
+      local cfg="$HOME/.apify/auth.json"
+      if [[ -f "$cfg" ]]; then
+        tok=$(node -e 'try { const c = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); console.log(c.token ?? ""); } catch {}' "$cfg" 2>/dev/null)
+      fi
+      ;;
+  esac
+  printf '%s' "$tok"
+}
+
+detect_global_label() {
+  local s=$1
+  case "$s" in
+    netlify)
+      local cfg="$HOME/Library/Preferences/netlify/config.json"
+      if [[ -f "$cfg" ]]; then
+        node -e 'try { const c = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); const u = c.users?.[c.userId]; console.log([u?.name, u?.email && "<" + u.email + ">"].filter(Boolean).join(" ")); } catch {}' "$cfg" 2>/dev/null
+      fi
+      ;;
+    apify)
+      local cfg="$HOME/.apify/auth.json"
+      if [[ -f "$cfg" ]]; then
+        node -e 'try { const c = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); console.log(c.email ? "<" + c.email + ">" : ""); } catch {}' "$cfg" 2>/dev/null
+      fi
+      ;;
+  esac
+}
+
 # ask_token SERVICE — open the token page, read the token hidden into T_<SERVICE>.
 ask_token() {
   local s=$1 url how
+  local existing existing_label
+  existing=$(detect_global_token "$s")
+  if [[ -n "$existing" ]]; then
+    existing_label=$(detect_global_label "$s")
+    printf '\n  %s%s token%s\n' "$BOLD" "$(service_title "$s")" "$RESET"
+    say "Found existing global $(service_title "$s") CLI login on this Mac: ${existing_label:-configured}"
+    if confirm_yes "Import this existing global $(service_title "$s") token into stack $STACK?"; then
+      eval "$(token_var "$s")=\$existing"
+      return 0
+    fi
+  fi
   case "$s" in
     netlify) url="https://app.netlify.com/user/applications#personal-access-tokens"; how="New access token. Name: agent-broker. Expiry: your choice." ;;
     supabase) url="https://supabase.com/dashboard/account/tokens"; how="Generate new token. Name: agent-broker." ;;
@@ -336,7 +384,7 @@ show_accounts() {
   done <<<"$lines"
 }
 
-stack_lines() { agent-broker stacks | js 'd.map((s) => `${s.stack}   ${Object.entries(s.accounts).map(([k, a]) => `${k}: ${a.email ?? a.name ?? (a.orgs ?? []).join(", ")}`).join(" · ") || "no tokens yet"}   (projects: ${s.projects.join(", ") || "none"})\t${s.stack}`).join("\n")'; }
+stack_lines() { agent-broker stacks | js 'd.map((s) => `${s.stack}${s.stack === "global" ? " (default fallback)" : ""}   ${Object.entries(s.accounts).map(([k, a]) => `${k}: ${a.email ?? a.name ?? (a.orgs ?? []).join(", ")}`).join(" · ") || "no tokens yet"}   (projects: ${s.projects.join(", ") || "none"})\t${s.stack}`).join("\n")'; }
 project_lines() { agent-broker projects | js 'd.map((p) => `${p.project}   ${p.stack ? "stack " + p.stack : "no stack"}   ${p.folders.join(", ")}\t${p.project}`).join("\n")'; }
 
 # choose_stack — STACK (+ STACK_NEW=1 and typed tokens for a new stack). Fills LOOKUP for its tokens.
@@ -364,14 +412,18 @@ choose_stack() {
 choose_stack_new() {
   STACK_NEW=1 LOOKUP="{}"
   clear_tokens
-  local taken
+  local taken def_name="global"
   taken=$(agent-broker stacks 2>/dev/null | js 'd.map((s) => s.stack).join(" ")' || true)
+  if [[ " $taken " == *" global "* ]]; then def_name=""; fi
   while :; do
-    ask_default STACK "Name the stack after its login (e.g. thedoor, studio):" ""
+    ask_default STACK "Name the stack after its login (e.g. global, thedoor, studio):" "$def_name"
     [[ "$STACK" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]] || { warn "Lowercase letters, digits, - and _ only."; continue; }
     [[ " $taken " == *" $STACK "* ]] && { warn "Stack $STACK exists already."; continue; }
     break
   done
+  if [[ "$STACK" == "global" ]]; then
+    note "Stack 'global' acts as the default fallback for projects without an explicit stack."
+  fi
   for svc in netlify supabase apify vercel; do
     if confirm "Does this stack have a $(service_title "$svc") login?"; then ask_token "$svc"; fi
   done
@@ -698,14 +750,31 @@ action_setup() {
     tell_agents "$p" "$(agent-broker projects | js "d.find((x) => x.project === '$p').folders[0]")"
   done
 
-  stage "Log out the global logins" 1
-  say "Then no command can fall back to whatever account is logged in. gh (GitHub) stays."
-  if confirm_yes "Log out of Netlify, Supabase and Apify?"; then
+  stage "Global CLI logins (optional)" 1
+  say "GitHub (gh) is ALWAYS kept intact."
+  say "You can also keep your global logins for Netlify, Supabase, Apify if you use them for personal work."
+  note "If you keep them, you can use them directly via --global or AGENT_BROKER_BYPASS=1."
+  note "Or import them into a 'global' stack for your projects."
+  printf '\n'
+  local logged_out=0
+  for svc in netlify supabase apify; do
     local bin
-    if bin=$(real_cli netlify); then "$bin" logout >/dev/null 2>&1 || true; fi
-    if bin=$(real_cli supabase); then "$bin" logout --yes >/dev/null 2>&1 || true; fi
-    if bin=$(real_cli apify); then "$bin" logout >/dev/null 2>&1 || true; fi
-    ok "logged out of Netlify, Supabase, Apify"
+    if bin=$(real_cli "$svc"); then
+      if confirm "Log out of global $(service_title "$svc") CLI login? (Press Enter to KEEP it)"; then
+        case "$svc" in
+          netlify) "$bin" logout >/dev/null 2>&1 || true ;;
+          supabase) "$bin" logout --yes >/dev/null 2>&1 || true ;;
+          apify) "$bin" logout >/dev/null 2>&1 || true ;;
+        esac
+        ok "logged out of $(service_title "$svc")"
+        logged_out=1
+      else
+        note "kept global $(service_title "$svc") login"
+      fi
+    fi
+  done
+  if [[ "$logged_out" -eq 0 ]]; then
+    ok "all global CLI logins kept"
   fi
   note "Open a new Terminal tab: the CLI guard starts in new shells."
   pause

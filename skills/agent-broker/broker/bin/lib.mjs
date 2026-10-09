@@ -102,9 +102,17 @@ export const saveSecrets = (name, secrets) => writeEnv(path.join(DIR.secrets, `$
 export const loadStackSecrets = (name) => readEnv(path.join(DIR.stackSecrets, `${checkName(name, 'stack')}.env`));
 export const saveStackSecrets = (name, secrets) => writeEnv(path.join(DIR.stackSecrets, `${checkName(name, 'stack')}.env`), secrets);
 
+/** The effective stack for a project: its explicit stack, or 'global' if a global stack exists. */
+export async function effectiveStack(project) {
+  if (project.stack) return project.stack;
+  if ((await listStacks()).includes('global')) return 'global';
+  return null;
+}
+
 /** The values a project runs with: its stack's account tokens, overridden by the project's own values. */
 export async function projectSecrets(name, project) {
-  return { ...(project.stack ? await loadStackSecrets(project.stack) : {}), ...(await loadSecrets(name)) };
+  const stack = await effectiveStack(project);
+  return { ...(stack ? await loadStackSecrets(stack) : {}), ...(await loadSecrets(name)) };
 }
 
 /** Every stored value of every stack and project: the scrubber removes all of them, not only the caller's. */

@@ -10,8 +10,9 @@ import path from 'node:path';
 import { createNetlifySite, createReadOnlyUser, lookup, verifyPins } from './accounts.mjs';
 import {
   CA_FILE, DIR, NAME, SERVICES, UsageError, allSecretValues, assertNoSecret, assertUnclaimed, audit, checkName,
-  checkRelative, fail, gitRoot, listProjects, listStacks, loadProject, loadSecrets, loadStack, loadStackSecrets,
-  makeScrubber, mkdirs, parseArgs, projectSecrets, resolveProject, run, saveProject, saveSecrets, syncProject,
+  checkRelative, effectiveStack, fail, gitRoot, listProjects, listStacks, loadProject, loadSecrets, loadStack,
+  loadStackSecrets, makeScrubber, mkdirs, parseArgs, projectSecrets, resolveProject, run, saveProject, saveSecrets,
+  syncProject,
 } from './lib.mjs';
 
 const HELP = `agent-broker <service> <action> [options]      run inside the project's folder: the folder picks the project
@@ -61,8 +62,9 @@ async function context(P, service, needs) {
   const config = P.project[service];
   if (!config) fail(`project ${P.name} does not use ${service} (owner: wizard -> "Add a project" to add it)`);
   const secrets = await projectSecrets(P.name, P.project);
+  const stack = await effectiveStack(P.project);
   for (const k of needs) {
-    if (!secrets[k]) fail(`project ${P.name} has no ${k}${P.project.stack ? ` (stack ${P.project.stack})` : ''}: ask the owner to run the wizard`);
+    if (!secrets[k]) fail(`project ${P.name} has no ${k}${stack ? ` (stack ${stack})` : ''}: ask the owner to run the wizard`);
   }
   const values = await allSecretValues();
   return { project: P.project, config, secrets, values, scrub: makeScrubber(values) };
@@ -359,17 +361,20 @@ const ACTIONS = { netlify, vercel, supabase, apify };
 
 /** What one project uses: stack, folders, pinned site / database, stored key names. */
 async function describe(name, project) {
+  const stack = await effectiveStack(project);
   const keys = new Set(Object.keys(await loadSecrets(name)));
-  if (project.stack) for (const k of Object.keys(await loadStackSecrets(project.stack))) keys.add(k);
+  if (stack) for (const k of Object.keys(await loadStackSecrets(stack))) keys.add(k);
   const services = {};
   for (const s of SERVICES) if (project[s]) services[s] = { ...project[s], token: keys.has(KEY_FOR[s]) };
-  return { project: name, stack: project.stack ?? null, folders: project.paths, services, keys: [...keys].sort(), note: project.note };
+  const stackLabel = project.stack ?? (stack ? 'global (default fallback)' : null);
+  return { project: name, stack: stackLabel, folders: project.paths, services, keys: [...keys].sort(), note: project.note };
 }
 
 async function whoami(cwd, explicit) {
   const P = await resolveProject(cwd, explicit);
   const d = await describe(P.name, P.project);
-  const accounts = P.project.stack ? (await loadStack(P.project.stack)).accounts ?? {} : {};
+  const stack = await effectiveStack(P.project);
+  const accounts = stack ? (await loadStack(stack)).accounts ?? {} : {};
   json({ ...d, folder: P.root, accounts, use: 'agent-broker <service> <action> from inside this folder; agent-broker help' });
   return 0;
 }
@@ -383,10 +388,10 @@ async function projectsList() {
 
 async function stacksList() {
   const out = [];
-  const projects = await Promise.all((await listProjects()).map(async (n) => [n, (await loadProject(n)).stack]));
+  const projects = await Promise.all((await listProjects()).map(async (n) => [n, await effectiveStack(await loadProject(n))]));
   for (const name of await listStacks()) {
     const s = await loadStack(name);
-    out.push({ stack: name, accounts: s.accounts ?? {}, keys: Object.keys(await loadStackSecrets(name)).sort(),
+    out.push({ stack: name, is_default: name === 'global', accounts: s.accounts ?? {}, keys: Object.keys(await loadStackSecrets(name)).sort(),
       projects: projects.filter(([, st]) => st === name).map(([n]) => n), note: s.note });
   }
   json(out);
@@ -490,7 +495,11 @@ async function addServices(project, name, folder, opts, tokens, stackName) {
 async function init(cwd, args) {
   const { opts, positional } = parseArgs(args, SETUP_OPTS);
   none(positional);
-  const stackName = checkName(opts.stack ?? fail('give the account stack: agent-broker init --stack <name> (ask the user which one; list: agent-broker stacks)'), 'stack');
+  const availableStacks = await listStacks();
+  const defaultStack = availableStacks.includes('global') ? 'global' : null;
+  const chosenStack = opts.stack ?? defaultStack;
+  if (!chosenStack) fail('give the account stack: agent-broker init --stack <name> (ask the user which one; list: agent-broker stacks)');
+  const stackName = checkName(chosenStack, 'stack');
   await loadStack(stackName);
   const tokens = await loadStackSecrets(stackName);
   if (opts.list) {
@@ -530,8 +539,9 @@ async function attach(cwd, args) {
   none(positional);
   if (opts.stack || opts.name || opts.here || opts.list) fail('attach only adds services (stack, name and folder are fixed; the owner changes them with the wizard)');
   const P = await resolveProject(cwd, explicit);
-  if (!P.project.stack) fail(`project ${P.name} has no stack yet: ask the owner (wizard: Set up / update)`);
-  const values = await addServices(P.project, P.name, P.root, opts, await loadStackSecrets(P.project.stack), P.project.stack);
+  const stack = await effectiveStack(P.project);
+  if (!stack) fail(`project ${P.name} has no stack yet: ask the owner (wizard: Set up / update)`);
+  const values = await addServices(P.project, P.name, P.root, opts, await loadStackSecrets(stack), stack);
   await saveProject(P.name, P.project);
   await saveSecrets(P.name, { ...(await loadSecrets(P.name)), ...values });
   await audit({ attach: P.name, services: Object.keys(opts) });
@@ -540,14 +550,14 @@ async function attach(cwd, args) {
 }
 
 /** The block for a project's AGENTS.md / CLAUDE.md. */
-function agentsBlock(name, project) {
+function agentsBlock(name, project, stack) {
   const label = { netlify: (c) => c.site_name ?? c.site_id, supabase: (c) => c.name ?? c.project_ref, vercel: (c) => c.name ?? c.project_id, apify: () => 'actors' };
   const uses = SERVICES.filter((s) => project[s]).map((s) => `${s} ${label[s](project[s])}`).join(', ');
   const lines = [
     '<!-- agent-broker:start -->',
     '## Accounts (agent broker)',
     '',
-    `This folder is broker project \`${name}\`${project.stack ? ` on account stack \`${project.stack}\`` : ''}${uses ? ` (${uses})` : ''}.`,
+    `This folder is broker project \`${name}\`${stack ? ` on account stack \`${stack}\`` : ''}${uses ? ` (${uses})` : ''}.`,
     'Use `agent-broker` from inside this folder: the folder picks the account. Never name an account, site id or',
     'project ref; never read tokens or `.env` secrets. The plain `netlify`/`supabase`/`apify`/`vercel` commands do local',
     'work only.',
@@ -569,7 +579,8 @@ async function agentsMd(cwd, args) {
   const { opts, positional } = parseArgs(rest, { json: 'bool' });
   none(positional);
   const P = await resolveProject(cwd, explicit);
-  const block = agentsBlock(P.name, P.project);
+  const stack = await effectiveStack(P.project);
+  const block = agentsBlock(P.name, P.project, stack);
   if (opts.json) json({ project: P.name, folder: P.root, block });
   else process.stdout.write(`${block}\n`);
   return 0;
