@@ -255,9 +255,9 @@ pick() {
   while IFS=$'\t' read -r label value; do
     [[ -z "$label" ]] && continue
     n=$((n + 1)); values+=("$value")
-    printf '   %s%2d%s  %s\n' "$BLUE" "$n" "$RESET" "$label"
+    printf '   %s%2d%s  %b\n' "$BLUE" "$n" "$RESET" "$label"
   done <<<"$lines"
-  [[ -n "$extra" ]] && printf '   %s n%s  %s\n' "$BLUE" "$RESET" "${extra#*$'\t'}"
+  [[ -n "$extra" ]] && printf '   %s n%s  %b\n' "$BLUE" "$RESET" "${extra#*$'\t'}"
   while :; do
     printf '  %sNumber:%s ' "$BOLD" "$RESET"
     read -r input || true
@@ -384,8 +384,21 @@ show_accounts() {
   done <<<"$lines"
 }
 
-stack_lines() { agent-broker stacks | js 'd.map((s) => `${s.stack}${s.stack === "global" ? " (default fallback)" : ""}   ${Object.entries(s.accounts).map(([k, a]) => `${k}: ${a.email ?? a.name ?? (a.orgs ?? []).join(", ")}`).join(" · ") || "no tokens yet"}   (projects: ${s.projects.join(", ") || "none"})\t${s.stack}`).join("\n")'; }
-project_lines() { agent-broker projects | js 'd.map((p) => `${p.project}   ${p.stack ? "stack " + p.stack : "no stack"}   ${p.folders.join(", ")}\t${p.project}`).join("\n")'; }
+stack_lines() {
+  agent-broker stacks | js 'd.map((s) => {
+    const isDef = s.is_default || s.stack === "global" ? " (default fallback)" : "";
+    const accts = Object.entries(s.accounts).map(([k, a]) => `${k} (${a.email ?? a.name ?? (a.orgs ?? []).join(", ")})`).join(" · ") || "no tokens yet";
+    const projs = s.projects.length ? s.projects.join(", ") : "none";
+    return `Account Stack: "${s.stack}"${isDef}  •  Projects: ${projs}\\n       Logins: ${accts}\t${s.stack}`;
+  }).join("\n")'
+}
+project_lines() {
+  agent-broker projects | js 'd.map((p) => {
+    const folders = p.folders.map((f) => f.replace(process.env.HOME, "~")).join(", ");
+    const stack = p.stack ? `"${p.stack}"` : "(none)";
+    return `Project: "${p.project}"  •  Account Stack: ${stack}\\n       Folder:  ${folders}\t${p.project}`;
+  }).join("\n")'
+}
 
 # choose_stack — STACK (+ STACK_NEW=1 and typed tokens for a new stack). Fills LOOKUP for its tokens.
 choose_stack() {
