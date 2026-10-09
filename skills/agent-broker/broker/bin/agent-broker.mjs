@@ -12,7 +12,7 @@ import {
   CA_FILE, DIR, NAME, SERVICES, UsageError, allSecretValues, assertNoSecret, assertUnclaimed, audit, checkName,
   checkRelative, effectiveStack, fail, gitRoot, listProjects, listStacks, loadProject, loadSecrets, loadStack,
   loadStackSecrets, makeScrubber, mkdirs, parseArgs, projectSecrets, resolveProject, run, saveProject, saveSecrets,
-  syncProject,
+  stackFromAgentsMd, syncProject,
 } from './lib.mjs';
 
 const HELP = `agent-broker <service> <action> [options]      run inside the project's folder: the folder picks the project
@@ -59,13 +59,15 @@ const KEY_FOR = { netlify: 'NETLIFY_AUTH_TOKEN', vercel: 'VERCEL_TOKEN', supabas
 
 /** P = { name, project, root } from resolveProject. */
 async function context(P, service, needs) {
-  const config = P.project[service];
-  if (!config) fail(`project ${P.name} does not use ${service} (owner: wizard -> "Add a project" to add it)`);
   const secrets = await projectSecrets(P.name, P.project);
   const stack = await effectiveStack(P.project);
-  for (const k of needs) {
-    if (!secrets[k]) fail(`project ${P.name} has no ${k}${stack ? ` (stack ${stack})` : ''}: ask the owner to run the wizard`);
+  if (!P.project[service] && !P.project.adHoc) {
+    fail(`project ${P.name} does not use ${service} (owner: wizard -> "Add a project" to add it)`);
   }
+  for (const k of needs) {
+    if (!secrets[k]) fail(`stack ${stack ?? P.name} has no ${k}: ask the owner to run the wizard`);
+  }
+  const config = P.project[service] ?? {};
   const values = await allSecretValues();
   return { project: P.project, config, secrets, values, scrub: makeScrubber(values) };
 }
@@ -370,8 +372,8 @@ async function describe(name, project) {
   return { project: name, stack: stackLabel, folders: project.paths, services, keys: [...keys].sort(), note: project.note };
 }
 
-async function whoami(cwd, explicit) {
-  const P = await resolveProject(cwd, explicit);
+async function whoami(cwd, flags = {}) {
+  const P = await resolveProject(cwd, flags.explicit, flags.explicitStack);
   const d = await describe(P.name, P.project);
   const stack = await effectiveStack(P.project);
   const accounts = stack ? (await loadStack(stack)).accounts ?? {} : {};
@@ -534,10 +536,10 @@ async function init(cwd, args) {
 }
 
 async function attach(cwd, args) {
-  const { explicit, rest } = takeProject(args);
+  const { explicit, explicitStack, rest } = takeFlags(args);
   const { opts, positional } = parseArgs(rest, SETUP_OPTS);
   none(positional);
-  if (opts.stack || opts.name || opts.here || opts.list) fail('attach only adds services (stack, name and folder are fixed; the owner changes them with the wizard)');
+  if (explicitStack || opts.stack || opts.name || opts.here || opts.list) fail('attach only adds services (stack, name and folder are fixed; the owner changes them with the wizard)');
   const P = await resolveProject(cwd, explicit);
   const stack = await effectiveStack(P.project);
   if (!stack) fail(`project ${P.name} has no stack yet: ask the owner (wizard: Set up / update)`);
@@ -549,7 +551,40 @@ async function attach(cwd, args) {
   return 0;
 }
 
-/** The block for a project's AGENTS.md / CLAUDE.md. */
+/** Generic, project-agnostic block for a stack. Drop into AGENTS.md / CLAUDE.md of any repo using this stack. */
+async function stackAgentsBlock(stackName) {
+  await loadStack(stackName);
+  const secrets = await loadStackSecrets(stackName);
+  const lines = [
+    '<!-- agent-broker:start -->',
+    '## Accounts & deployment (agent broker)',
+    '',
+    `This project uses account stack \`${stackName}\`.`,
+    'Use `agent-broker` from inside this repository. The stack picks your account.',
+    'Never name an account, site id or project ref; never read tokens or `.env` secrets.',
+    'The plain `netlify`/`supabase`/`apify`/`vercel` commands do local work only.',
+    '',
+    '- Check stack info: `agent-broker whoami`. All actions: `agent-broker help`.',
+  ];
+  if (secrets.NETLIFY_AUTH_TOKEN) {
+    lines.push('- Deploy: build, then `agent-broker netlify deploy --message "..."` (draft). `--prod` only when the owner asks.');
+  }
+  if (secrets.VERCEL_TOKEN) {
+    lines.push('- Deploy: `agent-broker vercel settings > .vercel/project.json`, `vercel build`, `agent-broker vercel deploy`.');
+  }
+  if (secrets.SUPABASE_ACCESS_TOKEN || secrets.SUPABASE_READ_URL) {
+    lines.push('- Database: `agent-broker supabase query "select ..."` (read-only). Changes: `agent-broker supabase migrate --dry-run`, then without; anything else: `agent-broker supabase admin-query "..."` (the owner approves).');
+  }
+  if (secrets.APIFY_TOKEN) {
+    lines.push('- Apify: `agent-broker apify push`, `runs <actor>`, `logs <run-id>`.');
+  }
+  lines.push('- Needs a site or database not attached yet: `agent-broker attach ...` (see `agent-broker help`).');
+  lines.push('- A missing token: stop and ask the owner to run the agent-broker wizard.');
+  lines.push('<!-- agent-broker:end -->');
+  return lines.join('\n');
+}
+
+/** Project-specific fallback block (legacy). */
 function agentsBlock(name, project, stack) {
   const label = { netlify: (c) => c.site_name ?? c.site_id, supabase: (c) => c.name ?? c.project_ref, vercel: (c) => c.name ?? c.project_id, apify: () => 'actors' };
   const uses = SERVICES.filter((s) => project[s]).map((s) => `${s} ${label[s](project[s])}`).join(', ');
@@ -575,12 +610,20 @@ function agentsBlock(name, project, stack) {
 }
 
 async function agentsMd(cwd, args) {
-  const { explicit, rest } = takeProject(args);
-  const { opts, positional } = parseArgs(rest, { json: 'bool' });
+  const { explicit, explicitStack, rest } = takeFlags(args);
+  const { opts, positional } = parseArgs(rest, { json: 'bool', stack: 'string' });
   none(positional);
-  const P = await resolveProject(cwd, explicit);
-  const stack = await effectiveStack(P.project);
-  const block = agentsBlock(P.name, P.project, stack);
+  const stack = opts.stack ?? explicitStack;
+  if (stack) {
+    checkName(stack, 'stack');
+    const block = await stackAgentsBlock(stack);
+    if (opts.json) json({ stack, block });
+    else process.stdout.write(`${block}\n`);
+    return 0;
+  }
+  const P = await resolveProject(cwd, explicit, explicitStack);
+  const effective = await effectiveStack(P.project);
+  const block = effective ? await stackAgentsBlock(effective) : agentsBlock(P.name, P.project, null);
   if (opts.json) json({ project: P.name, folder: P.root, block });
   else process.stdout.write(`${block}\n`);
   return 0;
@@ -589,16 +632,21 @@ async function agentsMd(cwd, args) {
 // ---- Main --------------------------------------------------------------------------------------------------------
 
 /** Takes --project NAME / --project=NAME out of the arguments. */
-function takeProject(args) {
+/** Takes --project and --stack out of the arguments. */
+function takeFlags(args) {
   let explicit;
+  let explicitStack;
   const rest = [];
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--project') explicit = args[++i] ?? fail('--project needs a value');
     else if (args[i].startsWith('--project=')) explicit = args[i].slice('--project='.length);
+    else if (args[i] === '--stack') explicitStack = args[++i] ?? fail('--stack needs a value');
+    else if (args[i].startsWith('--stack=')) explicitStack = args[i].slice('--stack='.length);
     else rest.push(args[i]);
   }
   if (explicit !== undefined) checkName(explicit);
-  return { explicit, rest };
+  if (explicitStack !== undefined) checkName(explicitStack, 'stack');
+  return { explicit, explicitStack, rest };
 }
 
 async function main(argv) {
@@ -611,14 +659,14 @@ async function main(argv) {
   if (service === 'stacks') return stacksList();
   if (service === 'result') return result(action);
   const after = [action, ...args].filter((a) => a !== undefined);
-  if (service === 'whoami') return whoami(cwd, takeProject(after).explicit);
+  if (service === 'whoami') return whoami(cwd, takeFlags(after));
   if (service === 'init') return init(cwd, after);
   if (service === 'attach') return attach(cwd, after);
   if (service === 'agents-md') return agentsMd(cwd, after);
   const actions = ACTIONS[service] ?? fail(`unknown service: ${service} (netlify, vercel, supabase, apify). See: agent-broker help`);
   const fn = Object.hasOwn(actions, action ?? '') ? actions[action] : fail(`${service} has no action "${action ?? ''}". Allowed: ${Object.keys(actions).join(', ')}`);
-  const { explicit, rest } = takeProject(args);
-  const P = await resolveProject(cwd, explicit);
+  const { explicit, explicitStack, rest } = takeFlags(args);
+  const P = await resolveProject(cwd, explicit, explicitStack);
   // Old form `agent-broker netlify deploy <project>` (blob store names may look like project names: not checked).
   if (!action.startsWith('blobs-') && NAME.test(rest[0] ?? '') && (await listProjects()).includes(rest[0])) {
     fail(`unexpected argument "${rest[0]}": the project comes from the folder you run in (here: ${P.name}). `

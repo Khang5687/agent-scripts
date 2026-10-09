@@ -158,7 +158,25 @@ async function matches(dir) {
  * share the deepest folder. Returns { name, project, root }: root is the folder to copy (the worktree's own files
  * for a worktree).
  */
-export async function resolveProject(cwd, explicit) {
+export async function stackFromAgentsMd(dir) {
+  let curr = dir;
+  for (let i = 0; i < 8; i++) {
+    for (const file of ['AGENTS.md', 'CLAUDE.md']) {
+      const p = path.join(curr, file);
+      const text = await fs.readFile(p, 'utf8').catch(() => null);
+      if (text) {
+        const m = text.match(/(?:account stack|on account stack|uses account stack|stack)[:\s`]+([a-z0-9][a-z0-9_-]{0,62})/i);
+        if (m) return m[1].toLowerCase();
+      }
+    }
+    const parent = path.dirname(curr);
+    if (parent === curr) break;
+    curr = parent;
+  }
+  return null;
+}
+
+export async function resolveProject(cwd, explicit, explicitStack, opts = {}) {
   const dir = await fs.realpath(cwd).catch(() => cwd);
   let found = await matches(dir);
   let rootFor = (folder) => folder;
@@ -170,11 +188,24 @@ export async function resolveProject(cwd, explicit) {
     }
   }
   if (!found.length) {
+    if (opts.registeredOnly) {
+      fail(`${dir} is not inside a registered project.`);
+    }
+    const available = await listStacks();
+    const fromDoc = await stackFromAgentsMd(dir);
+    const candidate = explicitStack ?? fromDoc ?? (available.includes('global') ? 'global' : null);
+    if (candidate && available.includes(candidate)) {
+      const git = (await gitRoot(dir)) ?? dir;
+      const name = path.basename(git).toLowerCase().replace(/[^a-z0-9_-]+/g, '-');
+      const project = { stack: candidate, paths: [git], adHoc: true };
+      return { name, project, root: git };
+    }
     const all = [];
     for (const name of await listProjects()) all.push(`${name} -> ${(await loadProject(name)).paths.join(', ')}`);
-    fail(`${dir} is not inside a registered project.\n  registered: ${all.join('; ') || 'none'}\n`
-      + '  If this is a new project: ask the user which account stack it uses (agent-broker stacks), then run\n'
-      + '  agent-broker init --stack <name> here. Otherwise cd into the project\'s folder.');
+    fail(`${dir} is not inside a registered project and no valid account stack was found in AGENTS.md.\n`
+      + `  available stacks: ${available.join(', ') || 'none (run wizard -> Add an account stack)'}\n`
+      + `  registered projects: ${all.join('; ') || 'none'}\n`
+      + '  Add this stack to the project\'s AGENTS.md (wizard: AGENTS.md text), or run: agent-broker init --stack <name>');
   }
   const deepest = found.filter((m) => m.folder.length === found[0].folder.length);
   let pick = deepest[0];
@@ -205,7 +236,7 @@ export async function gitRoot(dir) {
 export async function assertUnclaimed(folder) {
   let owner = null;
   try {
-    owner = await resolveProject(folder);
+    owner = await resolveProject(folder, undefined, undefined, { registeredOnly: true });
   } catch (e) {
     if (!(e instanceof UsageError)) throw e;
     if (!/is not inside a registered project/.test(e.message)) fail(`${folder} already belongs to projects: ${e.message}`);

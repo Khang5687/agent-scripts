@@ -715,14 +715,22 @@ action_add_folder() {
 }
 
 action_agents_text() {
-  begin "AGENTS.md text" 1 1
-  local projects
-  projects=$(project_lines)
-  [[ -n "$projects" ]] || { warn "No projects yet."; pause; return; }
-  stage "Project" 1
-  pick P_NAME "Which project?" "$projects"
-  (cd "$(agent-broker projects | js "d.find((p) => p.project === '$P_NAME').folders[0]")" && agent-broker agents-md --project "$P_NAME") | sed 's/^/    /'
-  tell_agents "$P_NAME" "$(agent-broker projects | js "d.find((p) => p.project === '$P_NAME').folders[0]")"
+  begin "AGENTS.md text for a stack" 1 1
+  local stacks
+  stacks=$(stack_lines)
+  [[ -n "$stacks" ]] || { warn "No stacks yet. Add a stack first (menu 1)."; pause; return; }
+  stage "Which account stack?" 1
+  say "Choose the stack you want to use. The snippet works in ANY project (existing or new)."
+  pick STACK "Which account stack?" "$stacks"
+  printf '\n'
+  local snippet
+  snippet=$(agent-broker agents-md --stack "$STACK")
+  say "Copy-paste this snippet into AGENTS.md (or CLAUDE.md) in any project using stack $STACK:"
+  printf '\n%s\n\n' "$snippet"
+  if command -v pbcopy >/dev/null 2>&1; then
+    printf '%s' "$snippet" | pbcopy
+    ok "Copied snippet to clipboard! Paste it into your project's AGENTS.md."
+  fi
   pause
 }
 
@@ -811,7 +819,7 @@ while :; do
   printf '   %s3%s  Add a project            %s(optional: agents do it with agent-broker init)%s\n' "$BLUE" "$RESET" "$DIM" "$RESET"
   printf '   %s4%s  Move a project           %s(to another stack)%s\n' "$BLUE" "$RESET" "$DIM" "$RESET"
   printf '   %s5%s  Add a folder             %s(second copy of a project)%s\n' "$BLUE" "$RESET" "$DIM" "$RESET"
-  printf '   %s6%s  AGENTS.md text           %s(for a project)%s\n' "$BLUE" "$RESET" "$DIM" "$RESET"
+  printf '   %s6%s  AGENTS.md text           %s(for a stack; copy into any project)%s\n' "$BLUE" "$RESET" "$DIM" "$RESET"
   printf '   %s7%s  Set up / update          %s(vault, install, log out)%s\n' "$BLUE" "$RESET" "$DIM" "$RESET"
   printf '   %s0%s  Done\n\n' "$BLUE" "$RESET"
   printf '  %sNumber:%s ' "$BOLD" "$RESET"

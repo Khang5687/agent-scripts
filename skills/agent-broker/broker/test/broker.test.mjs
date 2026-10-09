@@ -210,9 +210,9 @@ test('attach adds a missing service only; agents-md gives the block for the fold
 
   const md = JSON.parse(ok(broker(['agents-md', '--json'], app)).stdout);
   assert.equal(md.folder, app);
-  assert.match(md.block, /broker project `attachapp` on account stack `studio`/);
+  assert.match(md.block, /uses account stack `studio`/);
   assert.match(md.block, /agent-broker netlify deploy/);
-  assert.doesNotMatch(md.block, /supabase query/);
+  assert.match(md.block, /agent-broker supabase query/);
 });
 
 test('the AGENTS.md block is written once, replaced on rerun, and reaches Claude Code', async () => {
@@ -299,4 +299,22 @@ test('cli-guard blocks account commands but allows bypass via AGENT_BROKER_BYPAS
   const byFlag = runMock(['deploy', '--global', '--prod']);
   assert.equal(byFlag.status, 0);
   assert.match(byFlag.stdout, /REAL_NETLIFY: deploy --prod/);
+});
+
+test('agents-md --stack outputs a project-agnostic snippet; unregistered repo with stack in AGENTS.md dynamically resolves', async () => {
+  const out = ok(broker(['agents-md', '--stack', 'studio'])).stdout;
+  assert.match(out, /This project uses account stack `studio`/);
+  assert.match(out, /agent-broker netlify deploy/);
+  assert.doesNotMatch(out, /attachapp|saas-1|analytics/); // zero project names or paths
+
+  // New repository with zero pre-registration
+  const brandNewRepo = await folder('brand-new-repo');
+  await fs.mkdir(path.join(brandNewRepo, '.git'));
+  await fs.writeFile(path.join(brandNewRepo, 'AGENTS.md'), out);
+
+  // whoami inside the new repo resolves stack studio automatically
+  const who = JSON.parse(ok(broker(['whoami'], brandNewRepo)).stdout);
+  assert.equal(who.stack, 'studio');
+  assert.equal(who.project, 'brand-new-repo');
+  assert.equal(who.folder, brandNewRepo);
 });
