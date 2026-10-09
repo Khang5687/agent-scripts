@@ -724,7 +724,40 @@ action_agents_text() {
   pick STACK "Which account stack?" "$stacks"
   printf '\n'
   local snippet
-  snippet=$(agent-broker agents-md --stack "$STACK")
+  snippet=$(agent-broker stacks | node -e '
+    let s = ""; process.stdin.on("data", c => s += c).on("end", () => {
+      const d = JSON.parse(s || "[]");
+      const st = d.find(x => x.stack === process.argv[1]);
+      const keys = st?.keys ?? [];
+      const lines = [
+        "<!-- agent-broker:start -->",
+        "## Accounts & deployment (agent broker)",
+        "",
+        `This project uses account stack \`${process.argv[1]}\`.`,
+        "Use `agent-broker` from inside this repository. The stack picks your account.",
+        "Never name an account, site id or project ref; never read tokens or `.env` secrets.",
+        "The plain `netlify`/`supabase`/`apify`/`vercel` commands do local work only.",
+        "",
+        "- Check stack info: `agent-broker whoami`. All actions: `agent-broker help`."
+      ];
+      if (keys.includes("NETLIFY_AUTH_TOKEN")) {
+        lines.push("- Deploy: build, then `agent-broker netlify deploy --message \"...\"` (draft). `--prod` only when the owner asks.");
+      }
+      if (keys.includes("VERCEL_TOKEN")) {
+        lines.push("- Deploy: `agent-broker vercel settings > .vercel/project.json`, `vercel build`, `agent-broker vercel deploy`.");
+      }
+      if (keys.includes("SUPABASE_ACCESS_TOKEN") || keys.includes("SUPABASE_READ_URL")) {
+        lines.push("- Database: `agent-broker supabase query \"select ...\"` (read-only). Changes: `agent-broker supabase migrate --dry-run`, then without; anything else: `agent-broker supabase admin-query \"...\"` (the owner approves).");
+      }
+      if (keys.includes("APIFY_TOKEN")) {
+        lines.push("- Apify: `agent-broker apify push`, `runs <actor>`, `logs <run-id>`.");
+      }
+      lines.push("- Needs a site or database not attached yet: `agent-broker attach ...` (see `agent-broker help`).");
+      lines.push("- A missing token: stop and ask the owner to run the agent-broker wizard.");
+      lines.push("<!-- agent-broker:end -->");
+      console.log(lines.join("\n"));
+    });
+  ' "$STACK")
   say "Copy-paste this snippet into AGENTS.md (or CLAUDE.md) in any project using stack $STACK:"
   printf '\n%s\n\n' "$snippet"
   if command -v pbcopy >/dev/null 2>&1; then
