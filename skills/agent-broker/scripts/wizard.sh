@@ -458,7 +458,7 @@ stack_value_lines() {
 
 # choose_pins FOLDER — ask which services the project uses and pick its site / database from lists. Adds to ARGS.
 choose_pins() {
-  local folder=$1 found list ref org pid publish
+  local folder=$1 found list ref org pid publish site dir site_action site_name sb_action
   for svc in netlify supabase vercel apify; do
     local has_token=""
     [[ -n "$(printf '%s' "$LOOKUP" | js "d.$svc && !d.$svc.error ? 'y' : ''")" ]] && has_token=1
@@ -475,25 +475,81 @@ choose_pins() {
       netlify)
         found=$(node -e 'try { console.log(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).siteId ?? "") } catch {}' "$folder/.netlify/state.json")
         list=$(printf '%s' "$LOOKUP" | js "(d.netlify.sites ?? []).map((s) => \`\${s.name}   \${s.url}\${s.id === '$found' ? '   ← this folder' : ''}\t\${s.id}\`).join('\n')")
-        [[ -n "$list" ]] || die "This Netlify account has no sites. Create the site in Netlify first."
-        pick site "Which Netlify site?" "$list"
         publish=$(sed -nE 's/^[[:space:]]*publish[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "$folder/netlify.toml" 2>/dev/null | head -1)
         ask_default dir "Folder with the built files:" "${publish:-dist}"
-        ARGS+=(--netlify-site "$site" --netlify-dir "$dir")
+        if [[ -n "$list" ]]; then
+          pick site "Which Netlify site?" "$list" $'new\t+ Create a new Netlify site now\nskip\tSkip / unpin site for now (configure later)'
+          if [[ "$site" == "new" ]]; then
+            ask_default site_name "New Netlify site name:" "$(basename "$folder")"
+            ARGS+=(--netlify-new "$site_name" --netlify-dir "$dir")
+          elif [[ "$site" == "skip" ]]; then
+            ARGS+=(--remove-service netlify)
+          else
+            ARGS+=(--netlify-site "$site" --netlify-dir "$dir")
+          fi
+        else
+          say "This Netlify account has no sites yet."
+          pick site_action "What would you like to do?" $'new\tCreate a new Netlify site now\nskip\tSkip site pinning for now (configure later)\nmanual\tEnter site ID manually'
+          case "$site_action" in
+            new)
+              ask_default site_name "New Netlify site name:" "$(basename "$folder")"
+              ARGS+=(--netlify-new "$site_name" --netlify-dir "$dir")
+              ;;
+            manual)
+              ask site "Netlify site ID:"
+              ARGS+=(--netlify-site "$site" --netlify-dir "$dir")
+              ;;
+            skip | *)
+              ARGS+=(--remove-service netlify)
+              ;;
+          esac
+        fi
         ;;
       supabase)
         list=$(printf '%s' "$LOOKUP" | js "(d.supabase.projects ?? []).map((p) => \`\${p.name}   \${p.ref}   (\${p.org}, \${p.status})\t\${p.ref}\`).join('\n')")
-        [[ -n "$list" ]] || die "This Supabase account has no projects."
-        pick ref "Which Supabase project?" "$list"
-        ARGS+=(--supabase-ref "$ref")
-        P_REF=$ref
+        if [[ -n "$list" ]]; then
+          pick ref "Which Supabase project?" "$list" $'skip\tSkip / unpin Supabase for now'
+          if [[ "$ref" == "skip" ]]; then
+            ARGS+=(--remove-service supabase)
+          else
+            ARGS+=(--supabase-ref "$ref")
+            P_REF=$ref
+          fi
+        else
+          say "This Supabase account has no projects yet."
+          pick sb_action "What would you like to do?" $'skip\tSkip / unpin Supabase for now (configure later)\nmanual\tEnter project ref manually'
+          case "$sb_action" in
+            manual)
+              ask ref "Supabase project ref:"
+              ARGS+=(--supabase-ref "$ref")
+              P_REF=$ref
+              ;;
+            skip | *)
+              ARGS+=(--remove-service supabase)
+              ;;
+          esac
+        fi
         ;;
       vercel)
         list=$(printf '%s' "$LOOKUP" | js "(d.vercel.projects ?? []).map((p) => \`\${p.name}   (\${p.scope})\t\${p.org_id} \${p.id}\`).join('\n')")
-        [[ -n "$list" ]] || die "This Vercel account has no projects."
-        pick pid "Which Vercel project?" "$list"
-        org=${pid%% *}
-        ARGS+=(--vercel-org "$org" --vercel-project "${pid#* }")
+        if [[ -n "$list" ]]; then
+          pick pid "Which Vercel project?" "$list" $'skip\tSkip / unpin Vercel for now'
+          if [[ "$pid" == "skip" ]]; then
+            ARGS+=(--remove-service vercel)
+          else
+            org=${pid%% *}
+            ARGS+=(--vercel-org "$org" --vercel-project "${pid#* }")
+          fi
+        else
+          say "This Vercel account has no projects yet."
+          if confirm "Enter Vercel project ID manually?"; then
+            ask org "Vercel org ID:"
+            ask pid "Vercel project ID:"
+            ARGS+=(--vercel-org "$org" --vercel-project "$pid")
+          else
+            ARGS+=(--remove-service vercel)
+          fi
+        fi
         ;;
       apify)
         ask_default dir "Folder with the actor (.actor/actor.json), inside the project:" "."

@@ -6,7 +6,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import readline from 'node:readline/promises';
-import { accountLabel, lookup, verifyPins } from './accounts.mjs';
+import { accountLabel, createNetlifySite, lookup, verifyPins } from './accounts.mjs';
 import {
   ACCOUNT_KEYS, DIR, KEY, SERVICES, UsageError, allSecretValues, audit, checkName, checkRelative, fail, listProjects,
   listStacks, loadProject, loadSecrets, loadStack, loadStackSecrets, makeScrubber, mkdirs, parseArgs, projectSecrets,
@@ -67,7 +67,8 @@ async function apply(args) {
   const { opts, positional } = parseArgs(args, {
     stack: 'string', 'new-stack': 'bool', 'stack-note': 'string', 'stack-from-project': 'string',
     project: 'string', 'new-project': 'bool', note: 'string', path: 'string', 'add-path': 'list', 'remove-path': 'list',
-    'netlify-site': 'string', 'netlify-dir': 'string', 'supabase-ref': 'string', apify: 'bool', 'apify-dir': 'string',
+    'netlify-site': 'string', 'netlify-new': 'string', 'netlify-team': 'string', 'netlify-dir': 'string',
+    'supabase-ref': 'string', apify: 'bool', 'apify-dir': 'string',
     'vercel-org': 'string', 'vercel-project': 'string', 'remove-service': 'list',
   });
   if (positional.length) fail(`unexpected arguments: ${positional.join(' ')}`);
@@ -120,7 +121,17 @@ async function apply(args) {
     for (const p of opts['add-path'] ?? []) { const r = await realFolder(p); if (!project.paths.includes(r)) project.paths.push(r); }
     for (const p of opts['remove-path'] ?? []) project.paths = project.paths.filter((x) => x !== path.resolve(p));
     if (!project.paths.length) fail(`project ${opts.project} needs a folder (--path DIR)`);
-    if (opts['netlify-site'] || opts['netlify-dir']) {
+    if (opts['netlify-new']) {
+      const stackName = project.stack ?? opts.stack;
+      if (!stackName) fail('cannot create Netlify site without a stack');
+      const stackObj = await loadStack(stackName);
+      const team = opts['netlify-team'] ?? stackObj.accounts?.netlify?.teams?.[0]
+        ?? (await lookup({ NETLIFY_AUTH_TOKEN: tokens.NETLIFY_AUTH_TOKEN })).netlify?.account?.teams?.[0];
+      if (!team) fail(`could not find a Netlify team for stack ${stackName}; give --netlify-team`);
+      const site = await createNetlifySite(tokens.NETLIFY_AUTH_TOKEN, team, opts['netlify-new']).catch((e) => fail(`creating the Netlify site: ${e.message}`));
+      project.netlify = { site_id: site.id, site_name: site.name, site_url: site.url, dir: checkRelative(opts['netlify-dir'] ?? 'dist', '--netlify-dir') };
+      summary.push(`created Netlify site ${site.name} (${site.url}) in team ${team}`);
+    } else if (opts['netlify-site'] || opts['netlify-dir']) {
       project.netlify = { ...project.netlify };
       if (opts['netlify-site']) project.netlify = { site_id: id(opts['netlify-site'], 'Netlify site id'), dir: project.netlify.dir };
       if (opts['netlify-dir']) project.netlify.dir = checkRelative(opts['netlify-dir'], '--netlify-dir');
