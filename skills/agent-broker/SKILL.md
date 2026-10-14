@@ -9,7 +9,9 @@ The owner has several logins per service. Tokens live only in the **broker** (ma
 agents). Two layers:
 
 - **Account stack**: one login per service (e.g. stack `thedoor` = theDoor's Netlify + Supabase; stack `global` = default fallback for general projects). Tokens stored once.
-- **Project**: a folder, its stack, and the one site / database it may touch (pinned).
+- **Project**: a folder, its stack, and the one site / database it may touch (pinned). Nothing else: build folders and
+  other settings stay in the project's own files (`netlify.toml`, `vercel.json`, `.actor/`, `supabase/config.toml`),
+  read by the real CLI on every call.
 
 **The folder picks the project.** Run `agent-broker` from inside the project folder. Never name an account, site id or
 project ref. `gh` is separate (one GitHub account, logged in normally, never touched or logged out by the broker).
@@ -21,13 +23,16 @@ agent-broker help        # every action
 agent-broker <service> <action> [options]
 ```
 
-- **Deploy**: build as yourself first, then `agent-broker netlify deploy --message "..."` (a draft). Add `--prod`
-  only when the owner asks (credits). Vercel: `mkdir -p .vercel && agent-broker vercel settings > .vercel/project.json`,
-  `vercel build`, `agent-broker vercel deploy`.
+- **Deploy**: build as yourself first, then `agent-broker netlify deploy --message "..."` (a draft). It runs
+  `netlify deploy --no-build` on the pinned site: netlify.toml `publish` picks the folder, or pass `--dir out`;
+  `--prod`, `--alias`, `--functions`, `--json` ... pass through (`agent-broker help`). Add `--prod` only when the owner
+  asks (credits). Vercel: `mkdir -p .vercel && agent-broker vercel settings > .vercel/project.json`, `vercel build`,
+  `agent-broker vercel deploy`.
 - **Supabase**: `query "select ..."` is read-only; `migrate [--dry-run]` applies `supabase/migrations`; any other
   write is `admin-query "..."`, which waits: ask the owner to run `agent-broker-admin approve <id>`, then
   `agent-broker result <id>`.
-- **Apify**: `push`, `info|builds|runs <actor>`, `logs <run-id>`, `call <actor> --input-file F`, `pull <actor> | tar -x`.
+- **Apify**: `push [--dir <actor folder>]`, `info|builds|runs <actor>`, `logs <run-id>`, `call <actor> --input-file F`,
+  `pull <actor> | tar -x`.
 - **Plain CLIs** (`netlify`, `supabase`, `apify`, `vercel`) do local work only (`netlify dev`, `supabase start`,
   `vercel build`); account commands stop with a pointer here. For owner manual CLI work with personal global logins,
   pass `--global` (e.g. `netlify deploy --global`) or set `export AGENT_BROKER_BYPASS=1`.
@@ -82,5 +87,6 @@ Changing the broker: edit `broker/`, `cd broker && npm test`, then wizard → 7.
   limited to `main`.
 - **Apify actor runs** get a run token; actor code can print it.
 - **Netlify** tokens open the whole account; edge-function bundling during a deploy may run project code with the
-  token present (no project uses edge functions yet).
+  token present (no project uses edge functions yet). CLIs run in a macOS sandbox that cannot read the broker's
+  token files, so a path in `netlify.toml` (or any project config) cannot point a deploy at them.
 - **Tokens agents saw before the broker** (2026-10) stay valid until rotated (wizard → 2).

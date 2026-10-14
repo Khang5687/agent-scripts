@@ -8,7 +8,7 @@ import path from 'node:path';
 import readline from 'node:readline/promises';
 import { accountLabel, createNetlifySite, lookup, verifyPins } from './accounts.mjs';
 import {
-  ACCOUNT_KEYS, DIR, KEY, SERVICES, UsageError, allSecretValues, audit, checkName, checkRelative, fail, listProjects,
+  ACCOUNT_KEYS, DIR, KEY, SERVICES, UsageError, allSecretValues, audit, checkName, fail, listProjects,
   listStacks, loadProject, loadSecrets, loadStack, loadStackSecrets, makeScrubber, mkdirs, parseArgs, projectSecrets,
   run, saveProject, saveSecrets, saveStack, saveStackSecrets,
 } from './lib.mjs';
@@ -22,7 +22,7 @@ Usually run by the wizard: ~/git/agent-scripts/skills/agent-broker/scripts/wizar
      --stack NAME [--new-stack] [--stack-note T] [--stack-from-project P]   account stack (tokens: stack:KEY lines)
      --project NAME [--new-project] [--note T]                              project (uses --stack when given)
      --path DIR | --add-path DIR | --remove-path DIR                        its folders
-     --netlify-site ID [--netlify-dir D] | --supabase-ref REF | --apify [--apify-dir D]
+     --netlify-site ID | --netlify-new NAME [--netlify-team T] | --supabase-ref REF | --apify
      --vercel-org ID --vercel-project ID | --remove-service SERVICE
   lookup <stack>                  who the stack's tokens belong to; their sites and databases
   set <project> <KEY> | set-stack <stack> <KEY>     store one value (typed hidden)
@@ -67,8 +67,8 @@ async function apply(args) {
   const { opts, positional } = parseArgs(args, {
     stack: 'string', 'new-stack': 'bool', 'stack-note': 'string', 'stack-from-project': 'string',
     project: 'string', 'new-project': 'bool', note: 'string', path: 'string', 'add-path': 'list', 'remove-path': 'list',
-    'netlify-site': 'string', 'netlify-new': 'string', 'netlify-team': 'string', 'netlify-dir': 'string',
-    'supabase-ref': 'string', apify: 'bool', 'apify-dir': 'string',
+    'netlify-site': 'string', 'netlify-new': 'string', 'netlify-team': 'string',
+    'supabase-ref': 'string', apify: 'bool',
     'vercel-org': 'string', 'vercel-project': 'string', 'remove-service': 'list',
   });
   if (positional.length) fail(`unexpected arguments: ${positional.join(' ')}`);
@@ -138,21 +138,17 @@ async function apply(args) {
         ?? (await lookup({ NETLIFY_AUTH_TOKEN: tokens.NETLIFY_AUTH_TOKEN })).netlify?.account?.teams?.[0];
       if (!team) fail(`could not find a Netlify team for stack ${stackName}; give --netlify-team`);
       const site = await createNetlifySite(tokens.NETLIFY_AUTH_TOKEN, team, opts['netlify-new']).catch((e) => fail(`creating the Netlify site: ${e.message}`));
-      project.netlify = { site_id: site.id, site_name: site.name, site_url: site.url, dir: checkRelative(opts['netlify-dir'] ?? 'dist', '--netlify-dir') };
+      project.netlify = { site_id: site.id, site_name: site.name, site_url: site.url };
       summary.push(`created Netlify site ${site.name} (${site.url}) in team ${team}`);
-    } else if (opts['netlify-site'] || opts['netlify-dir']) {
-      project.netlify = { ...project.netlify };
-      if (opts['netlify-site']) project.netlify = { site_id: id(opts['netlify-site'], 'Netlify site id'), dir: project.netlify.dir };
-      if (opts['netlify-dir']) project.netlify.dir = checkRelative(opts['netlify-dir'], '--netlify-dir');
-      if (!project.netlify.site_id) fail('--netlify-site is required for Netlify');
-      project.netlify.dir ??= '.';
+    } else if (opts['netlify-site']) {
+      project.netlify = { site_id: id(opts['netlify-site'], 'Netlify site id') };
     }
     if (opts['supabase-ref']) project.supabase = { project_ref: id(opts['supabase-ref'], 'Supabase project ref') };
     if (opts['vercel-org'] || opts['vercel-project']) {
       if (!opts['vercel-org'] || !opts['vercel-project']) fail('Vercel needs both --vercel-org and --vercel-project');
       project.vercel = { org_id: id(opts['vercel-org'], 'Vercel org id'), project_id: id(opts['vercel-project'], 'Vercel project id') };
     }
-    if (opts.apify || opts['apify-dir']) project.apify = { dir: opts['apify-dir'] ? checkRelative(opts['apify-dir'], '--apify-dir') : project.apify?.dir ?? '.' };
+    if (opts.apify) project.apify ??= {};
     for (const s of opts['remove-service'] ?? []) { if (!SERVICES.includes(s)) fail(`unknown service ${s}`); delete project[s]; }
     if (project.stack && !(await exists(listStacks, project.stack)) && project.stack !== opts.stack) fail(`project uses unknown stack ${project.stack}`);
 

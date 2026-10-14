@@ -24,14 +24,17 @@ const HELP = `agent-broker <service> <action> [options]      run inside the proj
 New project (a folder not registered yet; the user names the stack; stacks come from the owner's wizard):
   agent-broker init --stack S --list                     the stack's sites and databases (free or used by a project)
   agent-broker init --stack S [--name N] [--here]        register this git repo (--here: this exact folder), then
-         [--netlify-site ID | --netlify-new NAME] [--netlify-dir D]     write the AGENTS.md block
-         [--supabase-ref REF [--no-reader]] [--vercel-project ID] [--apify [--apify-dir D]]
+         [--netlify-site ID | --netlify-new NAME]        write the AGENTS.md block
+         [--supabase-ref REF [--no-reader]] [--vercel-project ID] [--apify]
   agent-broker attach [same service options]             add a service the project does not use yet
   agent-broker agents-md [--write]                       the AGENTS.md block (--write: into AGENTS.md / CLAUDE.md)
   A new Supabase project costs money: ask the user to create it on supabase.com, then attach --supabase-ref.
   --netlify-new creates a Netlify site in the stack's account; --supabase-ref creates a read-only database user.
 
-netlify  deploy [--prod] [--message M] [--dir D]        deploy files already built (no build step); draft unless --prod
+netlify  deploy [--prod] [--message M] [--dir D] [--functions F] [--alias A] [--json] [--timeout S] [--skip-functions-cache]
+                                                        \`netlify deploy --no-build\` on the project's pinned site:
+                                                        files already built; without --dir, netlify.toml [build]
+                                                        publish decides (as with plain netlify); draft unless --prod
          status | deploys | logs [--since 1h] [--function NAME]...
          blobs-list <store> [--prefix P] | blobs-get <store> <key> | blobs-meta <store> <key>
 vercel   deploy [--prod]                                deploy .vercel/output built with \`vercel build\`
@@ -101,18 +104,24 @@ async function blobStore(ctx, name) {
 const checkKey = (k) => (k && k.length <= 600 && !/[\0-\x1f]/.test(k) ? k : fail(`invalid blob key: ${k ?? '(missing)'}`));
 const netlifyEnv = (ctx) => ({ NETLIFY_AUTH_TOKEN: ctx.secrets.NETLIFY_AUTH_TOKEN, NETLIFY_SITE_ID: ctx.config.site_id });
 
+// Options passed on to `netlify deploy` as given. Not offered: --site/--site-name/--team/--auth (the folder picks the
+// site and account), --build/--trigger (the build would run with the token present), --prod-if-unlocked (--prod only).
+const NETLIFY_DEPLOY_OPTS = {
+  prod: 'bool', message: 'string', dir: 'string', functions: 'string', alias: 'string', json: 'bool', timeout: 'string',
+  'skip-functions-cache': 'bool',
+};
+
 const netlify = {
   async deploy(P, args) {
-    const { opts, positional } = parseArgs(args, { prod: 'bool', message: 'string', dir: 'string' });
+    const { opts, positional } = parseArgs(args, NETLIFY_DEPLOY_OPTS);
     none(positional);
     const ctx = await context(P, 'netlify', ['NETLIFY_AUTH_TOKEN']);
-    const dir = checkRelative(opts.dir ?? ctx.config.dir, '--dir');
-    const work = await workCopy(P, ctx);
-    if (!(await fs.stat(path.join(work, dir)).catch(() => null))?.isDirectory()) fail(`${dir} does not exist: build the project first`);
-    const cli = ['deploy', '--no-build', '--dir', dir, '--site', ctx.config.site_id];
-    if (opts.prod) cli.push('--prod');
-    if (opts.message) cli.push('--message', opts.message);
-    return run('netlify', cli, { cwd: work, env: netlifyEnv(ctx), scrub: ctx.scrub });
+    const cli = ['deploy', '--no-build', '--site', ctx.config.site_id];
+    for (const [k, v] of Object.entries(opts)) {
+      // --name=value: a value that starts with "-" stays a value
+      cli.push(v === true ? `--${k}` : `--${k}=${k === 'dir' || k === 'functions' ? checkRelative(v, `--${k}`) : v}`);
+    }
+    return run('netlify', cli, { cwd: await workCopy(P, ctx), env: netlifyEnv(ctx), scrub: ctx.scrub });
   },
   async status(P, args) {
     none(args);
@@ -275,13 +284,13 @@ const supabase = {
 // apify-cli 1.10 reads its token only from ~/.apify/auth.json or the keyring: APIFY_TOKEN in the environment is ignored
 // by every account command ("You are not logged in"). Each call gets a throwaway HOME (0700, in the broker's tmp)
 // holding auth.json, removed when the CLI exits, so the token never lands in the broker user's real home.
-async function apifyRun(ctx, args, cwd, stdout) {
+async function apifyRun(ctx, args, cwd, stdout, allow = []) {
   const home = await scratch();
   try {
     await fs.mkdir(path.join(home, '.apify'), { mode: 0o700 });
     await fs.writeFile(path.join(home, '.apify', 'auth.json'), JSON.stringify({ token: ctx.secrets.APIFY_TOKEN, secretsBackend: 'file' }), { mode: 0o600 });
     const env = { HOME: home, APIFY_DISABLE_KEYRING: '1', APIFY_CLI_DISABLE_TELEMETRY: '1' };
-    return await run('apify', args, { cwd, env, scrub: ctx.scrub, out: stdout });
+    return await run('apify', args, { cwd, env, scrub: ctx.scrub, out: stdout, allow: [home, ...allow] });
   } finally {
     await fs.rm(home, { recursive: true, force: true });
   }
@@ -293,12 +302,12 @@ const apify = {
     none(positional);
     const ctx = await context(P, 'apify', ['APIFY_TOKEN']);
     const work = await workCopy(P, ctx);
-    const dir = path.join(work, checkRelative(opts.dir ?? ctx.config.dir ?? '.', '--dir'));
+    const dir = path.join(work, checkRelative(opts.dir ?? '.', '--dir'));
     const cli = ['push'];
     if (opts.force) cli.push('--force');
     if (opts.version) cli.push('--version', checkId(opts.version, 'version'));
     if (opts['build-tag']) cli.push('--build-tag', checkId(opts['build-tag'], 'build tag'));
-    return apifyRun(ctx, cli, dir);
+    return apifyRun(ctx, cli, dir, undefined, [work]);
   },
   async pull(P, [actor, ...rest]) {
     none(rest);
@@ -425,17 +434,10 @@ async function result(id) {
 
 const SETUP_OPTS = {
   stack: 'string', name: 'string', here: 'bool', list: 'bool', 'netlify-site': 'string', 'netlify-new': 'string',
-  'netlify-team': 'string', 'netlify-dir': 'string', 'supabase-ref': 'string', 'no-reader': 'bool',
-  'vercel-project': 'string', apify: 'bool', 'apify-dir': 'string',
+  'netlify-team': 'string', 'supabase-ref': 'string', 'no-reader': 'bool', 'vercel-project': 'string', apify: 'bool',
 };
 const skipVerify = () => Boolean(process.env.AGENT_BROKER_DEV_ROOT) && process.env.AGENT_BROKER_SKIP_VERIFY === '1'; // tests only
 const idArg = (v, what) => (/^[A-Za-z0-9_-]{1,100}$/.test(v ?? '') ? v : fail(`invalid ${what}: ${v ?? '(missing)'}`));
-
-/** The built-files folder from netlify.toml ([build] publish), else dist. */
-async function publishDir(folder) {
-  const toml = await fs.readFile(path.join(folder, 'netlify.toml'), 'utf8').catch(() => '');
-  return toml.match(/^\s*publish\s*=\s*["']([^"']+)["']/m)?.[1] ?? 'dist';
-}
 
 /** Which project already pins this site / database, if any (each is owned by one project only). */
 async function pinOwner(service, field, value, except) {
@@ -450,7 +452,7 @@ async function pinOwner(service, field, value, except) {
  * every other project). Returns project-only values to store (the read-only database URL). Creates a Netlify site
  * or a database user only after every check passed.
  */
-async function addServices(project, name, folder, opts, tokens, stackName) {
+async function addServices(project, name, opts, tokens, stackName) {
   const values = {};
   const wants = { netlify: opts['netlify-site'] || opts['netlify-new'], supabase: opts['supabase-ref'], vercel: opts['vercel-project'], apify: opts.apify };
   if (opts['netlify-site'] && opts['netlify-new']) fail('give --netlify-site or --netlify-new, not both');
@@ -462,7 +464,7 @@ async function addServices(project, name, folder, opts, tokens, stackName) {
   if (wants.netlify) {
     const site = opts['netlify-site'] && idArg(opts['netlify-site'], 'Netlify site id');
     if (site && await pinOwner('netlify', 'site_id', site, name)) fail(`Netlify site ${site} already belongs to project ${await pinOwner('netlify', 'site_id', site, name)}`);
-    project.netlify = { site_id: site, dir: checkRelative(opts['netlify-dir'] ?? await publishDir(folder), '--netlify-dir') };
+    project.netlify = { site_id: site };
   }
   if (wants.supabase) {
     const ref = idArg(opts['supabase-ref'], 'Supabase project ref');
@@ -482,7 +484,7 @@ async function addServices(project, name, folder, opts, tokens, stackName) {
     }
     project.vercel = { org_id: org ?? 'team_test', project_id: id };
   }
-  if (wants.apify) project.apify = { dir: checkRelative(opts['apify-dir'] ?? '.', '--apify-dir') };
+  if (wants.apify) project.apify = {};
 
   if (!skipVerify()) {
     const check = { ...project, netlify: project.netlify?.site_id ? project.netlify : undefined };
@@ -540,7 +542,7 @@ async function init(cwd, args) {
   const name = checkName(opts.name ?? path.basename(folder).toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^[-_]+/, ''));
   if ((await listProjects()).includes(name)) fail(`a project named ${name} exists already: add --name <other>`);
   const project = { stack: stackName, paths: [folder] };
-  const values = await addServices(project, name, folder, opts, tokens, stackName);
+  const values = await addServices(project, name, opts, tokens, stackName);
   await saveProject(name, project);
   await saveSecrets(name, values);
   await audit({ init: name, stack: stackName, folder, services: SERVICES.filter((s) => project[s]) });
@@ -556,13 +558,17 @@ async function attach(cwd, args) {
   const P = await resolveProject(cwd, explicit);
   const stack = await effectiveStack(P.project);
   if (!stack) fail(`project ${P.name} has no stack yet: ask the owner (wizard: Set up / update)`);
-  const values = await addServices(P.project, P.name, P.root, opts, await loadStackSecrets(stack), stack);
+  const values = await addServices(P.project, P.name, opts, await loadStackSecrets(stack), stack);
   await saveProject(P.name, P.project);
   await saveSecrets(P.name, { ...(await loadSecrets(P.name)), ...values });
   await audit({ attach: P.name, services: Object.keys(opts) });
   json(await describe(P.name, P.project));
   return 0;
 }
+
+// Shared by both blocks; the wizard (scripts/wizard.sh, "AGENTS.md text") carries the same lines.
+const NETLIFY_DEPLOY_LINE = 'Deploy: build, then `agent-broker netlify deploy --message "..."` (draft; the folder comes from netlify.toml `publish`, or add `--dir <folder>`). `--prod` only when the owner asks.';
+const APIFY_LINE = 'Apify: `agent-broker apify push [--dir <actor folder>]`, `runs <actor>`, `logs <run-id>`.';
 
 /** Generic, project-agnostic block for a stack. Drop into AGENTS.md / CLAUDE.md of any repo using this stack. */
 async function stackAgentsBlock(stackName) {
@@ -580,7 +586,7 @@ async function stackAgentsBlock(stackName) {
     '- Check stack info: `agent-broker whoami`. All actions: `agent-broker help`.',
   ];
   if (secrets.NETLIFY_AUTH_TOKEN) {
-    lines.push('- Deploy: build, then `agent-broker netlify deploy --message "..."` (draft). `--prod` only when the owner asks.');
+    lines.push(`- ${NETLIFY_DEPLOY_LINE}`);
   }
   if (secrets.VERCEL_TOKEN) {
     lines.push('- Deploy: `agent-broker vercel settings > .vercel/project.json`, `vercel build`, `agent-broker vercel deploy`.');
@@ -589,7 +595,7 @@ async function stackAgentsBlock(stackName) {
     lines.push('- Database: `agent-broker supabase query "select ..."` (read-only). Changes: `agent-broker supabase migrate --dry-run`, then without; anything else: `agent-broker supabase admin-query "..."` (the owner approves).');
   }
   if (secrets.APIFY_TOKEN) {
-    lines.push('- Apify: `agent-broker apify push`, `runs <actor>`, `logs <run-id>`.');
+    lines.push(`- ${APIFY_LINE}`);
   }
   lines.push('- Needs a site or database not attached yet: `agent-broker attach ...` (see `agent-broker help`).');
   lines.push('- A missing token: stop and ask the owner to run the agent-broker wizard.');
@@ -612,10 +618,10 @@ function agentsBlock(name, project, stack) {
     '',
     '- Check: `agent-broker whoami`. All actions: `agent-broker help`.',
   ];
-  if (project.netlify) lines.push('- Deploy: build, then `agent-broker netlify deploy --message "..."` (draft). `--prod` only when the owner asks.');
+  if (project.netlify) lines.push(`- ${NETLIFY_DEPLOY_LINE}`);
   if (project.vercel) lines.push('- Deploy: `agent-broker vercel settings > .vercel/project.json`, `vercel build`, `agent-broker vercel deploy`.');
   if (project.supabase) lines.push('- Database: `agent-broker supabase query "select ..."` (read-only). Changes: `agent-broker supabase migrate --dry-run`, then without; anything else: `agent-broker supabase admin-query "..."` (the owner approves).');
-  if (project.apify) lines.push('- Apify: `agent-broker apify push`, `runs <actor>`, `logs <run-id>`.');
+  if (project.apify) lines.push(`- ${APIFY_LINE}`);
   lines.push('- Needs a site or database it does not have yet: `agent-broker attach ...` (see `agent-broker help`).');
   lines.push('- A missing token: stop and ask the owner to run the agent-broker wizard.');
   lines.push('<!-- agent-broker:end -->');

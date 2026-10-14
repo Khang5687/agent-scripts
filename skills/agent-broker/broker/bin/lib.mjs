@@ -3,6 +3,7 @@
 // Runs as the _deployer user (sudo). Agents (the normal user) cannot read _deployer's home, where the tokens live.
 // Guide: agent-scripts/skills/agent-broker/SKILL.md
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
@@ -68,11 +69,20 @@ async function listNames(dir) {
   return files.filter((f) => f.endsWith('.json')).map((f) => f.slice(0, -5)).sort();
 }
 
+// Fields older records carry that the broker no longer keeps: the built-files folder was copied once from
+// netlify.toml and went stale (a static export deployed its old .next folder). The CLIs read the project's own config.
+const DROPPED = { netlify: ['dir'], apify: ['dir'] };
+
 /** A project: { stack?, paths: [realpath...], netlify?, vercel?, supabase?, apify?, note? }. */
 export async function loadProject(name) {
   const p = await readJson(DIR.projects, name, 'project');
   if (p.path && !p.paths) { p.paths = [p.path]; delete p.path; } // registered before folders became a list
   p.paths ??= [];
+  let stale = false;
+  for (const [s, keys] of Object.entries(DROPPED)) {
+    for (const k of keys) if (p[s] && k in p[s]) { delete p[s][k]; stale = true; }
+  }
+  if (stale) await saveProject(name, p);
   return p;
 }
 export const saveProject = (name, config) => writePrivate(path.join(DIR.projects, `${checkName(name)}.json`), `${JSON.stringify(config, null, 2)}\n`);
@@ -322,33 +332,53 @@ export function assertNoSecret(buf, values, what) {
 
 // ---- Running CLIs ------------------------------------------------------------------------------------------------
 
+// The CLIs read the project's own config (netlify.toml publish / functions, .actor, supabase/config.toml), and the
+// agents write it: a path there could point at the broker's token files and upload them. Every CLI runs in a macOS
+// sandbox that cannot read or write the broker's own folders, except its working folder and a private temp folder.
+const PRIVATE = ['stackSecrets', 'secrets', 'stacks', 'projects', 'queue', 'log', 'work', 'tmp'];
+
+async function sandboxProfile(allowed) {
+  const sub = (dirs) => dirs.map((d) => `(subpath ${JSON.stringify(d)})`).join(' ');
+  const denied = await Promise.all(PRIVATE.map((k) => fs.realpath(DIR[k])));
+  const ok = await Promise.all(allowed.map((d) => fs.realpath(d)));
+  // Later rules win: the allowed folders are carved out of the denied ones. Metadata (stat) stays readable so tools
+  // walking up for a .git or package.json see "not found" instead of an error.
+  return `(version 1)(allow default)(deny file-read-data file-write* ${sub(denied)})(allow file-read-data file-write* ${sub(ok)})`;
+}
+
 /**
  * Runs a CLI from the broker's own tool folder with a fixed environment (tool PATH, _deployer HOME, plus the given
- * variables). stdout/stderr are scrubbed; `out` replaces stdout as the destination (e.g. stderr when stdout carries
- * binary data). Arguments are passed as an array: no shell. Tokens go in `env`, never in arguments (macOS shows
- * every process's arguments to every user).
+ * variables), sandboxed away from the broker's folders except `cwd` and `allow`. stdout/stderr are scrubbed; `out`
+ * replaces stdout as the destination (e.g. stderr when stdout carries binary data). Arguments are passed as an
+ * array: no shell. Tokens go in `env`, never in arguments (macOS shows every process's arguments to every user).
  */
-export async function run(cmd, args, { cwd, env = {}, scrub, out = process.stdout }) {
-  const child = spawn(cmd, args, {
-    cwd,
-    env: {
-      PATH: TOOL_PATH,
-      HOME,
-      TMPDIR: DIR.tmp,
-      LANG: 'en_US.UTF-8',
-      NO_COLOR: '1',
-      FORCE_COLOR: '0',
-      CI: '1', // no interactive prompts
-      ...env,
-    },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  const done = new Promise((resolve, reject) => {
-    child.on('error', reject);
-    child.on('close', (code, signal) => resolve(code ?? (signal ? 1 : 0)));
-  });
-  await Promise.all([scrubStream(child.stdout, out, scrub), scrubStream(child.stderr, process.stderr, scrub)]);
-  return done;
+export async function run(cmd, args, { cwd, env = {}, scrub, out = process.stdout, allow = [] }) {
+  const tmp = path.join(DIR.tmp, randomUUID());
+  await fs.mkdir(tmp, { recursive: true, mode: 0o700 });
+  try {
+    const child = spawn('/usr/bin/sandbox-exec', ['-p', await sandboxProfile([cwd, tmp, ...allow]), cmd, ...args], {
+      cwd,
+      env: {
+        PATH: TOOL_PATH,
+        HOME,
+        TMPDIR: tmp,
+        LANG: 'en_US.UTF-8',
+        NO_COLOR: '1',
+        FORCE_COLOR: '0',
+        CI: '1', // no interactive prompts
+        ...env,
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const done = new Promise((resolve, reject) => {
+      child.on('error', reject);
+      child.on('close', (code, signal) => resolve(code ?? (signal ? 1 : 0)));
+    });
+    await Promise.all([scrubStream(child.stdout, out, scrub), scrubStream(child.stderr, process.stderr, scrub)]);
+    return await done;
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
 }
 
 // ---- Project copy ------------------------------------------------------------------------------------------------

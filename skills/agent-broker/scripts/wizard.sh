@@ -202,7 +202,7 @@ VAULT_DIR="$HOME/Secrets"
 GUARD_DIR=/opt/agent-broker/guard
 DONE=()
 # filled by ask / ask_default / pick (printf -v)
-P_PATH="" P_NAME="" STACK="" STACK_NEW="" choice="" site="" dir="" move="" conn="" svc=""
+P_PATH="" P_NAME="" STACK="" STACK_NEW="" choice="" site="" move="" conn="" svc=""
 LOOKUP="{}" PROJECT_LINES="" ARGS=()
 # Tokens typed in this run (read indirectly as ${!var}); cleared as soon as they are saved.
 # shellcheck disable=SC2034
@@ -458,7 +458,7 @@ stack_value_lines() {
 
 # choose_pins FOLDER — ask which services the project uses and pick its site / database from lists. Adds to ARGS.
 choose_pins() {
-  local folder=$1 found list ref org pid publish site dir site_action site_name sb_action
+  local folder=$1 found list ref org pid site site_action site_name sb_action
   for svc in netlify supabase vercel apify; do
     local has_token=""
     [[ -n "$(printf '%s' "$LOOKUP" | js "d.$svc && !d.$svc.error ? 'y' : ''")" ]] && has_token=1
@@ -475,17 +475,15 @@ choose_pins() {
       netlify)
         found=$(node -e 'try { console.log(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).siteId ?? "") } catch {}' "$folder/.netlify/state.json")
         list=$(printf '%s' "$LOOKUP" | js "(d.netlify.sites ?? []).map((s) => \`\${s.name}   \${s.url}\${s.id === '$found' ? '   ← this folder' : ''}\t\${s.id}\`).join('\n')")
-        publish=$(sed -nE 's/^[[:space:]]*publish[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "$folder/netlify.toml" 2>/dev/null | head -1)
-        ask_default dir "Folder with the built files:" "${publish:-dist}"
         if [[ -n "$list" ]]; then
           pick site "Which Netlify site?" "$list" $'new\t+ Create a new Netlify site now\nskip\tSkip / unpin site for now (configure later)'
           if [[ "$site" == "new" ]]; then
             ask_default site_name "New Netlify site name:" "$(basename "$folder")"
-            ARGS+=(--netlify-new "$site_name" --netlify-dir "$dir")
+            ARGS+=(--netlify-new "$site_name")
           elif [[ "$site" == "skip" ]]; then
             ARGS+=(--remove-service netlify)
           else
-            ARGS+=(--netlify-site "$site" --netlify-dir "$dir")
+            ARGS+=(--netlify-site "$site")
           fi
         else
           say "This Netlify account has no sites yet."
@@ -493,11 +491,11 @@ choose_pins() {
           case "$site_action" in
             new)
               ask_default site_name "New Netlify site name:" "$(basename "$folder")"
-              ARGS+=(--netlify-new "$site_name" --netlify-dir "$dir")
+              ARGS+=(--netlify-new "$site_name")
               ;;
             manual)
               ask site "Netlify site ID:"
-              ARGS+=(--netlify-site "$site" --netlify-dir "$dir")
+              ARGS+=(--netlify-site "$site")
               ;;
             skip | *)
               ARGS+=(--remove-service netlify)
@@ -550,8 +548,7 @@ choose_pins() {
         fi
         ;;
       apify)
-        ask_default dir "Folder with the actor (.actor/actor.json), inside the project:" "."
-        ARGS+=(--apify --apify-dir "$dir")
+        ARGS+=(--apify)
         ;;
     esac
   done
@@ -791,7 +788,7 @@ action_agents_text() {
         "- Check stack info: `agent-broker whoami`. All actions: `agent-broker help`."
       ];
       if (keys.includes("NETLIFY_AUTH_TOKEN")) {
-        lines.push("- Deploy: build, then `agent-broker netlify deploy --message \"...\"` (draft). `--prod` only when the owner asks.");
+        lines.push("- Deploy: build, then `agent-broker netlify deploy --message \"...\"` (draft; the folder comes from netlify.toml `publish`, or add `--dir <folder>`). `--prod` only when the owner asks.");
       }
       if (keys.includes("VERCEL_TOKEN")) {
         lines.push("- Deploy: `agent-broker vercel settings > .vercel/project.json`, `vercel build`, `agent-broker vercel deploy`.");
@@ -800,7 +797,7 @@ action_agents_text() {
         lines.push("- Database: `agent-broker supabase query \"select ...\"` (read-only). Changes: `agent-broker supabase migrate --dry-run`, then without; anything else: `agent-broker supabase admin-query \"...\"` (the owner approves).");
       }
       if (keys.includes("APIFY_TOKEN")) {
-        lines.push("- Apify: `agent-broker apify push`, `runs <actor>`, `logs <run-id>`.");
+        lines.push("- Apify: `agent-broker apify push [--dir <actor folder>]`, `runs <actor>`, `logs <run-id>`.");
       }
       lines.push("- Needs a site or database not attached yet: `agent-broker attach ...` (see `agent-broker help`).");
       lines.push("- A missing token: stop and ask the owner to run the agent-broker wizard.");

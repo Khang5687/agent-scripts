@@ -98,7 +98,7 @@ test('project copy refuses a file that contains a stored secret', async () => {
 test('a stack holds the account token once; every project on it uses it; output shows names, never values', async () => {
   const shop = await folder('shop');
   const blog = await folder('blog');
-  ok(admin(['apply', '--stack', 'studio', '--new-stack', '--project', 'shop', '--new-project', '--path', shop, '--netlify-site', 'site-shop', '--netlify-dir', 'dist'],
+  ok(admin(['apply', '--stack', 'studio', '--new-stack', '--project', 'shop', '--new-project', '--path', shop, '--netlify-site', 'site-shop'],
     `stack:NETLIFY_AUTH_TOKEN=${TOKEN}\nproject:SUPABASE_READ_URL=postgresql://r.x:dbpass-secret@h:5432/postgres\n`));
   ok(admin(['apply', '--stack', 'studio', '--project', 'blog', '--new-project', '--path', blog, '--netlify-site', 'site-blog']));
 
@@ -148,8 +148,8 @@ test('the folder picks the project: subfolders, deepest folder, worktrees; wrong
 
 test('one folder holding two projects asks for --project, and accepts only those two', async () => {
   const mono = await folder('mono');
-  ok(admin(['apply', '--stack', 'studio', '--project', 'web', '--new-project', '--path', mono, '--netlify-site', 'site-web', '--netlify-dir', 'apps/web/dist']));
-  ok(admin(['apply', '--stack', 'studio', '--project', 'api', '--new-project', '--path', mono, '--netlify-site', 'site-api', '--netlify-dir', 'apps/api/dist']));
+  ok(admin(['apply', '--stack', 'studio', '--project', 'web', '--new-project', '--path', mono, '--netlify-site', 'site-web']));
+  ok(admin(['apply', '--stack', 'studio', '--project', 'api', '--new-project', '--path', mono, '--netlify-site', 'site-api']));
   assert.match(broker(['whoami'], mono).stderr, /holds 2 projects: (api, web|web, api).*--project/s);
   assert.equal(JSON.parse(ok(broker(['whoami', '--project', 'web'], mono)).stdout).project, 'web');
   assert.match(broker(['whoami', '--project', 'shop'], mono).stderr, /holds 2 projects/);
@@ -175,6 +175,58 @@ test('only allow-listed actions, options and paths inside the project', async ()
   assert.match(broker(['supabase', 'query', 'select 1'], shop).stderr, /does not use supabase/);
 });
 
+// A fake CLI first in PATH that writes its arguments (one per line) and the token file it tries to read to `log`.
+async function fakeCli(name, script) {
+  const bin = await folder(`fake-${name}-bin`);
+  const log = path.join(dev, `fake-${name}.log`);
+  await fs.writeFile(path.join(bin, name), `#!/bin/sh\n${script.replaceAll('$LOG', log)}\n`, { mode: 0o755 });
+  const call = (args, cwd) => spawnSync(process.execPath, [path.join(BIN, 'agent-broker.mjs'), ...args],
+    { cwd, env: { ...env, PATH: `${bin}:${process.env.PATH}` }, encoding: 'utf8' });
+  return { call, log };
+}
+
+test('netlify deploy is plain `netlify deploy --no-build` on the pinned site: no stored folder, options passed on', async () => {
+  const shop = await folder('shop');
+  const { call, log } = await fakeCli('netlify', 'printf "%s\\n" "$@" > "$LOG"');
+  ok(call(['netlify', 'deploy', '--message', 'first try'], shop));
+  // No --dir: the CLI reads netlify.toml [build] publish itself, as plain netlify does.
+  assert.deepEqual((await fs.readFile(log, 'utf8')).trim().split('\n'), ['deploy', '--no-build', '--site', 'site-shop', '--message=first try']);
+  ok(call(['netlify', 'deploy', '--dir', 'out', '--prod', '--alias', 'v2', '--message', '--prod'], shop));
+  assert.deepEqual((await fs.readFile(log, 'utf8')).trim().split('\n'),
+    ['deploy', '--no-build', '--site', 'site-shop', '--dir=out', '--prod', '--alias=v2', '--message=--prod']);
+  // The folder picks the site and account; the build never runs with the token present; --prod is the only prod switch.
+  for (const flag of ['--site', '--auth', '--build', '--trigger', '--prod-if-unlocked', '--site-name']) {
+    assert.match(call(['netlify', 'deploy', flag, 'x'], shop).stderr, new RegExp(`unknown option ${flag}`));
+  }
+  assert.match(call(['netlify', 'deploy', '--functions', '/etc'], shop).stderr, /must be a path inside the project/);
+});
+
+test('CLIs cannot read the broker token files, whatever path the project config points at', async () => {
+  const shop = await folder('shop');
+  const tokenFile = path.join(dev, 'home', 'stack-secrets', 'studio.env');
+  const { call, log } = await fakeCli('netlify', `cat "${tokenFile}" > "$LOG" 2>&1; ls "${path.join(dev, 'home', 'projects')}" >> "$LOG" 2>&1; echo own > own.txt; echo done`);
+  const r = ok(call(['netlify', 'deploy'], shop));
+  assert.match(r.stdout, /done/);
+  const seen = await fs.readFile(log, 'utf8');
+  assert.match(seen, /Operation not permitted/);
+  assert.ok(!seen.includes('NETLIFY_AUTH_TOKEN') && !seen.includes('shop.json'), seen);
+  // Its own working copy stays writable.
+  assert.equal(await fs.readFile(path.join(dev, 'home', 'work', 'shop', 'own.txt'), 'utf8'), 'own\n');
+});
+
+test('records with a stored build folder lose it on load: whoami shows none', async () => {
+  const app = await folder('oldsite');
+  ok(admin(['apply', '--stack', 'studio', '--project', 'oldsite', '--new-project', '--path', app, '--netlify-site', 'site-old']));
+  const file = path.join(dev, 'home', 'projects', 'oldsite.json');
+  const record = JSON.parse(await fs.readFile(file, 'utf8'));
+  await fs.writeFile(file, JSON.stringify({ ...record, netlify: { ...record.netlify, dir: '.next' }, apify: { dir: 'actor' } }));
+  const who = JSON.parse(ok(broker(['whoami'], app)).stdout);
+  assert.deepEqual(who.services.netlify, { site_id: 'site-old', token: true });
+  assert.deepEqual(who.services.apify, { token: false });
+  const saved = JSON.parse(await fs.readFile(file, 'utf8'));
+  assert.deepEqual([saved.netlify, saved.apify], [{ site_id: 'site-old' }, {}]);
+});
+
 test('init: an agent registers an unclaimed git repo on an existing stack; claimed folders and pins are refused', async () => {
   ok(admin(['apply', '--stack', 'studio'], `stack:SUPABASE_ACCESS_TOKEN=${['sbp', 'fake', 'value'].join('_')}\n`));
   const repo = await folder('newapp');
@@ -186,7 +238,8 @@ test('init: an agent registers an unclaimed git repo on an existing stack; claim
   const made = JSON.parse(ok(broker(['init', '--stack', 'studio', '--netlify-site', 'site-new', '--supabase-ref', 'refnew', '--no-reader'], sub)).stdout);
   assert.equal(made.created, 'newapp');
   assert.equal(made.folder, repo); // the git root, not the subfolder it ran in
-  assert.equal(made.services.netlify.dir, 'dist');
+  assert.deepEqual(made.services.netlify, { site_id: 'site-new' });
+  assert.match(broker(['init', '--stack', 'studio', '--here', '--netlify-dir', 'out'], await folder('dirapp')).stderr, /unknown option --netlify-dir/);
   assert.equal(JSON.parse(ok(broker(['whoami'], sub)).stdout).stack, 'studio');
 
   assert.match(broker(['init', '--stack', 'studio'], repo).stderr, /already belongs to project newapp/);
