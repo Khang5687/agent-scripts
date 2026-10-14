@@ -272,7 +272,20 @@ const supabase = {
 
 // ---- Apify -------------------------------------------------------------------------------------------------------
 
-const apifyRun = (ctx, args, cwd) => run('apify', args, { cwd, env: { APIFY_TOKEN: ctx.secrets.APIFY_TOKEN }, scrub: ctx.scrub });
+// apify-cli 1.10 reads its token only from ~/.apify/auth.json or the keyring: APIFY_TOKEN in the environment is ignored
+// by every account command ("You are not logged in"). Each call gets a throwaway HOME (0700, in the broker's tmp)
+// holding auth.json, removed when the CLI exits, so the token never lands in the broker user's real home.
+async function apifyRun(ctx, args, cwd, stdout) {
+  const home = await scratch();
+  try {
+    await fs.mkdir(path.join(home, '.apify'), { mode: 0o700 });
+    await fs.writeFile(path.join(home, '.apify', 'auth.json'), JSON.stringify({ token: ctx.secrets.APIFY_TOKEN, secretsBackend: 'file' }), { mode: 0o600 });
+    const env = { HOME: home, APIFY_DISABLE_KEYRING: '1', APIFY_CLI_DISABLE_TELEMETRY: '1' };
+    return await run('apify', args, { cwd, env, scrub: ctx.scrub, out: stdout });
+  } finally {
+    await fs.rm(home, { recursive: true, force: true });
+  }
+}
 
 const apify = {
   async push(P, args) {
@@ -293,7 +306,7 @@ const apify = {
     const dir = await scratch();
     try {
       const out = path.join(dir, 'actor');
-      const code = await run('apify', ['pull', checkActor(actor), '--dir', out], { cwd: dir, env: { APIFY_TOKEN: ctx.secrets.APIFY_TOKEN }, scrub: ctx.scrub, out: process.stderr });
+      const code = await apifyRun(ctx, ['pull', checkActor(actor), '--dir', out], dir, process.stderr);
       if (code) return code;
       // stdout carries only the tar (CLI messages went to stderr); the tar is checked for stored secrets first.
       const { execFileSync } = await import('node:child_process');

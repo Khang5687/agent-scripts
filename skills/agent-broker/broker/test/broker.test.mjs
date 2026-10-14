@@ -215,6 +215,28 @@ test('attach adds a missing service only; agents-md gives the block for the fold
   assert.match(md.block, /agent-broker supabase query/);
 });
 
+test('apify commands give the CLI its token in a throwaway auth file that is removed afterwards', async () => {
+  // apify-cli reads ~/.apify/auth.json (or the keyring), never APIFY_TOKEN, so the token has to arrive as that file.
+  const apifyToken = ['apify', 'api', 'TESTtokenVALUE0123456789abcd'].join('_');
+  ok(admin(['apply', '--stack', 'actors', '--new-stack'], `stack:APIFY_TOKEN=${apifyToken}\n`));
+  const app = await folder('actorapp');
+  ok(broker(['init', '--stack', 'actors', '--here', '--apify'], app));
+  const bin = await folder('fake-apify-bin');
+  const log = path.join(dev, 'fake-apify.log');
+  await fs.writeFile(path.join(bin, 'apify'), `#!/bin/sh\n{ echo "HOME=$HOME"; echo "KEYRING=$APIFY_DISABLE_KEYRING"; cat "$HOME/.apify/auth.json"; } > "${log}"\necho '{"name":"x"}'\n`, { mode: 0o755 });
+  const r = spawnSync(process.execPath, [path.join(BIN, 'agent-broker.mjs'), 'apify', 'info', 'thedoor/some-actor'],
+    { cwd: app, env: { ...env, PATH: `${bin}:${process.env.PATH}` }, encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /"name":"x"/);
+  const [homeLine, keyringLine, ...auth] = (await fs.readFile(log, 'utf8')).split('\n');
+  const home = homeLine.slice('HOME='.length);
+  assert.notEqual(home, lib.HOME);
+  assert.equal(keyringLine, 'KEYRING=1');
+  assert.equal(JSON.parse(auth.join('\n')).token, apifyToken);
+  assert.equal(await fs.lstat(home).catch(() => null), null, 'throwaway HOME left behind');
+  assert.ok(!r.stdout.includes(apifyToken) && !r.stderr.includes(apifyToken));
+});
+
 test('the AGENTS.md block is written once, replaced on rerun, and reaches Claude Code', async () => {
   const { withBlock, writeBlocks } = await import('../bin/write-block.mjs');
   const block = (n) => `<!-- agent-broker:start -->\nblock ${n}\n<!-- agent-broker:end -->`;
