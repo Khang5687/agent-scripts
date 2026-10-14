@@ -130,6 +130,11 @@ async function apply(args) {
     for (const p of opts['add-path'] ?? []) { const r = await realFolder(p); if (!project.paths.includes(r)) project.paths.push(r); }
     for (const p of opts['remove-path'] ?? []) project.paths = project.paths.filter((x) => x !== path.resolve(p));
     if (!project.paths.length) fail(`project ${opts.project} needs a folder (--path DIR)`);
+    projectValues = { ...(known ? await loadSecrets(opts.project) : {}), ...values.project };
+    if (moveFrom === opts.project) for (const k of ACCOUNT_KEYS) delete projectValues[k];
+    // The tokens the project will run with (stack, overridden by its own values): create the site, check the pins.
+    const stackTokens = project.stack === opts.stack ? stackSecrets : project.stack ? await loadStackSecrets(project.stack) : {};
+    const tokens = { ...stackTokens, ...projectValues };
     if (opts['netlify-new']) {
       const stackName = project.stack ?? opts.stack;
       if (!stackName) fail('cannot create Netlify site without a stack');
@@ -151,12 +156,6 @@ async function apply(args) {
     if (opts.apify) project.apify ??= {};
     for (const s of opts['remove-service'] ?? []) { if (!SERVICES.includes(s)) fail(`unknown service ${s}`); delete project[s]; }
     if (project.stack && !(await exists(listStacks, project.stack)) && project.stack !== opts.stack) fail(`project uses unknown stack ${project.stack}`);
-
-    projectValues = { ...(known ? await loadSecrets(opts.project) : {}), ...values.project };
-    if (moveFrom === opts.project) for (const k of ACCOUNT_KEYS) delete projectValues[k];
-    // Check the pins with the tokens the project will run with (stack, overridden by its own values).
-    const stackTokens = project.stack === opts.stack ? stackSecrets : project.stack ? await loadStackSecrets(project.stack) : {};
-    const tokens = { ...stackTokens, ...projectValues };
     if (!skipVerify) {
       const { names, unverified } = await verifyPins(project, tokens).catch((e) => fail(e.message));
       for (const [s, n] of Object.entries(names)) project[s] = { ...project[s], ...n };
