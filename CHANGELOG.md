@@ -4,6 +4,11 @@ summary: Timeline of guardrail helper changes mirrored from Sweetistics and rela
 
 # Changelog
 
+## 2026-10-21 — Agent Broker on Linux (Docker Compose)
+- `agent-broker` now installs on Linux (Ubuntu homelab): `install.sh` creates `_deployer` with `useradd` (joins the owner's group and `docker`), finds Node via nvm or mise, skips the cloud CLIs and guard, and accepts `@includedir` sudoers.
+- New `agent-broker compose <command>`: runs `docker compose` in the registered stack folder with the project's stored secrets in the environment (the `.env` keeps only non-secret settings), scrubbed output, stdin passed on; refuses worktrees, `-p`, `--project-directory` and files outside the project. Cloud services are refused on Linux (no sandbox).
+- `agent-broker-admin import` now reads `.env` values the way Compose does (quotes, `$$`, trailing comments) and refuses values with a `$` Compose would expand; `init --no-agents-md` skips the AGENTS.md block.
+
 ## 2026-10-05 — Delegation Skill Refresh
 - Refreshed `delegate-to-other-agents` routing to the current lineup (Codex GPT-6.1 Sol default / GPT-6 Luna cheap lane / GPT-6 Astra escalation with scope fences; Grok 4.7 demoted to overflow; Opus 5.5 default orchestrator, Sonnet 5.5 near-opus implementer, Fable 5.1 for multi-day runs with the narrowed, visible safeguard fallback) backed by a dated 2026-10 evidence snapshot in `references/routing-evidence.md`.
 - Restructured the skill per `writing-for-agents`: SKILL.md keeps the decision flow; invoke commands, Codex multi-account rotation, and spec packaging moved to `references/executors.md`, `references/codex-accounts.md`, `references/spec.md`; added Claude Code / omp harness mapping for subagent spawn and follow-up.

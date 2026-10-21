@@ -1,5 +1,5 @@
 #!/bin/bash
-# agent-broker-admin: owner-only broker management; sudo asks for your Mac password. Token values are read here
+# agent-broker-admin: owner-only broker management; sudo asks for your password. Token values are read here
 # (hidden from the keyboard, from stdin, or from a .env file) and handed to the broker on stdin, never as arguments.
 # Guide: agent-scripts/skills/agent-broker/SKILL.md
 set -euo pipefail

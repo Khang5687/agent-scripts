@@ -13,9 +13,9 @@ import {
   run, saveProject, saveSecrets, saveStack, saveStackSecrets,
 } from './lib.mjs';
 
-const HELP = `agent-broker-admin <command>   (asks for your Mac password / Touch ID every time)
+const HELP = `agent-broker-admin <command>   (asks for your password every time; Touch ID on a Mac)
 
-Usually run by the wizard: ~/git/agent-scripts/skills/agent-broker/scripts/wizard.sh
+On a Mac usually run by the wizard: ~/git/agent-scripts/skills/agent-broker/scripts/wizard.sh (on Linux: run it directly)
 
   apply [options] < values        one change, checked before anything is saved; values on stdin as
                                   stack:KEY=VALUE or project:KEY=VALUE lines
@@ -303,6 +303,20 @@ async function remove(kind, name) {
 
 const pairs = (text) => text.split('\n').filter(Boolean).map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]);
 
+/**
+ * A .env value as Docker Compose reads it: surrounding quotes removed ("..." also unescapes \" and \\), an unquoted
+ * value loses a trailing ` # comment`. The broker hands values to Compose through the environment, where nothing is
+ * expanded, so a `$` that Compose would have expanded is refused: store that value with `set` as Compose used it.
+ */
+function envValue(key, raw) {
+  const v = raw.trim();
+  if (v.length >= 2 && v.startsWith("'") && v.endsWith("'")) return v.slice(1, -1);
+  const double = v.length >= 2 && v.startsWith('"') && v.endsWith('"');
+  const out = double ? v.slice(1, -1).replace(/\\(["\\])/g, '$1') : v.replace(/\s+#.*$/, '');
+  if (out.replaceAll('$$', '').includes('$')) fail(`${key}: the value has a $ that Compose expands; store it with: agent-broker-admin set <project> ${key}`);
+  return out.replaceAll('$$', '$');
+}
+
 async function main([cmd, ...args]) {
   await mkdirs();
   process.chdir(DIR.tmp);
@@ -313,7 +327,7 @@ async function main([cmd, ...args]) {
     case 'set': return setValues('project', args[0], [[args[1], (await readStdin()).replace(/\r?\n$/, '')]]);
     case 'set-stack': return setValues('stack', args[0], [[args[1], (await readStdin()).replace(/\r?\n$/, '')]]);
     case 'import': {
-      const entries = pairs(await readStdin());
+      const entries = pairs(await readStdin()).map(([k, v]) => [k, envValue(k, v)]);
       if (!entries.length) fail('no KEY=VALUE lines on stdin');
       return setValues('project', args[0], entries);
     }

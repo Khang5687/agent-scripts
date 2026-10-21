@@ -883,7 +883,7 @@ action_setup() {
 
 # ── Menu ─────────────────────────────────────────────────────────────────
 [[ -t 0 && -t 1 ]] || die "Run this in your own Terminal app, not through an agent."
-[[ "$(uname)" == Darwin ]] || die "This wizard is for macOS."
+[[ "$(uname)" == Darwin ]] || die "This wizard is for macOS. Linux: sudo $(cd "$(dirname "$0")/../broker" && pwd)/install.sh, then agent-broker-admin (see SKILL.md, Linux)."
 command -v node >/dev/null || die "Node is missing. Install it first."
 
 if ! command -v agent-broker >/dev/null || ! agent-broker stacks >/dev/null 2>&1; then

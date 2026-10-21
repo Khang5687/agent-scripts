@@ -9,7 +9,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createNetlifySite, createReadOnlyUser, lookup, verifyPins } from './accounts.mjs';
 import {
-  CA_FILE, DIR, NAME, SERVICES, UsageError, allSecretValues, assertNoSecret, assertUnclaimed, audit, checkName,
+  CA_FILE, DIR, LINUX, NAME, SERVICES, UsageError, allSecretValues, assertNoSecret, assertUnclaimed, audit, checkName,
   checkRelative, effectiveStack, fail, gitRoot, listProjects, listStacks, loadProject, loadSecrets, loadStack,
   loadStackSecrets, makeScrubber, mkdirs, parseArgs, projectSecrets, resolveProject, run, saveProject, saveSecrets,
   stackFromAgentsMd, syncProject,
@@ -24,8 +24,8 @@ const HELP = `agent-broker <service> <action> [options]      run inside the proj
 New project (a folder not registered yet; the user names the stack; stacks come from the owner's wizard):
   agent-broker init --stack S --list                     the stack's sites and databases (free or used by a project)
   agent-broker init --stack S [--name N] [--here]        register this git repo (--here: this exact folder), then
-         [--netlify-site ID | --netlify-new NAME]        write the AGENTS.md block
-         [--supabase-ref REF [--no-reader]] [--vercel-project ID] [--apify]
+         [--netlify-site ID | --netlify-new NAME]        write the AGENTS.md block (--no-agents-md: skip it)
+         [--supabase-ref REF [--no-reader]] [--vercel-project ID] [--apify] [--no-agents-md]
   agent-broker attach [same service options]             add a service the project does not use yet
   agent-broker agents-md [--write]                       the AGENTS.md block (--write: into AGENTS.md / CLAUDE.md)
   A new Supabase project costs money: ask the user to create it on supabase.com, then attach --supabase-ref.
@@ -47,6 +47,9 @@ apify    push [--dir D] [--force] [--version V] [--build-tag T]
          pull <actor>                                   actor source as a tar stream on stdout
          info <actor> | builds <actor> | build-log <build-id> | runs <actor> | run-info <run-id> | logs <run-id>
          call <actor> [--input-file F | --input JSON] [--build B] [--memory MB] [--timeout S]
+compose  [-f F] [--profile P] [--dry-run] <command> [args]
+                                                        Linux: \`docker compose\` in the project's own folder with
+                                                        its stored values (e.g. up -d | ps | logs app | exec -T db ...)
 
 --project NAME only chooses between projects that share one folder (a repo root holding two projects).
 Commands that print keys, passwords or environment values are not offered.`;
@@ -379,6 +382,40 @@ const apify = {
   },
 };
 
+// ---- Docker Compose (Linux broker) -------------------------------------------------------------------------------
+
+// Options accepted before the compose command. Not offered: --env-file, --project-directory, -p / --project-name (the
+// folder decides them; the broker gives the values), and anything not listed.
+const COMPOSE_OPTS = { '-f': 'file', '--file': 'file', '--profile': 'value', '--progress': 'value', '--ansi': 'value', '--dry-run': 'bool' };
+
+/**
+ * `docker compose` in the project's registered folder, with the project's stored values in the environment (Compose
+ * reads them before the folder's .env file, which keeps only the non-secret settings). Output is scrubbed; stdin is
+ * passed on (`exec -T db psql < dump.sql`). Runs only in the registered folder itself: a git worktree of it has the
+ * same Compose project name, so it would replace the live containers.
+ */
+async function compose(cwd, args) {
+  if (!LINUX && !process.env.AGENT_BROKER_DEV_ROOT) fail('compose runs on the Linux broker only (on a Mac, Docker belongs to your own user: use docker compose)');
+  const P = await resolveProject(cwd, undefined, undefined, { registeredOnly: true });
+  if (!P.project.paths.includes(P.root)) {
+    fail(`compose runs only in the project's own folder (${P.project.paths.join(', ')}), not in a worktree of it: it would change the live containers`);
+  }
+  const opts = [];
+  let i = 0;
+  for (; i < args.length && args[i].startsWith('-'); i++) {
+    const [flag, inline] = args[i].split(/=(.*)/s, 2);
+    const kind = COMPOSE_OPTS[flag] ?? fail(`compose option ${flag} is not offered before the command (allowed: ${Object.keys(COMPOSE_OPTS).join(', ')})`);
+    if (kind === 'bool') { opts.push(flag); continue; }
+    const v = inline ?? args[++i] ?? fail(`${flag} needs a value`);
+    opts.push(flag, kind === 'file' ? checkRelative(v, flag) : v);
+  }
+  if (i >= args.length) fail('give a compose command: agent-broker compose ps | up -d | logs <service> | ...');
+  const code = await run('docker', ['compose', ...opts, ...args.slice(i)],
+    { cwd: P.root, env: await loadSecrets(P.name), scrub: makeScrubber(await allSecretValues()), sandbox: false, stdin: 'inherit' });
+  await audit({ service: 'compose', command: args[i], project: P.name, code });
+  return code;
+}
+
 const ACTIONS = { netlify, vercel, supabase, apify };
 
 // ---- Overview commands (no secrets, only names) --------------------------------------------------------------
@@ -435,6 +472,7 @@ async function result(id) {
 const SETUP_OPTS = {
   stack: 'string', name: 'string', here: 'bool', list: 'bool', 'netlify-site': 'string', 'netlify-new': 'string',
   'netlify-team': 'string', 'supabase-ref': 'string', 'no-reader': 'bool', 'vercel-project': 'string', apify: 'bool',
+  'no-agents-md': 'bool', // read by the wrapper: init then leaves AGENTS.md alone
 };
 const skipVerify = () => Boolean(process.env.AGENT_BROKER_DEV_ROOT) && process.env.AGENT_BROKER_SKIP_VERIFY === '1'; // tests only
 const idArg = (v, what) => (/^[A-Za-z0-9_-]{1,100}$/.test(v ?? '') ? v : fail(`invalid ${what}: ${v ?? '(missing)'}`));
@@ -569,6 +607,7 @@ async function attach(cwd, args) {
 // Shared by both blocks; the wizard (scripts/wizard.sh, "AGENTS.md text") carries the same lines.
 const NETLIFY_DEPLOY_LINE = 'Deploy: build, then `agent-broker netlify deploy --message "..."` (draft; the folder comes from netlify.toml `publish`, or add `--dir <folder>`). `--prod` only when the owner asks.';
 const APIFY_LINE = 'Apify: `agent-broker apify push [--dir <actor folder>]`, `runs <actor>`, `logs <run-id>`.';
+const COMPOSE_LINE = 'Docker Compose: `agent-broker compose <command>` in the stack folder instead of `docker compose`; the broker adds the stored secrets (the folder\'s `.env` keeps only non-secret settings).';
 
 /** Generic, project-agnostic block for a stack. Drop into AGENTS.md / CLAUDE.md of any repo using this stack. */
 async function stackAgentsBlock(stackName) {
@@ -597,6 +636,7 @@ async function stackAgentsBlock(stackName) {
   if (secrets.APIFY_TOKEN) {
     lines.push(`- ${APIFY_LINE}`);
   }
+  if (LINUX) lines.push(`- ${COMPOSE_LINE}`);
   lines.push('- Needs a site or database not attached yet: `agent-broker attach ...` (see `agent-broker help`).');
   lines.push('- A missing token: stop and ask the owner to run the agent-broker wizard.');
   lines.push('<!-- agent-broker:end -->');
@@ -623,6 +663,7 @@ function agentsBlock(name, project, stack) {
   if (project.supabase) lines.push('- Database: `agent-broker supabase query "select ..."` (read-only). Changes: `agent-broker supabase migrate --dry-run`, then without; anything else: `agent-broker supabase admin-query "..."` (the owner approves).');
   if (project.apify) lines.push(`- ${APIFY_LINE}`);
   lines.push('- Needs a site or database it does not have yet: `agent-broker attach ...` (see `agent-broker help`).');
+  if (LINUX) lines.push(`- ${COMPOSE_LINE}`);
   lines.push('- A missing token: stop and ask the owner to run the agent-broker wizard.');
   lines.push('<!-- agent-broker:end -->');
   return lines.join('\n');
@@ -682,7 +723,9 @@ async function main(argv) {
   if (service === 'init') return init(cwd, after);
   if (service === 'attach') return attach(cwd, after);
   if (service === 'agents-md') return agentsMd(cwd, after);
-  const actions = ACTIONS[service] ?? fail(`unknown service: ${service} (netlify, vercel, supabase, apify). See: agent-broker help`);
+  if (service === 'compose') return compose(cwd, after);
+  if (LINUX && ACTIONS[service]) fail(`${service} is not offered on Linux: the broker here runs compose only (the cloud CLIs need the macOS sandbox)`);
+  const actions = ACTIONS[service] ?? fail(`unknown service: ${service} (netlify, vercel, supabase, apify, compose). See: agent-broker help`);
   const fn = Object.hasOwn(actions, action ?? '') ? actions[action] : fail(`${service} has no action "${action ?? ''}". Allowed: ${Object.keys(actions).join(', ')}`);
   const { explicit, explicitStack, rest } = takeFlags(args);
   const P = await resolveProject(cwd, explicit, explicitStack);

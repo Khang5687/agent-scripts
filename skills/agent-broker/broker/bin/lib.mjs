@@ -14,8 +14,10 @@ import path from 'node:path';
 const DEV = process.env.AGENT_BROKER_DEV_ROOT;
 if (DEV && os.userInfo().username === '_deployer') throw new Error('AGENT_BROKER_DEV_ROOT is not allowed for _deployer');
 
+// Linux brokers (homelab servers) run Docker Compose only: the cloud CLIs need the macOS sandbox (see run()).
+export const LINUX = process.platform === 'linux';
 export const ROOT = DEV ? path.join(DEV, 'opt') : '/opt/agent-broker';
-export const HOME = DEV ? path.join(DEV, 'home') : '/Users/_deployer';
+export const HOME = DEV ? path.join(DEV, 'home') : LINUX ? '/home/_deployer' : '/Users/_deployer';
 export const DIR = {
   stacks: path.join(HOME, 'stacks'), //               <stack>.json     one login per service (no secrets)
   stackSecrets: path.join(HOME, 'stack-secrets'), //  <stack>.env      account tokens, KEY=VALUE per line
@@ -351,12 +353,16 @@ async function sandboxProfile(allowed) {
  * variables), sandboxed away from the broker's folders except `cwd` and `allow`. stdout/stderr are scrubbed; `out`
  * replaces stdout as the destination (e.g. stderr when stdout carries binary data). Arguments are passed as an
  * array: no shell. Tokens go in `env`, never in arguments (macOS shows every process's arguments to every user).
+ * `sandbox: false` only for docker compose: the Docker daemon runs as root and mounts whatever the compose file
+ * names, so a sandbox around the client would not keep anything out.
  */
-export async function run(cmd, args, { cwd, env = {}, scrub, out = process.stdout, allow = [] }) {
+export async function run(cmd, args, { cwd, env = {}, scrub, out = process.stdout, allow = [], sandbox = true, stdin = 'ignore' }) {
+  if (sandbox && process.platform !== 'darwin') fail(`${cmd} needs the macOS sandbox; on Linux the broker runs compose only`);
   const tmp = path.join(DIR.tmp, randomUUID());
   await fs.mkdir(tmp, { recursive: true, mode: 0o700 });
   try {
-    const child = spawn('/usr/bin/sandbox-exec', ['-p', await sandboxProfile([cwd, tmp, ...allow]), cmd, ...args], {
+    const [bin, argv] = sandbox ? ['/usr/bin/sandbox-exec', ['-p', await sandboxProfile([cwd, tmp, ...allow]), cmd, ...args]] : [cmd, args];
+    const child = spawn(bin, argv, {
       cwd,
       env: {
         PATH: TOOL_PATH,
@@ -368,7 +374,7 @@ export async function run(cmd, args, { cwd, env = {}, scrub, out = process.stdou
         CI: '1', // no interactive prompts
         ...env,
       },
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: [stdin, 'pipe', 'pipe'],
     });
     const done = new Promise((resolve, reject) => {
       child.on('error', reject);

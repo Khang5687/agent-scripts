@@ -393,3 +393,45 @@ test('agents-md --stack outputs a project-agnostic snippet; unregistered repo wi
   assert.equal(who.project, 'brand-new-repo');
   assert.equal(who.folder, brandNewRepo);
 });
+
+test('compose: docker compose in the registered folder with its stored values; output scrubbed; stdin passed on', async () => {
+  const PW = 'compose-db-password-0123';
+  const stack = await folder('homelab', 'stacks', 'firefly');
+  ok(admin(['apply', '--stack', 'homelab', '--new-stack', '--project', 'firefly', '--new-project', '--path', stack], `project:POSTGRES_PASSWORD=${PW}\n`));
+  const bin = await folder('fake-docker-bin');
+  const log = path.join(dev, 'fake-docker.log');
+  await fs.writeFile(path.join(bin, 'docker'), `#!/bin/sh\npwd > "${log}"\nprintf "%s\\n" "$@" >> "${log}"\necho "password=$POSTGRES_PASSWORD"\ncat\n`, { mode: 0o755 });
+  const compose = (args, cwd, input = '') => spawnSync(process.execPath, [path.join(BIN, 'agent-broker.mjs'), 'compose', ...args],
+    { cwd, input, env: { ...env, PATH: `${bin}:${process.env.PATH}` }, encoding: 'utf8' });
+
+  // From a subfolder too: Compose always runs in the registered folder, so the Compose project name never changes.
+  const r = ok(compose(['--profile', 'mcp', '-f', 'compose.yaml', 'exec', '-T', 'db', 'psql'], await folder('homelab', 'stacks', 'firefly', 'sub'), 'select 1;\n'));
+  assert.equal(r.stdout, 'password=[secret]\nselect 1;\n');
+  assert.deepEqual((await fs.readFile(log, 'utf8')).trim().split('\n'), [stack, 'compose', '--profile', 'mcp', '-f', 'compose.yaml', 'exec', '-T', 'db', 'psql']);
+
+  // The folder and the broker decide the project folder and name; files stay inside the project. (--env-file never
+  // reaches the broker: Node itself reads that flag, wherever it stands.)
+  for (const [args, msg] of [
+    [['-p', 'other', 'up'], /-p is not offered/],
+    [['--project-directory=/', 'up'], /--project-directory is not offered/],
+    [['-f', '../immich/compose.yaml', 'up'], /must be a path inside the project/],
+    [['--profile', 'mcp'], /give a compose command/],
+  ]) assert.match(compose(args, stack).stderr, msg);
+
+  // A git worktree has the same folder name, so the same Compose project: it would replace the live containers.
+  const repo = path.dirname(path.dirname(stack));
+  await fs.mkdir(path.join(repo, '.git', 'worktrees', 'ticket'), { recursive: true });
+  const wt = await folder('homelab-ticket');
+  await fs.writeFile(path.join(wt, '.git'), `gitdir: ${path.join(repo, '.git', 'worktrees', 'ticket')}\n`);
+  assert.match(compose(['up', '-d'], await folder('homelab-ticket', 'stacks', 'firefly')).stderr, /not in a worktree of it/);
+  assert.match(compose(['ps'], await folder('unregistered')).stderr, /is not inside a registered project/);
+});
+
+test('admin import stores .env values as Compose reads them; a $ Compose would expand is refused', async () => {
+  const app = await folder('homelab', 'stacks', 'immich');
+  ok(admin(['apply', '--stack', 'homelab', '--project', 'immich', '--new-project', '--path', app]));
+  ok(admin(['import', 'immich'], 'A="dq \\"x\\" y"\nB=\'sq $HOME\'\nC=plain-value # note\nD=cost$$1\n'));
+  assert.deepEqual(await lib.loadSecrets('immich'), { A: 'dq "x" y', B: 'sq $HOME', C: 'plain-value', D: 'cost$1' });
+  assert.match(admin(['import', 'immich'], 'E=pa$word\n').stderr, /E: the value has a \$ that Compose expands/);
+  assert.equal((await lib.loadSecrets('immich')).E, undefined);
+});

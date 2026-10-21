@@ -1,11 +1,11 @@
 ---
 name: agent-broker
-description: "Use for Netlify, Vercel, Supabase or Apify work (deploys, logs, SQL, migrations, actors), API tokens or .env secrets, or adding a project/account."
+description: "Use for Netlify, Vercel, Supabase or Apify work (deploys, logs, SQL, migrations, actors), API tokens or .env secrets, Docker Compose secrets on a Linux homelab, or adding a project/account."
 ---
 
 # Agent broker
 
-The owner has several logins per service. Tokens live only in the **broker** (macOS user `_deployer`, unreadable to
+The owner has several logins per service. Tokens live only in the **broker** (user `_deployer`, unreadable to
 agents). Two layers:
 
 - **Account stack**: one login per service (e.g. stack `thedoor` = theDoor's Netlify + Supabase; stack `global` = default fallback for general projects). Tokens stored once.
@@ -78,6 +78,37 @@ the sudo rule `/etc/sudoers.d/agent-broker` (password every time), and the CLI g
 in `PATH` via one line in `~/.zshenv` and `~/.zshrc`). Owner bypass for a real CLI: its full path (`which -a netlify`).
 Changing the broker: edit `broker/`, `cd broker && npm test`, then wizard → 7.
 
+## Linux (homelab): Docker Compose
+
+On Linux the broker runs **only** `docker compose` (the cloud CLIs need the macOS sandbox; `netlify` etc. are refused).
+A compose stack folder is a project; its secrets live in the broker, its `.env` keeps only non-secret settings.
+
+```sh
+agent-broker compose ps | up -d | logs --tail 100 app | pull | down     # instead of docker compose, in the stack folder
+agent-broker compose --profile mcp up -d                                 # -f F, --profile, --dry-run before the command
+agent-broker compose exec -T db psql -U app < dump.sql                   # stdin passes through; use -T
+```
+
+- Runs in the registered folder only (never a git worktree of it: same Compose project name = live containers).
+  `--env-file`, `-p`, `--project-directory` are not offered; drop `--env-file .env` from old runbook commands.
+- Plain `docker compose` there fails on `${VAR:?set VAR}`: that is the cue to use the broker. `docker logs <container>`
+  and `docker ps` need no secrets.
+- Output is scrubbed of stored values; `compose config` shows `[secret]`.
+
+Owner setup (once per host, in your own terminal; sudo asks your password):
+
+```sh
+sudo ~/git/agent-scripts/skills/agent-broker/broker/install.sh     # _deployer (owner's group + docker), /opt/agent-broker
+agent-broker-admin apply --stack homelab --new-stack                 # a stack with no cloud tokens
+cd <repo>/stacks/<name> && agent-broker init --stack homelab --here --no-agents-md   # agents may do this step
+agent-broker-admin import <name> .env KEY1 KEY2                      # moves the secret lines out of .env
+chmod 640 .env                                                      # _deployer reads the non-secret rest
+agent-broker-admin set <name> KEY                                    # one value, typed hidden
+```
+
+`import` reads values the way Compose does (quotes, `$$`, ` # comment`); a value with a `$` Compose would expand is
+refused: use `set`. Update the broker: `git pull`, rerun `install.sh`.
+
 ## Known gaps
 
 - **Folder rule = accident prevention**, not a wall: an agent can `cd` into another project's folder.
@@ -90,3 +121,6 @@ Changing the broker: edit `broker/`, `cd broker && npm test`, then wizard → 7.
   token present (no project uses edge functions yet). CLIs run in a macOS sandbox that cannot read the broker's
   token files, so a path in `netlify.toml` (or any project config) cannot point a deploy at them.
 - **Tokens agents saw before the broker** (2026-10) stay valid until rotated (wizard → 2).
+- **Linux: `docker` / `lxd` group = root.** An agent user in those groups can read any secret back (`docker inspect`
+  shows a container's environment). The Linux broker stops accidental `.env` reads, not a determined agent; a real wall
+  means taking the agent user out of both groups.
