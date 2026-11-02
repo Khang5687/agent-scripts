@@ -108,7 +108,7 @@ export async function lookup(tokens) {
   return out;
 }
 
-/** A one-line label for an account lookup, e.g. "theDoor <a@b.c>, teams: thedoorapi". */
+/** A one-line label for an account lookup, e.g. "Acme <a@b.c>, teams: acmeapi". */
 export function accountLabel(account = {}) {
   const who = [account.name, account.email && `<${account.email}>`].filter(Boolean).join(' ');
   const extra = account.teams?.length ? `teams: ${account.teams.join(', ')}` : account.orgs?.length ? `orgs: ${account.orgs.join(', ')}` : '';

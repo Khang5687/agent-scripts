@@ -8,7 +8,7 @@ description: "Use for Netlify, Vercel, Supabase or Apify work (deploys, logs, SQ
 The owner has several logins per service. Tokens live only in the **broker** (user `_deployer`, unreadable to
 agents). Two layers:
 
-- **Account stack**: one login per service (e.g. stack `thedoor` = theDoor's Netlify + Supabase; stack `global` = default fallback for general projects). Tokens stored once.
+- **Account stack**: one login per service (e.g. stack `acme` = Acme's Netlify + Supabase; stack `global` = default fallback for general projects). Tokens stored once.
 - **Project**: a folder, its stack, and the one site / database it may touch (pinned). Nothing else: build folders and
   other settings stay in the project's own files (`netlify.toml`, `vercel.json`, `.actor/`, `supabase/config.toml`),
   read by the real CLI on every call.

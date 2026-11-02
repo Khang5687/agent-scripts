@@ -8,7 +8,7 @@ Browse and install background skins from the [paseo-skins catalog](https://huang
 ## Install
 
 ```bash
-paseo plugin install /Users/khangnguyen/git/agent-scripts/plugins/paseo/skins
+paseo plugin install ./plugins/paseo/skins
 ```
 
 Reload plugins (or restart the daemon) if the plugin does not appear. Remove or disable it from **Settings → Plugins** or with `paseo plugin` (see `paseo plugin --help`). Removing the plugin does not delete downloaded images; delete the data directory below for that.
@@ -67,4 +67,4 @@ npm run typecheck
 npm test
 ```
 
-`@getpaseo/plugin` is linked from a local Paseo checkout (`file:/Users/khangnguyen/git/paseo-app-skins/packages/plugin`) because the published SDK does not yet have `addSkin`. `zod` is pinned to the version that checkout uses; a different `zod` makes `tsc` run out of memory comparing two copies of its types. Switch both to the released versions once a Paseo release ships the skin API.
+`@getpaseo/plugin` is linked from a local Paseo checkout (`file:../../../../paseo/packages/plugin`) because the published SDK does not yet have `addSkin`. `zod` is pinned to the version that checkout uses; a different `zod` makes `tsc` run out of memory comparing two copies of its types. Switch both to the released versions once a Paseo release ships the skin API.

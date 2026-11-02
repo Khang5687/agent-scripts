@@ -429,7 +429,7 @@ choose_stack_new() {
   taken=$(agent-broker stacks 2>/dev/null | js 'd.map((s) => s.stack).join(" ")' || true)
   if [[ " $taken " == *" global "* ]]; then def_name=""; fi
   while :; do
-    ask_default STACK "Name the stack after its login (e.g. global, thedoor, studio):" "$def_name"
+    ask_default STACK "Name the stack after its login (e.g. global, acme, studio):" "$def_name"
     [[ "$STACK" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]] || { warn "Lowercase letters, digits, - and _ only."; continue; }
     [[ " $taken " == *" $STACK "* ]] && { warn "Stack $STACK exists already."; continue; }
     break
