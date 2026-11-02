@@ -2,6 +2,8 @@
 
 Shared agent instructions, skills, and small portable helpers for Peter's local workspaces.
 
+Public, shareable skills. Personal config lives in a private agent-home repo.
+
 This repo is the canonical place for:
 - `AGENTS.MD`: shared hard rules for Codex/Claude-style agents
 - `skills/`: reusable workflow skills, including repo-owned skills exposed by symlink
@@ -16,7 +18,11 @@ Interactive selector (pick skills, pick agents, global or project scope) via the
 npx skills add Khang5687/agent-scripts
 ```
 
-Works on this private repo — it clones with your local git credentials. Useful flags: `--list` to browse, `-s <name>` to install one skill, `-g` for user-level install, `--all` for everything non-interactively.
+Useful flags: `--list` to browse, `-s <name>` to install one skill, `-g` for user-level install, `--all` for everything non-interactively. For example, the delegation skill alone:
+
+```bash
+npx skills add Khang5687/agent-scripts --skill delegate
+```
 
 ## Skills
 

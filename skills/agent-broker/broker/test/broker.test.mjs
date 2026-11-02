@@ -159,10 +159,10 @@ test('a project that held its own account token moves it into a new stack', asyn
   const legacy = await folder('legacy');
   ok(admin(['apply', '--project', 'legacy', '--new-project', '--path', legacy, '--netlify-site', 'site-legacy'],
     'project:NETLIFY_AUTH_TOKEN=nfp_legacy_value_00000000000000000\nproject:SUPABASE_READ_URL=postgresql://a:b@c/d\n'));
-  ok(admin(['apply', '--stack', 'thedoor', '--new-stack', '--stack-from-project', 'legacy', '--project', 'legacy']));
+  ok(admin(['apply', '--stack', 'acme', '--new-stack', '--stack-from-project', 'legacy', '--project', 'legacy']));
   assert.deepEqual(Object.keys(await lib.loadSecrets('legacy')), ['SUPABASE_READ_URL']);
-  assert.equal((await lib.loadStackSecrets('thedoor')).NETLIFY_AUTH_TOKEN, 'nfp_legacy_value_00000000000000000');
-  assert.equal((await lib.loadProject('legacy')).stack, 'thedoor');
+  assert.equal((await lib.loadStackSecrets('acme')).NETLIFY_AUTH_TOKEN, 'nfp_legacy_value_00000000000000000');
+  assert.equal((await lib.loadProject('legacy')).stack, 'acme');
 });
 
 test('only allow-listed actions, options and paths inside the project', async () => {
@@ -259,7 +259,7 @@ test('attach adds a missing service only; agents-md gives the block for the fold
   ok(broker(['init', '--stack', 'studio', '--here'], app));
   assert.equal(JSON.parse(ok(broker(['attach', '--netlify-site', 'site-attach'], app)).stdout).services.netlify.site_id, 'site-attach');
   assert.match(broker(['attach', '--netlify-site', 'site-other'], app).stderr, /already uses netlify/);
-  assert.match(broker(['attach', '--stack', 'thedoor'], app).stderr, /attach only adds services/);
+  assert.match(broker(['attach', '--stack', 'acme'], app).stderr, /attach only adds services/);
 
   const md = JSON.parse(ok(broker(['agents-md', '--json'], app)).stdout);
   assert.equal(md.folder, app);
@@ -277,7 +277,7 @@ test('apify commands give the CLI its token in a throwaway auth file that is rem
   const bin = await folder('fake-apify-bin');
   const log = path.join(dev, 'fake-apify.log');
   await fs.writeFile(path.join(bin, 'apify'), `#!/bin/sh\n{ echo "HOME=$HOME"; echo "KEYRING=$APIFY_DISABLE_KEYRING"; cat "$HOME/.apify/auth.json"; } > "${log}"\necho '{"name":"x"}'\n`, { mode: 0o755 });
-  const r = spawnSync(process.execPath, [path.join(BIN, 'agent-broker.mjs'), 'apify', 'info', 'thedoor/some-actor'],
+  const r = spawnSync(process.execPath, [path.join(BIN, 'agent-broker.mjs'), 'apify', 'info', 'acme/some-actor'],
     { cwd: app, env: { ...env, PATH: `${bin}:${process.env.PATH}` }, encoding: 'utf8' });
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /"name":"x"/);
