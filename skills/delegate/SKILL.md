@@ -29,14 +29,15 @@ Auto-maintained; edit only between the markers (see `UPDATING.md`).
 <!-- model-facts:start -->
 | Model | Role | Effort ceiling | Notes | Last verified |
 |---|---|---|---|---|
-| Claude Fable 5.1 (`fable`) | Top tier: multi-day, research-grade, ambiguous work | `xhigh` | Safeguard fallback (visible notice, pins session to Opus) on exploit dev, dual-use bio, distillation, frontier-LLM infra. On it: stop, keep that work in main session. | 2026-10-05 |
-| Claude Opus 5.5 (`opus`) | Default orchestrator; adversarial review, architecture | `xhigh` | `max` over-thinks to the output cap on trivial prompts. | 2026-10-05 |
-| Claude Sonnet 5.5 (`sonnet`) | Near-Opus implementer; standard review | `high` | Ties Opus 5.5 on Vals Index at ~2/3 cost; strong design/taste. | 2026-10-05 |
-| Claude Haiku 4.5 (`haiku`) | Dispatcher only | — | Implement nothing non-trivial. | 2026-10-05 |
-| GPT-6.1 Sol (`gpt-6.1-sol`) | Default Codex executor; 1M ctx | `high` | Not for security review (safeguards). | 2026-10-05 |
+| Claude Fable 5.1 (`fable`) | Top tier: multi-day, research-grade, ambiguous work | `xhigh` | Safeguard fallback (visible notice, pins session to Opus) on exploit dev, dual-use bio, distillation, frontier-LLM infra. On it: stop, keep that work in main session. | 2026-11-02 |
+| Claude Opus 5.5 (`opus`) | Default orchestrator; adversarial review, architecture | `xhigh` | `max` over-thinks to the output cap on trivial prompts. | 2026-11-02 |
+| Claude Sonnet 5.5 (`sonnet`) | Near-Opus implementer; standard review | `high` | Ties Opus 5.5 on Vals Index at ~2/3 cost; strong design/taste. | 2026-11-02 |
+| Claude Haiku 5.5 (`haiku`) | Narrow subagent: lookups, summaries, extraction, explore | `high` | Terminal-Bench 4.0 39% vs Sonnet 5.5 71%: never give it multi-step implement. `haiku` is still 4.5 on Bedrock/Vertex/Foundry. | 2026-11-02 |
+| GPT-6.1 Sol (`gpt-6.1-sol`) | Default Codex executor; 1M ctx API, 500K default in Codex | `high` | Not for security review (safeguards). local: 6/18 `high` Paseo runs failed Oct 31-Nov 1; 71/71 other runs ok. | 2026-11-02 |
 | GPT-6 Sol (`gpt-6-sol`) | — | — | Regression vs `gpt-6.1-sol`; never route to it. | 2026-10-05 |
 | GPT-6 Luna (`gpt-6-luna`) | Cheap single-step lane; 272k ctx | `medium` | Leaves multi-step chains incomplete; `xhigh`/`max` can trip a Codex compaction loop. | 2026-10-05 |
 | GPT-6 Astra (`gpt-6-astra`) | Escalation for large multi-file work | `high` | Scope creep: needs explicit non-goal fences; rationed on Plus. | 2026-10-05 |
+| GPT-6.1 Terra (`gpt-6.1-terra`) | Screens/images, computer use, plain writing; 1M ctx | `high` | Not a coding lane: route code to `gpt-6.1-sol`. Needs Codex CLI ≥ 0.159.0. | 2026-11-02 |
 | Grok 4.7 (`grok-4.7`) | Overflow only | — | Slowest and costliest per task on long agentic work. | 2026-10-05 |
 
 Safeguards apply to all Claude 5.x tiers; spawning a higher tier does not escape them.
