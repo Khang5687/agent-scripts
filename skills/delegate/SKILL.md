@@ -11,6 +11,15 @@ description: "Hand work to other agents: Paseo agents, in-harness subagents, or 
 2. **Pilot one, then fan out.** For N similar tasks, run one lane, review it fully, freeze it as the template, then fan out the rest.
 3. **Helpers never commit or push.** Workers leave changes uncommitted; the orchestrator reviews, verifies, and lands.
 4. **Reviewer tier ≥ worker tier.** Never let a weaker model sign off on a stronger model's diff.
+5. **Cheapest model that fits.** Default for every helper (Paseo agent or subagent), unless the user names a model:
+
+| Job | Model |
+|---|---|
+| Search, read, summarize, extract, explore | Haiku 5.5 |
+| Scoped coding from a clear spec, standard review, routine research | Sonnet 5.5 |
+| Design, security/adversarial review, messy debugging, planning, orchestration | Opus 5.5 high |
+
+Before spawning, state the job type and the pick in one line. A helper that fails its job reruns one tier up. Reviews follow rule 4.
 
 ## How to delegate today
 
