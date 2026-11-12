@@ -31,6 +31,7 @@ export const DIR = {
   tmp: path.join(HOME, 'tmp'),
   sync: path.join(HOME, 'sync'), //                   seq.json         last copy received from the sending machine, per stack and key
   ssh: path.join(HOME, '.ssh'), //                    authorized_keys  the one forced-command key of the sending machine
+  outbox: path.join(HOME, 'sync-outbox'), //          <stack>.<KEY>.json   token copies the sending side has not delivered yet
 };
 
 /** Account tokens live in the stack; a project value of the same name overrides it (e.g. a project-scoped token). */
@@ -419,7 +420,7 @@ export function assertNoSecret(buf, values, what) {
 // agents write it: a path there could point at the broker's token files and upload them. Every CLI runs in a sandbox
 // (sandbox-exec on macOS, bwrap on Linux) that cannot read or write the broker's own folders, except its working folder
 // and a private temp folder.
-const PRIVATE = ['stackSecrets', 'secrets', 'groupSecrets', 'groups', 'stacks', 'projects', 'queue', 'log', 'work', 'tmp', 'sync', 'ssh'];
+const PRIVATE = ['stackSecrets', 'secrets', 'groupSecrets', 'groups', 'stacks', 'projects', 'queue', 'log', 'work', 'tmp', 'sync', 'ssh', 'outbox'];
 
 async function sandboxProfile(allowed) {
   const sub = (dirs) => dirs.map((d) => `(subpath ${JSON.stringify(d)})`).join(' ');

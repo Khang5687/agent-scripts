@@ -15,6 +15,7 @@ import {
   loadStackSecrets, loadSyncState, makeScrubber, mkdirs, parseArgs, projectSecrets, run, saveGroup, saveGroupSecrets,
   saveProject, saveSecrets, saveStack, saveStackSecrets, saveSyncState, validateGrants, writePrivate,
 } from './lib.mjs';
+import * as sync from './sync.mjs';
 
 const HELP = `agent-broker-admin <command>   (asks for your password every time; Touch ID on a Mac)
 
@@ -47,6 +48,11 @@ On a Mac usually run by the wizard: ~/git/agent-scripts/skills/agent-broker/scri
   trust-mac '<ssh-ed25519 key line>' --from <address>    let the Mac send tokens: writes the one restricted key line
                                   (this machine's SSH host keys are printed: pin them on the Mac)
   untrust-mac                     removes that key line
+  share-stack <stack> | unshare-stack <stack>     copy this stack's account tokens to the other machine; each change is
+                                  saved here first, then copied (unshare: stops copying; the other side keeps what it has)
+  sync-setup --to HOST --host-key 'TYPE KEY' [--host-key ...] [--user NAME] [--port N] [--new-key]
+                                  this machine's key pair, the pinned host key and the target for the copy (opens no connection)
+  sync-push [--all]               try the waiting copies now (--all: queue every key of every shared stack again first)
   pending | approve <id> | reject <id>               Supabase admin queries waiting for you
   log [lines]                     recent broker calls`;
 
@@ -180,6 +186,7 @@ async function apply(args) {
   // Stack: tokens (new values, or moved from a project that held them itself), account labels.
   let stack = null;
   let stackSecrets = {};
+  let copyKeys = [];
   const moveFrom = opts['stack-from-project'] && checkName(opts['stack-from-project']);
   if (opts.stack) {
     checkName(opts.stack, 'stack');
@@ -199,6 +206,7 @@ async function apply(args) {
       stackSecrets[k] = v;
     }
     const changed = moveFrom ? ACCOUNT_KEYS : Object.keys(values.stack);
+    copyKeys = changed.filter((k) => stackSecrets[k] || k in values.stack);
     const found = skipVerify ? {} : await lookup(Object.fromEntries(changed.filter((k) => stackSecrets[k]).map((k) => [k, stackSecrets[k]])));
     for (const [service, r] of Object.entries(found)) {
       if (r.error) fail(`${service} token: ${r.error}`);
@@ -287,7 +295,9 @@ async function apply(args) {
     await saveSecrets(opts.project, projectValues);
   }
   await audit({ admin: 'apply', stack: opts.stack, project: opts.project, keys: [...Object.keys(values.stack), ...Object.keys(values.project)] });
+  const copy = stack && copyKeys.length ? await sync.copyAfterChange(opts.stack, copyKeys) : null;
   for (const line of summary) console.log(`✓ ${line}`);
+  if (copy) console.log(`stack ${opts.stack}: ${copy}`);
   return 0;
 }
 
@@ -302,7 +312,7 @@ async function lookupStack(name) {
 async function list() {
   for (const name of await listStacks()) {
     const s = await loadStack(name);
-    console.log(JSON.stringify({ stack: name, accounts: s.accounts, keys: Object.keys(await loadStackSecrets(name)).sort(), note: s.note, followsMac: s.followsMac }, null, 2));
+    console.log(JSON.stringify({ stack: name, accounts: s.accounts, keys: Object.keys(await loadStackSecrets(name)).sort(), note: s.note, followsMac: s.followsMac, shared: s.shared }, null, 2));
   }
   for (const name of await listProjects()) {
     const p = await loadProject(name);
@@ -336,6 +346,8 @@ async function setValues(kind, name, entries) {
   await k.saveSecrets(name, secrets);
   await audit({ admin: `set-${kind}`, [kind]: name, keys: entries.map(([key]) => key) });
   console.log(`stored for ${kind} ${name}: ${entries.map(([key]) => key).join(', ')} (values not shown)`);
+  const copy = kind === 'stack' ? await sync.copyAfterChange(name, entries.map(([key]) => key)) : null;
+  if (copy) console.log(`stack ${name}: ${copy}`);
   return 0;
 }
 
@@ -348,6 +360,8 @@ async function unset(kind, name, key) {
   await k.saveSecrets(name, secrets);
   await audit({ admin: `unset-${kind}`, [kind]: name, key });
   console.log(`deleted ${key} from ${kind} ${name}`);
+  const copy = kind === 'stack' ? await sync.copyAfterChange(name, [key]) : null;
+  if (copy) console.log(`stack ${name}: ${copy}`);
   return 0;
 }
 
@@ -399,22 +413,25 @@ async function pending() {
 }
 
 async function remove(kind, name, stopFollowing = false) {
+  let note = '';
   if (kind === 'group') {
     checkName(name, 'group');
     await loadGroup(name);
     for (const f of [path.join(DIR.groups, `${name}.json`), path.join(DIR.groupSecrets, `${name}.env`)]) await fs.rm(f, { force: true });
   } else if (kind === 'stack') {
     checkName(name, 'stack');
-    if ((await loadStack(name)).followsMac && !stopFollowing) fail('this stack follows the Mac; change it there (to drop it on this machine only: remove-stack NAME --stop-following)');
+    const record = await loadStack(name);
+    if (record.followsMac && !stopFollowing) fail('this stack follows the Mac; change it there (to drop it on this machine only: remove-stack NAME --stop-following)');
     for (const p of await listProjects()) if ((await loadProject(p)).stack === name) fail(`project ${p} still uses stack ${name}: move it first`);
     for (const f of [path.join(DIR.stacks, `${name}.json`), path.join(DIR.stackSecrets, `${name}.env`)]) await fs.rm(f, { force: true });
+    if (record.shared) note = `; it was shared: ${await sync.dropEntries(name)} waiting copies dropped, and the other machine keeps what it has until the owner drops it there`;
   } else {
     checkName(name);
     await loadProject(name);
     for (const f of [path.join(DIR.projects, `${name}.json`), path.join(DIR.secrets, `${name}.env`), path.join(DIR.work, name)]) await fs.rm(f, { recursive: true, force: true });
   }
   await audit({ admin: `remove-${kind}`, name });
-  console.log(`removed ${kind} ${name}`);
+  console.log(`removed ${kind} ${name}${note}`);
   return 0;
 }
 
@@ -625,6 +642,43 @@ async function untrustMac() {
   return 0;
 }
 
+// ---- Copy to the other machine (this machine is the sender) ---------------------------------------------------------
+
+async function syncSetup(args) {
+  const { opts, positional } = parseArgs(args, { to: 'string', 'host-key': 'list', user: 'string', port: 'string', 'new-key': 'bool' });
+  if (positional.length) fail(`unexpected arguments: ${positional.join(' ')}`);
+  for (const line of await sync.setup({ to: opts.to ?? fail('--to <host> is required'), hostKeys: opts['host-key'], user: opts.user, port: opts.port, newKey: opts['new-key'] })) console.log(line);
+  return 0;
+}
+
+async function shareStack(name) {
+  checkName(name, 'stack');
+  const keys = await sync.share(name);
+  console.log(`stack ${name} is shared${keys.length ? `: ${keys.join(', ')} queued` : '; it holds no account keys yet'}. Every change to its account keys is now copied to the other machine (saved here first).`);
+  if (keys.length) for (const line of sync.describeDelivery(await sync.deliver())) console.log(line);
+  return 0;
+}
+
+async function unshareStack(name) {
+  checkName(name, 'stack');
+  const dropped = await sync.unshare(name);
+  console.log(`stack ${name} is no longer shared: future changes are not copied${dropped ? `; ${dropped} waiting or refused cop${dropped === 1 ? 'y was' : 'ies were'} dropped` : ''}.`);
+  console.log('The other machine keeps what it already has until the owner drops it there (on that machine: agent-broker-admin remove-stack NAME --stop-following).');
+  return 0;
+}
+
+async function syncPush(args) {
+  const { opts, positional } = parseArgs(args, { all: 'bool' });
+  if (positional.length) fail(`unexpected arguments: ${positional.join(' ')}`);
+  if (opts.all) {
+    const n = await sync.queueAll();
+    console.log(`queued ${n} key${n === 1 ? '' : 's'} again with new numbers`);
+  }
+  const lines = sync.describeDelivery(await sync.deliver());
+  for (const line of lines.length ? lines : ['nothing waiting']) console.log(line);
+  return 0;
+}
+
 async function main([cmd, ...args]) {
   await mkdirs();
   process.chdir(DIR.tmp);
@@ -635,6 +689,10 @@ async function main([cmd, ...args]) {
     case 'set': return setValues('project', args[0], [[args[1], (await readStdin()).replace(/\r?\n$/, '')]]);
     case 'set-stack': return setValues('stack', args[0], [[args[1], (await readStdin()).replace(/\r?\n$/, '')]]);
     case 'receive-from-mac': return receiveFromMac();
+    case 'share-stack': return shareStack(args[0]);
+    case 'unshare-stack': return unshareStack(args[0]);
+    case 'sync-setup': return syncSetup(args);
+    case 'sync-push': return syncPush(args);
     case 'trust-mac': return trustMac(args);
     case 'untrust-mac': return untrustMac();
     case 'import': {

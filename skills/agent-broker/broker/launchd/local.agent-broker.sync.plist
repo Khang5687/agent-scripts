@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Retries the account-token copies that are still waiting for the other machine: as the broker user, at load and every
+  10 minutes. `agent-broker.mjs sync-retry` does nothing (no connection, no output) while the outbox is empty or no
+  target is set. Installed by install.sh (macOS) into /Library/LaunchDaemons; it runs no command that needs a password.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>local.agent-broker.sync</string>
+  <key>UserName</key>
+  <string>_deployer</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/agent-broker/bin/agent-broker.mjs</string>
+    <string>sync-retry</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/opt/agent-broker</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>600</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+</dict>
+</plist>

@@ -30,7 +30,7 @@ NODE_DIR=${NODE_DIR:-$(newest "$OWNER_HOME"/.nvm/versions/node/v*)}
 NODE_DIR=${NODE_DIR:-$(newest "$OWNER_HOME"/.local/share/mise/installs/node/*)}
 [ -n "$NODE_DIR" ] && [ -x "$NODE_DIR/bin/node" ] || { echo "no Node found; set NODE_DIR=/path/to/node/version" >&2; exit 1; }
 
-echo "1/6 user _deployer"
+echo "1/7 user _deployer"
 if [ "$OS" = mac ]; then
   if ! dscl . -read /Users/_deployer >/dev/null 2>&1; then
     uid=480
@@ -59,7 +59,7 @@ mkdir -p "$HOME_D"
 chown _deployer:"$HOME_GROUP" "$HOME_D"
 chmod 700 "$HOME_D"
 
-echo "2/6 broker and its own Node in $ROOT"
+echo "2/7 broker and its own Node in $ROOT"
 mkdir -p "$ROOT/bin" "$ROOT/node/bin" "$ROOT/node/lib/node_modules"
 cp "$NODE_DIR/bin/node" "$ROOT/node/bin/node"
 rm -rf "$ROOT/node/lib/node_modules/npm"
@@ -69,7 +69,7 @@ cp "$SRC/package.json" "$ROOT/package.json"
 rm -f "$ROOT"/bin/*
 cp "$SRC"/bin/*.mjs "$SRC/bin/supabase-ca.pem" "$ROOT/bin/"
 
-echo "3/6 CLIs (netlify, vercel, supabase, apify) in $ROOT/node_modules"
+echo "3/7 CLIs (netlify, vercel, supabase, apify) in $ROOT/node_modules"
 [ "$OS" = mac ] && NPM_HOME=/var/root || NPM_HOME=/root
 (cd "$ROOT" && PATH="$ROOT/node/bin:/usr/bin:/bin:/usr/sbin:/sbin" HOME="$NPM_HOME" npm install --omit=dev --no-fund --no-audit --loglevel=error)
 rm -rf "$ROOT/apparmor"
@@ -82,13 +82,13 @@ chown -R root:"$ROOT_GROUP" "$ROOT"
 chmod -R go-w "$ROOT"
 chmod 755 "$ROOT/bin/agent-broker.mjs" "$ROOT/bin/agent-broker-admin.mjs"
 
-echo "4/6 commands in /usr/local/bin"
+echo "4/7 commands in /usr/local/bin"
 mkdir -p /usr/local/bin
 install -m 755 -o root -g "$ROOT_GROUP" "$SRC/wrappers/agent-broker" /usr/local/bin/agent-broker
 install -m 755 -o root -g "$ROOT_GROUP" "$SRC/wrappers/agent-broker-admin" /usr/local/bin/agent-broker-admin
 
 rm -rf "$ROOT/guard"
-echo "5/6 CLI guard: netlify / supabase / apify / vercel point account commands to agent-broker"
+echo "5/7 CLI guard: netlify / supabase / apify / vercel point account commands to agent-broker"
 mkdir -p "$ROOT/guard"
 install -m 755 -o root -g "$ROOT_GROUP" "$SRC/guard/cli-guard" "$ROOT/guard/cli-guard"
 for cli in netlify supabase apify vercel; do ln -sf cli-guard "$ROOT/guard/$cli"; done
@@ -121,7 +121,7 @@ else
   done
 fi
 
-echo "6/6 sudo rule"
+echo "6/7 sudo rule"
 grep -qE '^[#@]includedir /(private/)?etc/sudoers.d' /etc/sudoers || { echo "/etc/sudoers does not include /etc/sudoers.d" >&2; exit 1; }
 tmp=$(mktemp)
 sed "s/__USER__/$OWNER/g" "$SRC/sudoers" > "$tmp"
@@ -130,6 +130,16 @@ install -m 440 -o root -g "$ROOT_GROUP" "$tmp" /etc/sudoers.d/agent-broker
 rm -f "$tmp"
 
 (cd / && sudo -u _deployer "$ROOT/bin/agent-broker.mjs" projects >/dev/null)
+
+if [ "$OS" = mac ]; then
+  # Retries the token copies that wait for the other machine: as _deployer, at load and every 10 minutes. It does nothing
+  # while the outbox is empty or no target is set (agent-broker-admin sync-setup). Rerun-safe: unload, then load again.
+  echo "7/7 launchd job local.agent-broker.sync (retry waiting token copies, macOS only)"
+  PLIST=/Library/LaunchDaemons/local.agent-broker.sync.plist
+  install -m 644 -o root -g wheel "$SRC/launchd/local.agent-broker.sync.plist" "$PLIST"
+  launchctl bootout system/local.agent-broker.sync >/dev/null 2>&1 || true
+  launchctl bootstrap system "$PLIST" || echo "  note: could not load $PLIST; load it with: sudo launchctl bootstrap system $PLIST" >&2
+fi
 echo "Installed. Check as yourself:  agent-broker help"
 if [ "$OS" = linux ]; then
   echo "Linux: the cloud CLIs run in a bwrap sandbox, which Ubuntu allows only with one AppArmor file. Install it yourself, once:"

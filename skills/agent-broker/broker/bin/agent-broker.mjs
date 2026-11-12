@@ -15,6 +15,7 @@ import {
   saveProject, saveSecrets, sandboxReady,
   stackFromAgentsMd, syncProject,
 } from './lib.mjs';
+import { deliver, describeDelivery, healthNotes } from './sync.mjs';
 
 const HELP = `agent-broker <service> <action> [options]      run inside the project's folder: the folder picks the project
 
@@ -26,6 +27,8 @@ const HELP = `agent-broker <service> <action> [options]      run inside the proj
   agent-broker key <group> <KEY>   for a program's key line (OMP apiKey "!..."): prints that one value to the
                              program the group's program grant names; refused for anything else
   agent-broker health        can the broker serve every key its groups promise? one line, no values; exit 0 = healthy
+  agent-broker sync-retry    try the token copies still waiting for the other machine (what the timer runs); no arguments:
+                             it can only send what is already queued, to the one pinned target
 
 New project (a folder not registered yet; the user names the stack; stacks come from the owner's wizard):
   agent-broker init --stack S --list                     the stack's sites and databases (free or used by a project)
@@ -458,7 +461,7 @@ async function stacksList() {
   const projects = await Promise.all((await listProjects()).map(async (n) => [n, await effectiveStack(await loadProject(n))]));
   for (const name of await listStacks()) {
     const s = await loadStack(name);
-    out.push({ stack: name, is_default: name === 'global', ...(s.followsMac ? { follows_mac: true } : {}), accounts: s.accounts ?? {},
+    out.push({ stack: name, is_default: name === 'global', ...(s.followsMac ? { follows_mac: true } : {}), ...(s.shared ? { shared: true } : {}), accounts: s.accounts ?? {},
       keys: Object.keys(await loadStackSecrets(name)).sort(), projects: projects.filter(([, st]) => st === name).map(([n]) => n), note: s.note });
   }
   json(out);
@@ -896,6 +899,7 @@ async function health() {
     const last = Object.values(sync[name] ?? {}).map((e) => e?.at).filter(Boolean).sort().at(-1);
     macNotes.push(`stack ${name}: last copy from the Mac ${last ?? 'never'}`);
   }
+  macNotes.push(...(await healthNotes()));
   const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
   const line = causes.length
     ? `broker broken (${causes.join('; ')}), so ${[...stops].join(', ')} cannot get keys`
@@ -916,6 +920,10 @@ async function main(argv) {
   if (service === 'run') return runGroup(action);
   if (service === 'key') return keyValue(action, args[0]);
   if (service === 'health') return health();
+  if (service === 'sync-retry') {
+    for (const line of describeDelivery(await deliver())) console.log(line);
+    return 0;
+  }
   const after = [action, ...args].filter((a) => a !== undefined);
   if (service === 'whoami') return whoami(cwd, takeFlags(after));
   if (service === 'init') return init(cwd, after);
