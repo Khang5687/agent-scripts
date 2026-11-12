@@ -95,7 +95,8 @@ agent-broker compose exec -T db psql -U app < dump.sql                   # stdin
 
 - A compose stack folder is a project; its secrets live in the broker, its `.env` keeps only the non-secret settings.
 - Runs in the registered folder only (never a git worktree of it: same Compose project name = live containers).
-  `--env-file`, `-p`, `--project-directory` are not offered; drop `--env-file .env` from old runbook commands.
+  `--env-file`, `-p`, `--project-directory` are not offered; drop `--env-file .env` from old runbook commands. `-f`
+  takes a file inside the project (not `-`, not a remote reference), and so does `COMPOSE_FILE` in `.env`.
 - Plain `docker compose` there fails on `${VAR:?set VAR}`: that is the cue to use the broker. `docker logs <container>`
   and `docker ps` need no secrets.
 - Output is scrubbed of stored values; `compose config` shows `[secret]`.
@@ -196,10 +197,16 @@ Each `agent-broker-admin` call asks your password.
   whoever can start containers from a file an agent wrote can reach the host. Taking the agent user out of `docker` does
   not change that while `compose` is offered, because the broker's own Docker calls run as the broker user. What the
   broker refuses: any command or flag not in the table (below); `run -v` and mounts that reach the broker's home, the
-  Docker socket or `/`; `privileged`, `pid`/`network_mode`/`userns_mode: host`, `devices`, `cap_add`, `security_opt`
-  other than `no-new-privileges`, and a volume `device` that is not a checked bind; secrets, configs and build contexts
-  in the broker's home. What it does not stop: a compose file rewritten between the check and the real call (the real
-  call reads the files again; running it on the checked JSON was not done because it cannot be proven here that Compose
-  then keeps every container unchanged), a path swapped after the check, a socket under another name, `docker exec`
-  into a running container, and `docker`/`lxc` run by the agent itself. The secret guard has its own rules for those
-  direct calls (a guard as well).
+  Docker socket or `/`; `privileged`, `pid`/`network_mode`/`userns_mode: host`, `container:` forms of
+  `network_mode`/`pid`/`ipc`, `devices`, `device_cgroup_rules`, `cap_add`, `security_opt` other than
+  `no-new-privileges`, and a volume `device` that is not a bind (an `o` that is exactly `bind` or `rbind`) passing the
+  checks; every host path the client reads or writes (secrets, configs, `env_file`, `label_file`, build context,
+  absolute or climbing `dockerfile`, `ssh`, `type=local` cache) when it is in the broker's home. Compose files: `-f`
+  and each `COMPOSE_FILE` entry (from the stored values or the folder's `.env`, split on `COMPOSE_PATH_SEPARATOR`) must
+  be a file inside the project, never `-` (stdin) or a remote reference; `COMPOSE_ENV_FILES` is refused. Only `run` and
+  `exec` get the caller's stdin. What it does not stop: a compose file or `.env` rewritten between the check and the
+  real call (the real call reads the files again; running it on the checked JSON was not done because it cannot be
+  proven here that Compose then keeps every container unchanged), a path swapped after the check, a socket under
+  another name, a top-level `name:` or `COMPOSE_PROJECT_NAME` that points at another project's containers (the owner has
+  not decided whether the broker pins the project name), `docker exec` into a running container, and `docker`/`lxc`
+  run by the agent itself. The secret guard has its own rules for those direct calls (a guard as well).

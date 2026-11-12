@@ -25,19 +25,22 @@ test.before(async () => {
   await fs.mkdir(project, { recursive: true });
   await fs.mkdir(bin);
   // config -> the JSON in $FAKE_CONFIG (and a log line); anything else -> a log line "RAN <args>".
-  await fs.writeFile(path.join(bin, 'docker'), `#!/bin/sh\ncase " $* " in *" config "*) echo "CONFIG $*" >> "${log}"; cat "${cfg}";; *) echo "RAN $*" >> "${log}"; echo "ran $OWN";; esac\n`, { mode: 0o755 });
+  await fs.writeFile(path.join(bin, 'docker'), `#!/bin/sh\ncase " $* " in *" config "*) echo "CONFIG $*" >> "${log}"; cat "${cfg}";; *) echo "RAN $*" >> "${log}"; echo "STDIN:$(cat)" >> "${log}"; echo "ran $OWN";; esac\n`, { mode: 0o755 });
   let r = admin(['apply', '--stack', 'demo', '--new-stack', '--project', 'app', '--new-project', '--path', project], `project:APP_SECRET=${OWN}\n`);
   assert.equal(r.status, 0, r.stderr);
   r = admin(['apply', '--group', 'other', '--new-group', '--grant-root', 'OTHER_KEY'], `group:OTHER_KEY=${OTHER}\n`);
   assert.equal(r.status, 0, r.stderr);
 });
 
-async function compose(config, args) {
+async function compose(config, args, { input, dotenv } = {}) {
   await fs.writeFile(cfg, JSON.stringify(config));
   await fs.writeFile(log, '');
-  const r = spawnSync(process.execPath, [path.join(BIN, 'agent-broker.mjs'), 'compose', ...args], { cwd: project, env: { ...env, PATH: `${bin}:${process.env.PATH}` }, encoding: 'utf8' });
+  if (dotenv === undefined) await fs.rm(path.join(project, '.env'), { force: true });
+  else await fs.writeFile(path.join(project, '.env'), dotenv);
+  const r = spawnSync(process.execPath, [path.join(BIN, 'agent-broker.mjs'), 'compose', ...args], { cwd: project, env: { ...env, PATH: `${bin}:${process.env.PATH}` }, encoding: 'utf8', input });
+  await fs.rm(path.join(project, '.env'), { force: true });
   const lines = (await fs.readFile(log, 'utf8')).trim().split('\n').filter(Boolean);
-  return { ...r, ran: lines.filter((l) => l.startsWith('RAN')), configCalls: lines.filter((l) => l.startsWith('CONFIG')) };
+  return { ...r, ran: lines.filter((l) => l.startsWith('RAN')), configCalls: lines.filter((l) => l.startsWith('CONFIG')), stdinSeen: lines.filter((l) => l.startsWith('STDIN:')).map((l) => l.slice(6)) };
 }
 const svc = (extra) => ({ services: { web: { image: 'x', ...extra } } });
 const bind = (source) => svc({ volumes: [{ type: 'bind', source, target: '/t' }] });
@@ -270,5 +273,121 @@ test('--env-file is in no table (Node itself stops it before the broker sees it,
       if (COMPOSE_COMMANDS[command].flags[flag]) continue; // -f: logs --follow, rm --force, version --format
       assert.deepEqual((await commandProblems(command, [flag, 'x'], { home, cwd: project })).length > 0, true, `${command} ${flag}`);
     }
+  }
+});
+
+test('Y1: a compose file from stdin, a remote file or a hidden file list is refused; the check and the real call read the same files', async () => {
+  const stdinForms = [
+    ['-f -', ['-f', 'compose.yaml', '-f', '-', 'up', '-d']],
+    ['--file=-', ['-f', 'compose.yaml', '--file=-', 'up', '-d']],
+    ['-f - for ps', ['-f', '-', 'ps']],
+    ['a git remote ref', ['-f', 'git@host.example:x/y.git', 'up']],
+    ['an oci ref', ['-f', 'oci://registry.example/x:1', 'up']],
+    ['an https ref', ['--file', 'https://host.example/c.yaml', 'up']],
+    ['an absolute file', ['-f', '/tmp/evil.yaml', 'up']],
+  ];
+  for (const [what, args] of stdinForms) {
+    const r = await compose(svc({}), args, { input: 'services: {}\n' });
+    assert.equal(r.status, 2, `${what}: ${r.stderr}`);
+    assert.deepEqual([r.ran, r.configCalls], [[], []], what);
+  }
+  const envForms = [
+    ['COMPOSE_FILE=compose.yaml:- in .env', 'COMPOSE_FILE=compose.yaml:-\n', /COMPOSE_FILE entry "-"/],
+    ['a quoted list', 'COMPOSE_FILE="compose.yaml:-"\n', /entry "-"/],
+    ['export form', 'export COMPOSE_FILE=compose.yaml:-\n', /entry "-"/],
+    ['a custom separator', 'COMPOSE_PATH_SEPARATOR=;\nCOMPOSE_FILE=compose.yaml;-\n', /entry "-"/],
+    ['a custom separator hiding a colon entry', 'COMPOSE_PATH_SEPARATOR=;\nCOMPOSE_FILE=compose.yaml;git@host.example:x/y.git\n', /remote reference/],
+    ['a remote ref', 'COMPOSE_FILE=compose.yaml:oci://registry.example/x\n', /COMPOSE_FILE entry/],
+    ['a file outside the project', 'COMPOSE_FILE=compose.yaml:../other/c.yaml\n', /not a path inside the project/],
+    ['a variable', 'COMPOSE_FILE=${X}\n', /variable/],
+    ['COMPOSE_ENV_FILES', 'COMPOSE_ENV_FILES=/x/.env\n', /COMPOSE_ENV_FILES/],
+  ];
+  for (const [what, dotenv, mention] of envForms) {
+    for (const command of ['up', 'ps']) {
+      const r = await compose(svc({}), [command], { dotenv });
+      assert.equal(r.status, 2, `${what} ${command}: ${r.stderr}`);
+      assert.match(r.stderr, mention, what);
+      assert.deepEqual([r.ran, r.configCalls], [[], []], what);
+    }
+  }
+  // Ordinary lists still run, and Compose's own default files (no list at all) are left alone.
+  for (const dotenv of ['COMPOSE_FILE=compose.yaml:compose.prod.yaml\n', 'COMPOSE_PATH_SEPARATOR=;\nCOMPOSE_FILE=compose.yaml;compose.prod.yaml\n', 'OTHER=1\n', 'COMPOSE_FILE=\n']) {
+    const r = await compose(svc({}), ['up', '-d'], { dotenv });
+    assert.equal(r.status, 0, `${dotenv}: ${r.stderr}`);
+    assert.match(r.ran[0], /^RAN compose up -d$/);
+  }
+  const plain = await compose(svc({}), ['up', '-d']);
+  assert.equal(plain.status, 0);
+  assert.equal(plain.ran[0], 'RAN compose up -d'); // no explicit -f where there was none
+});
+
+test('Y1: stdin goes only to run and exec; up, build, restart, start and the rest run with it ignored', async () => {
+  for (const command of ['up', 'build', 'restart', 'start', 'ps', 'pull']) {
+    const r = await compose(svc({}), [command], { input: 'services: {web: {image: evil}}\n' });
+    assert.equal(r.status, 0, `${command}: ${r.stderr}`);
+    assert.deepEqual(r.stdinSeen, [''], `${command} must not see stdin`);
+  }
+  for (const args of [['exec', '-T', 'db', 'psql'], ['run', '--rm', '-T', 'web', 'cat']]) {
+    const r = await compose(svc({}), args, { input: 'select 1;\n' });
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(r.stdinSeen, ['select 1;'], `${args[0]} keeps stdin (the runbooks pipe SQL into exec -T)`);
+  }
+});
+
+test('Y2: every key that makes the client read or write a host path goes through the path check', async () => {
+  const cases = [
+    ['env_file as a string', svc({ env_file: path.join(home, 'secrets/app.env') }), 'env_file'],
+    ['env_file as a list of strings', svc({ env_file: ['/dev/null', path.join(home, 'group-secrets/x.env')] }), 'env_file'],
+    ['env_file as a list of objects', svc({ env_file: [{ path: path.join(home, 'x.env'), required: true }] }), 'env_file'],
+    ['label_file', svc({ label_file: [path.join(home, 'labels')] }), 'label_file'],
+    ['an absolute dockerfile', svc({ build: { context: project, dockerfile: path.join(home, 'Dockerfile') } }), 'build dockerfile'],
+    ['a dockerfile that climbs out of the context', svc({ build: { context: path.join(project, 'sub'), dockerfile: path.relative(path.join(project, 'sub'), path.join(home, 'Dockerfile')) } }), 'build dockerfile'],
+    ['build ssh as strings', svc({ build: { context: project, ssh: [`default=${path.join(home, 'key')}`] } }), 'build ssh'],
+    ['build ssh as objects', svc({ build: { context: project, ssh: [{ id: 'default', path: path.join(home, 'key') }] } }), 'build ssh'],
+    ['cache_to type=local dest', svc({ build: { context: project, cache_to: [`type=local,dest=${path.join(home, 'cache')},mode=max`] } }), 'build cache_to'],
+    ['cache_from type=local src', svc({ build: { context: project, cache_from: [`type=local,src=${home}`] } }), 'build cache_from'],
+  ];
+  for (const [what, config, mention] of cases) {
+    const r = await compose(config, ['up', '-d']);
+    assert.equal(r.status, 2, `${what}: ${r.stderr}`);
+    assert.deepEqual(r.ran, [], what);
+    assert.ok(r.stderr.includes(mention), `${what}: ${r.stderr}`);
+  }
+  const fine = svc({
+    env_file: [path.join(project, 'app.env'), { path: path.join(project, 'more.env') }],
+    label_file: path.join(project, 'labels'),
+    build: { context: project, dockerfile: 'Dockerfile', ssh: ['default'], cache_from: ['type=local,src=cache', 'registry.example/app:cache'], cache_to: ['type=local,dest=cache', 'type=registry,ref=registry.example/app:cache'] },
+  });
+  const r = await compose(fine, ['up', '-d']);
+  assert.equal(r.status, 0, r.stderr);
+});
+
+test('Y3 and the container: forms: device_cgroup_rules, a bind that is only named bind, and a join of another container', async () => {
+  const cases = [
+    ['device_cgroup_rules', svc({ device_cgroup_rules: ['b *:* rwm'] }), 'device_cgroup_rules'],
+    ['an option that only contains the text bind', { ...svc({}), volumes: { v: { driver: 'local', driver_opts: { type: 'ext4', device: '/dev/sda1', o: 'usrjquota=bind,jqfmt=vfsv0' } } } }, 'driver_opts device /dev/sda1'],
+    ['network_mode: container:', svc({ network_mode: 'container:other' }), 'network_mode container:other'],
+    ['pid: container:', svc({ pid: 'container:other' }), 'pid container:other'],
+    ['ipc: container:', svc({ ipc: 'container:other' }), 'ipc container:other'],
+  ];
+  for (const [what, config, mention] of cases) {
+    const r = await compose(config, ['up', '-d']);
+    assert.equal(r.status, 2, `${what}: ${r.stderr}`);
+    assert.ok(r.stderr.includes(mention), `${what}: ${r.stderr}`);
+  }
+  for (const o of ['bind', 'rbind', 'ro,bind', 'bind,ro']) {
+    const r = await compose({ ...svc({}), volumes: { v: { driver: 'local', driver_opts: { type: 'none', o, device: '/srv/media' } } } }, ['up', '-d']);
+    assert.equal(r.status, 0, `${o}: ${r.stderr}`);
+  }
+  const ok = await compose(svc({ network_mode: 'service:db', pid: 'service:db', device_cgroup_rules: [] }), ['up', '-d']);
+  assert.equal(ok.status, 0, ok.stderr);
+});
+
+test('N1: a name from the object prototype is not a command', async () => {
+  for (const command of ['constructor', 'toString', '__proto__', 'hasOwnProperty']) {
+    const r = await compose(svc({}), [command]);
+    assert.equal(r.status, 2, command);
+    assert.match(r.stderr, /is not offered/, command);
+    assert.deepEqual(r.ran, [], command);
   }
 });

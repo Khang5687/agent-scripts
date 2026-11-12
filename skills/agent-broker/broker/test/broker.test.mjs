@@ -175,7 +175,7 @@ test('only allow-listed actions, options and paths inside the project', async ()
   const shop = await folder('shop');
   const escape = broker(['netlify', 'deploy', '--dir', '../..'], shop);
   assert.equal(escape.status, 2);
-  assert.match(escape.stderr, /must be a path inside the project/);
+  assert.match(escape.stderr, /(must be|is not) a path inside the project/);
   assert.match(broker(['netlify', 'env:list'], shop).stderr, /has no action "env:list"/);
   assert.match(broker(['netlify', 'deploy', '--debug'], shop).stderr, /unknown option --debug/);
   assert.match(broker(['supabase', 'query', 'select 1'], shop).stderr, /does not use supabase/);
@@ -204,7 +204,7 @@ test('netlify deploy is plain `netlify deploy --no-build` on the pinned site: no
   for (const flag of ['--site', '--auth', '--build', '--trigger', '--prod-if-unlocked', '--site-name']) {
     assert.match(call(['netlify', 'deploy', flag, 'x'], shop).stderr, new RegExp(`unknown option ${flag}`));
   }
-  assert.match(call(['netlify', 'deploy', '--functions', '/etc'], shop).stderr, /must be a path inside the project/);
+  assert.match(call(['netlify', 'deploy', '--functions', '/etc'], shop).stderr, /(must be|is not) a path inside the project/);
 });
 
 // Needs a sandbox that really hides folders: sandbox-exec on a Mac, the real bwrap on Linux (which Ubuntu lets run only
@@ -443,7 +443,7 @@ test('compose: docker compose in the registered folder with its stored values; o
   for (const [args, msg] of [
     [['-p', 'other', 'up'], /-p is not offered/],
     [['--project-directory=/', 'up'], /--project-directory is not offered/],
-    [['-f', '../app-two/compose.yaml', 'up'], /must be a path inside the project/],
+    [['-f', '../app-two/compose.yaml', 'up'], /(must be|is not) a path inside the project/],
     [['--profile', 'mcp'], /give a compose command/],
   ]) assert.match(compose(args, stack).stderr, msg);
 

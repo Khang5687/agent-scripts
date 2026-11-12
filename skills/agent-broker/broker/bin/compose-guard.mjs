@@ -1,9 +1,11 @@
 // What `agent-broker compose` refuses before it lets Docker start or change containers. The compose file belongs to the
 // agents and the Docker daemon runs as root, so a bind mount of the broker's own folder would hand over every stored
 // value. The check reads the RESOLVED config (`docker compose config --format json`: includes, extends, profiles and .env
-// already applied), so one rule covers every way a path can get in. A guard for the usual routes, not a wall:
-// see "What this does not stop" in SKILL.md (a symlink swapped after the check, env_file of broker files unless a stored
-// value shows up, a socket under another name, and the Docker group of the owner's own user).
+// already applied). It checks, per service: bind mounts and the other keys that make the client read or write a host path
+// (env_file, label_file, build context / dockerfile / ssh / local cache, secret and config files), device and
+// root-equivalent settings, and the compose file list itself (`-f`, `COMPOSE_FILE`). A guard for the usual routes, not a
+// wall: see "What this does not stop" in SKILL.md (a file or symlink changed after the check, a socket under another name,
+// the project name, and the Docker group of the owner's own user).
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
@@ -58,13 +60,36 @@ export async function configProblems(config, { home, cwd, otherValues = [] }) {
     if ((svc.cap_add ?? []).length) out.push(`${at}: cap_add ${svc.cap_add.join(',')}`);
     for (const s of svc.security_opt ?? []) if (!/^no-new-privileges([:=]true)?$/.test(String(s))) out.push(`${at}: security_opt ${s} (only no-new-privileges is offered)`);
     for (const d of svc.devices ?? []) out.push(`${at}: host device ${typeof d === 'string' ? d.split(':')[0] : d?.source ?? '?'}`);
+    for (const key of ['network_mode', 'pid', 'ipc']) if (String(svc[key] ?? '').startsWith('container:')) out.push(`${at}: ${key} ${svc[key]} (joins a container outside this check)`);
+    if ((svc.device_cgroup_rules ?? []).length) out.push(`${at}: device_cgroup_rules (lets the container make device nodes)`);
+    // Keys that make the client (running as the broker user) read or write a host path. The resolved shapes: env_file is
+    // a string, a list of strings, or a list of {path}; label_file a string or list; build.ssh a list of "id=path"
+    // strings or {id, path}; cache_from/cache_to strings like "type=local,src=/x,dest=/y".
+    for (const f of [svc.env_file].flat().filter(Boolean)) await bad(`${at} env_file`, typeof f === 'string' ? f : f?.path);
+    for (const f of [svc.label_file].flat().filter(Boolean)) await bad(`${at} label_file`, f);
     const ctx = svc.build?.context ?? (typeof svc.build === 'string' ? svc.build : null);
+    const ctxIsPath = typeof ctx === 'string' && !/^[a-z][a-z0-9+.-]*:|^git@/i.test(ctx);
     if (ctx && path.isAbsolute(ctx)) await bad(`${at} build context`, ctx);
+    const dockerfile = svc.build?.dockerfile;
+    if (typeof dockerfile === 'string') await bad(`${at} build dockerfile`, path.isAbsolute(dockerfile) ? dockerfile : ctxIsPath ? path.resolve(cwd, ctx, dockerfile) : null);
     for (const c of Object.values(svc.build?.additional_contexts ?? {})) if (typeof c === 'string' && path.isAbsolute(c)) await bad(`${at} build context`, c);
+    const ssh = svc.build?.ssh ?? [];
+    for (const s of Array.isArray(ssh) ? ssh : Object.entries(ssh).map(([id, p]) => `${id}=${p}`)) await bad(`${at} build ssh`, typeof s === 'string' ? s.split('=').slice(1).join('=') : s?.path);
+    for (const key of ['cache_from', 'cache_to']) {
+      for (const entry of svc.build?.[key] ?? []) {
+        const parts = String(entry).split(',');
+        if (!parts.includes('type=local')) continue;
+        for (const part of parts) {
+          const m = /^(?:src|dest)=(.*)$/.exec(part);
+          if (m) await bad(`${at} build ${key}`, m[1]);
+        }
+      }
+    }
   }
   for (const [name, vol] of Object.entries(config?.volumes ?? {})) {
     const o = vol?.driver_opts ?? {};
-    if (typeof o.device === 'string' && /bind/.test(String(o.o ?? ''))) await bad(`volume "${name}"`, o.device);
+    const isBind = String(o.o ?? '').split(',').some((x) => x === 'bind' || x === 'rbind');
+    if (typeof o.device === 'string' && isBind) await bad(`volume "${name}"`, o.device);
     else if (o.device !== undefined) out.push(`volume "${name}": driver_opts device ${o.device} (only a bind that passes the folder checks is offered)`);
   }
   for (const kind of ['secrets', 'configs']) {
@@ -83,7 +108,8 @@ export async function configProblems(config, { home, cwd, otherValues = [] }) {
  * `build --ssh`) than anyone can list, so what is not named is refused. Flags are read the way pflag reads them:
  * `--flag=value`, `--flag value`, `-f value`, `-f=value`, `-fvalue`, and bundled short flags (`-Tv x` is `-T -v x`).
  * `check`: the command can start or change containers, so the resolved config is checked first.
- * `stop`: run and exec end their flags at the first word (the rest is the container's own command).
+ * `stop`: run and exec end their flags at the first word (the rest is the container's own command). This leans on Compose
+ *   turning interspersed flags off for those two commands (true in v5.3.1); recheck it when Compose is upgraded.
  * `no`: a flag that is refused with its own reason.
  * Never named, on purpose: --env-from-file, --env-file, --privileged, --cap-add, --ssh, --builder, -o/--output, -p,
  * --project-directory (the folder decides the project), and anything that writes a host file (cp, export, -o).
@@ -111,14 +137,58 @@ export const COMPOSE_COMMANDS = {
   version: { flags: { ...list('--short'), ...take('-f', '--format') } },
 };
 export const COMPOSE_COMMAND_NAMES = Object.keys(COMPOSE_COMMANDS);
-export const needsCheck = (command) => COMPOSE_COMMANDS[command]?.check === true;
+export const needsCheck = (command) => Object.hasOwn(COMPOSE_COMMANDS, command) && COMPOSE_COMMANDS[command].check === true;
+
+/** Commands that get the caller's stdin. Every other command runs with stdin ignored, so no file can arrive on it. */
+export const takesStdin = (command) => command === 'run' || command === 'exec';
+
+/** Why one compose file entry (`-f` value, or one `COMPOSE_FILE` entry) is refused, or null: it must be a file inside the project. */
+export function fileEntryProblem(e) {
+  if (e === '-') return 'reads the compose file from stdin, which the check cannot see';
+  if (/[:@]|^\w+\/\//.test(e)) return 'is a remote reference (the check cannot see what it fetches)';
+  const n = path.posix.normalize(e);
+  if (path.isAbsolute(n) || n === '..' || n.startsWith('../') || e.includes('\0')) return 'is not a path inside the project';
+  return null;
+}
+
+/** The value of KEY in the text of a `.env` file, the way Compose reads a plain line (`KEY=v`, `export KEY="v"`), or undefined. */
+function dotenvValue(text, key) {
+  let found;
+  for (const line of text.split(/\r?\n/)) {
+    const m = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_.-]*)\s*=\s*(.*?)\s*$/.exec(line);
+    if (m?.[1] === key) found = m[2].replace(/^(["'])(.*)\1$/, '$2');
+  }
+  return found;
+}
+
+/**
+ * The compose file list the real call would load beyond `-f`: `COMPOSE_FILE` split on `COMPOSE_PATH_SEPARATOR` (default
+ * `:`), read from the environment the broker passes (the project's stored values, which win) and then the folder's
+ * `.env`. Each entry follows the `-f` rule. `COMPOSE_ENV_FILES` points Compose at other env files: refused. The check and
+ * the real call read the same list, so no file the check did not see can be loaded.
+ */
+export async function fileListProblems(env, cwd) {
+  const dotenv = await fs.readFile(path.join(cwd, '.env'), 'utf8').catch(() => '');
+  const get = (k) => env?.[k] ?? dotenvValue(dotenv, k);
+  const out = [];
+  if (get('COMPOSE_ENV_FILES')) out.push('COMPOSE_ENV_FILES points Compose at other env files, which the check cannot see');
+  const list = get('COMPOSE_FILE');
+  if (!list) return out;
+  if (/\$/.test(list)) out.push('COMPOSE_FILE uses a ${variable}; write the file names out');
+  const sep = get('COMPOSE_PATH_SEPARATOR') || ':';
+  for (const e of list.split(sep)) {
+    const why = e === '' ? null : fileEntryProblem(e);
+    if (why) out.push(`COMPOSE_FILE entry "${e}" ${why}`);
+  }
+  return out;
+}
 
 /**
  * Why this command and these flags must not run, or []. Positional words (service names, the container's own command)
  * are not checked here. `-v SRC:DST` of `run` goes through hostPathProblem like a mount in the compose file.
  */
 export async function commandProblems(command, args, { home, cwd }) {
-  const spec = COMPOSE_COMMANDS[command];
+  const spec = Object.hasOwn(COMPOSE_COMMANDS, command) ? COMPOSE_COMMANDS[command] : undefined;
   if (!spec) return [`compose ${command} is not offered (allowed: ${COMPOSE_COMMAND_NAMES.join(', ')})`];
   const out = [];
   const volumes = [];

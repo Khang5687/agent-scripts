@@ -16,7 +16,7 @@ import {
   stackFromAgentsMd, syncProject,
 } from './lib.mjs';
 import { deliver, describeDelivery, healthNotes } from './sync.mjs';
-import { COMPOSE_COMMAND_NAMES, COMPOSE_COMMANDS, commandProblems, configProblems, needsCheck } from './compose-guard.mjs';
+import { COMPOSE_COMMAND_NAMES, COMPOSE_COMMANDS, commandProblems, configProblems, fileEntryProblem, fileListProblems, needsCheck, takesStdin } from './compose-guard.mjs';
 
 const HELP = `agent-broker <service> <action> [options]      run inside the project's folder: the folder picks the project
 
@@ -418,17 +418,26 @@ async function compose(cwd, args) {
     const kind = COMPOSE_OPTS[flag] ?? fail(`compose option ${flag} is not offered before the command (allowed: ${Object.keys(COMPOSE_OPTS).join(', ')})`);
     if (kind === 'bool') { opts.push(flag); continue; }
     const v = inline ?? args[++i] ?? fail(`${flag} needs a value`);
+    if (kind === 'file') {
+      const why = fileEntryProblem(v);
+      if (why) fail(`${flag} ${v} ${why}`);
+    }
     opts.push(flag, kind === 'file' ? checkRelative(v, flag) : v);
   }
   if (i >= args.length) fail('give a compose command: agent-broker compose ps | up -d | logs <service> | ...');
   const [command, ...rest] = args.slice(i);
   const refused = await commandProblems(command, rest, { home: HOME, cwd: P.root });
   if (refused.length) {
-    await audit({ service: 'compose', command: COMPOSE_COMMANDS[command] ? command : '(not offered)', project: P.name, refused: refused[0] });
+    await audit({ service: 'compose', command: Object.hasOwn(COMPOSE_COMMANDS, command) ? command : '(not offered)', project: P.name, refused: refused[0] });
     fail(`compose ${command} refused, nothing was started: ${refused.slice(0, 5).join('; ')}`);
   }
   const secrets = await loadSecrets(P.name);
   const scrub = makeScrubber(await allSecretValues());
+  const listed = await fileListProblems(secrets, P.root);
+  if (listed.length) {
+    await audit({ service: 'compose', command, project: P.name, refused: listed[0] });
+    fail(`compose ${command} refused, nothing was started: ${listed.join('; ')}`);
+  }
   if (needsCheck(command)) {
     const problems = await composeProblems(P, opts, command, secrets);
     if (problems.length) {
@@ -437,7 +446,7 @@ async function compose(cwd, args) {
     }
   }
   const code = await run('docker', ['compose', ...opts, command, ...rest],
-    { cwd: P.root, env: secrets, scrub, sandbox: false, stdin: 'inherit' });
+    { cwd: P.root, env: secrets, scrub, sandbox: false, stdin: takesStdin(command) ? 'inherit' : 'ignore' });
   await audit({ service: 'compose', command, project: P.name, code });
   return code;
 }

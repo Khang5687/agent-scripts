@@ -173,7 +173,7 @@ async function main(argv) {
   for (let i = 0; i < flags.length; i++) {
     const f = flags[i];
     const name = f.replace(/^--/, '');
-    if (!['file', 'group', 'exe', 'name'].includes(name) || !f.startsWith('--')) fail(`unexpected argument: ${f}\nusage: agent-broker-admin omp-move --exe DIR [--name omp] [--file models.yml] [--group omp]`);
+    if (!['file', 'group', 'exe', 'name'].includes(name) || !f.startsWith('--')) fail(`unexpected argument: ${f}\nusage: agent-broker-admin omp-move --exe DIR --name omp [--file models.yml] [--group omp]`);
     const value = flags[++i] ?? fail(`--${name} needs a value`);
     if (name === 'name') opt.names.push(value);
     else opt[name] = value;
