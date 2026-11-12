@@ -12,7 +12,7 @@ import {
   CA_FILE, DIR, KEY, LINUX, NAME, SERVICES, UsageError, allSecretValues, assertNoSecret, assertUnclaimed, audit, checkName,
   checkRelative, effectiveStack, fail, gitRoot, listGroups, listProjects, listStacks, loadGroup, loadGroupSecrets, loadProject,
   loadSecrets, loadStack, loadStackSecrets, makeScrubber, mkdirs, parseArgs, projectSecrets, resolveProject, run,
-  saveProject, saveSecrets,
+  saveProject, saveSecrets, sandboxReady,
   stackFromAgentsMd, syncProject,
 } from './lib.mjs';
 
@@ -914,9 +914,10 @@ async function main(argv) {
   if (service === 'attach') return attach(cwd, after);
   if (service === 'agents-md') return agentsMd(cwd, after);
   if (service === 'compose') return compose(cwd, after);
-  if (LINUX && ACTIONS[service]) fail(`${service} is not offered on Linux: the broker here runs compose only (the cloud CLIs need the macOS sandbox)`);
+  // (cloud actions run their CLI in the sandbox on both systems; on Linux that is bwrap, checked before any token is loaded)
   const actions = ACTIONS[service] ?? fail(`unknown service: ${service} (netlify, vercel, supabase, apify, compose). See: agent-broker help`);
   const fn = Object.hasOwn(actions, action ?? '') ? actions[action] : fail(`${service} has no action "${action ?? ''}". Allowed: ${Object.keys(actions).join(', ')}`);
+  sandboxReady();
   const { explicit, explicitStack, rest } = takeFlags(args);
   const P = await resolveProject(cwd, explicit, explicitStack);
   // Old form `agent-broker netlify deploy <project>` (blob store names may look like project names: not checked).

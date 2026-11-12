@@ -36,7 +36,7 @@ fi
 
 block() {
   {
-    echo "$name $*: needs an account, which agents reach only through the agent broker on this Mac."
+    echo "$name $*: needs an account, which agents reach only through the agent broker on this machine."
     echo "  For agents in a project folder:  agent-broker whoami   then   agent-broker help"
     echo "  For personal/manual CLI use with your global login: pass --global or set AGENT_BROKER_BYPASS=1"
   } >&2

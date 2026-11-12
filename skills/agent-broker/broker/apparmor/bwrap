@@ -1,0 +1,12 @@
+# Lets /usr/bin/bwrap create the user namespace the agent broker's cloud-CLI sandbox needs (Ubuntu 24.04 blocks it
+# for programs without a profile). Installed by the OWNER, once (install.sh only copies it to /opt/agent-broker/apparmor/):
+#   sudo install -m 644 /opt/agent-broker/apparmor/bwrap /etc/apparmor.d/bwrap
+#   sudo apparmor_parser -r /etc/apparmor.d/bwrap     (loads this one profile; restarts nothing)
+# Side effect: any user of this machine, agents included, may then use bwrap. Undo: sudo apparmor_parser -R /etc/apparmor.d/bwrap
+#              && sudo rm /etc/apparmor.d/bwrap
+abi <abi/4.0>,
+include <tunables/global>
+
+profile bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+}

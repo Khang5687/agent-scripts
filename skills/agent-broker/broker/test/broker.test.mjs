@@ -3,7 +3,7 @@
 // and the project picks its account stack; only allow-listed actions and paths are accepted.
 // Runs without sudo: AGENT_BROKER_DEV_ROOT puts the broker's home in a temp folder.
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -16,7 +16,12 @@ const lib = await import('../bin/lib.mjs');
 const BIN = path.resolve(import.meta.dirname, '../bin');
 const TOKEN = 'nfp_TESTtokenVALUE0123456789abcdef';
 
-const env = { ...process.env, AGENT_BROKER_DEV_ROOT: dev, AGENT_BROKER_SKIP_VERIFY: '1' };
+// Linux: the broker starts CLIs through bwrap. Here a pass-through stand-in (logs its arguments, runs the command after `--`):
+// the real bwrap needs an AppArmor file the owner installs. It hides nothing, so the test of hiding uses the real one.
+const BWRAP_LOG = path.join(dev, 'bwrap-argv.log');
+const BWRAP_SHIM = path.join(dev, 'bwrap-shim.sh');
+await fs.writeFile(BWRAP_SHIM, `#!/bin/bash\nprintf '%s\\n' "$*" >> '${BWRAP_LOG}'\nwhile [ $# -gt 0 ] && [ "$1" != -- ]; do shift; done\nshift\nexec "$@"\n`, { mode: 0o755 });
+const env = { ...process.env, AGENT_BROKER_DEV_ROOT: dev, AGENT_BROKER_SKIP_VERIFY: '1', AGENT_BROKER_DEV_BWRAP: BWRAP_SHIM };
 const broker = (args, cwd = dev) => spawnSync(process.execPath, [path.join(BIN, 'agent-broker.mjs'), ...args], { cwd, env, encoding: 'utf8' });
 const admin = (args, input) => spawnSync(process.execPath, [path.join(BIN, 'agent-broker-admin.mjs'), ...args], { env, input, encoding: 'utf8' });
 const ok = (r) => { assert.equal(r.status, 0, r.stderr); return r; };
@@ -176,12 +181,12 @@ test('only allow-listed actions, options and paths inside the project', async ()
 });
 
 // A fake CLI first in PATH that writes its arguments (one per line) and the token file it tries to read to `log`.
-async function fakeCli(name, script) {
+async function fakeCli(name, script, extraEnv = {}) {
   const bin = await folder(`fake-${name}-bin`);
   const log = path.join(dev, `fake-${name}.log`);
   await fs.writeFile(path.join(bin, name), `#!/bin/sh\n${script.replaceAll('$LOG', log)}\n`, { mode: 0o755 });
   const call = (args, cwd) => spawnSync(process.execPath, [path.join(BIN, 'agent-broker.mjs'), ...args],
-    { cwd, env: { ...env, PATH: `${bin}:${process.env.PATH}` }, encoding: 'utf8' });
+    { cwd, env: { ...env, PATH: `${bin}:${process.env.PATH}`, ...extraEnv }, encoding: 'utf8' });
   return { call, log };
 }
 
@@ -201,17 +206,40 @@ test('netlify deploy is plain `netlify deploy --no-build` on the pinned site: no
   assert.match(call(['netlify', 'deploy', '--functions', '/etc'], shop).stderr, /must be a path inside the project/);
 });
 
-test('CLIs cannot read the broker token files, whatever path the project config points at', async () => {
+// Needs a sandbox that really hides folders: sandbox-exec on a Mac, the real bwrap on Linux (which Ubuntu lets run only
+// once the owner has installed apparmor/bwrap; until then this is the owner's live check, see the report).
+const realBwrap = lib.LINUX && spawnSync('/usr/bin/bwrap', ['--unshare-all', '--ro-bind', '/', '/', '--', '/usr/bin/true'], { stdio: 'ignore' }).status === 0;
+const hidingSkip = process.platform === 'darwin' || realBwrap ? false : 'needs a working sandbox: bwrap does not start here until the AppArmor file is installed (owner\'s live check)';
+test('CLIs cannot read the broker token files, whatever path the project config points at', { skip: hidingSkip }, async () => {
   const shop = await folder('shop');
   const tokenFile = path.join(dev, 'home', 'stack-secrets', 'studio.env');
-  const { call, log } = await fakeCli('netlify', `cat "${tokenFile}" > "$LOG" 2>&1; ls "${path.join(dev, 'home', 'projects')}" >> "$LOG" 2>&1; echo own > own.txt; echo done`);
+  const { call, log } = await fakeCli('netlify', `cat "${tokenFile}" > "$LOG" 2>&1; ls "${path.join(dev, 'home', 'projects')}" >> "$LOG" 2>&1; echo own > own.txt; echo done`, realBwrap ? { AGENT_BROKER_DEV_BWRAP: '/usr/bin/bwrap' } : {});
   const r = ok(call(['netlify', 'deploy'], shop));
   assert.match(r.stdout, /done/);
   const seen = await fs.readFile(log, 'utf8');
-  assert.match(seen, /Operation not permitted/);
+  assert.match(seen, realBwrap ? /No such file or directory/ : /Operation not permitted/);
   assert.ok(!seen.includes('NETLIFY_AUTH_TOKEN') && !seen.includes('shop.json'), seen);
-  // Its own working copy stays writable.
+  // Its own working copy is there and stays writable: a file made inside shows outside.
   assert.equal(await fs.readFile(path.join(dev, 'home', 'work', 'shop', 'own.txt'), 'utf8'), 'own\n');
+
+  // A folder made in the broker's temp folder AFTER the sandbox started (another broker call's) is not visible inside.
+  const started = path.join(dev, 'late-started');
+  const go = path.join(dev, 'late-go');
+  const seenLate = path.join(dev, 'late-seen.log');
+  await fs.rm(started, { force: true });
+  await fs.rm(go, { force: true });
+  await fakeCli('netlify', `touch "${started}"; while [ ! -e "${go}" ]; do sleep 0.1; done; ls -A "${path.join(dev, 'home', 'tmp')}" > "${seenLate}" 2>&1; echo done`);
+  const bin = path.join(dev, 'repos', 'fake-netlify-bin');
+  const child = spawn(process.execPath, [path.join(BIN, 'agent-broker.mjs'), 'netlify', 'deploy'],
+    { cwd: shop, env: { ...env, PATH: `${bin}:${process.env.PATH}`, ...(realBwrap ? { AGENT_BROKER_DEV_BWRAP: '/usr/bin/bwrap' } : {}) }, stdio: 'ignore' });
+  const exited = new Promise((resolve) => child.on('exit', resolve));
+  for (let i = 0; i < 100 && !(await fs.lstat(started).catch(() => null)); i++) await new Promise((r) => setTimeout(r, 100));
+  assert.ok(await fs.lstat(started).catch(() => null), 'the sandboxed CLI never started');
+  await fs.mkdir(path.join(dev, 'home', 'tmp', 'late-private-folder'));
+  await fs.writeFile(go, '');
+  assert.equal(await exited, 0);
+  assert.ok(!(await fs.readFile(seenLate, 'utf8')).includes('late-private-folder'));
+  await fs.rm(path.join(dev, 'home', 'tmp', 'late-private-folder'), { recursive: true, force: true });
 });
 
 test('records with a stored build folder lose it on load: whoami shows none', async () => {
@@ -1121,4 +1149,78 @@ test('omp-move: literal keys move into the group, lines are rewritten, the rest 
   assert.equal(move(file).status, 0);
   assert.equal(await fs.readFile(file, 'utf8'), expected.replace(/\n/g, '\r\n'));
   await fs.rm(dir, { recursive: true, force: true });
+});
+
+// ---- Linux sandbox (bwrap) ---------------------------------------------------------------------------------------
+
+test('bwrap argument list: every hidden folder is one whole tmpfs, kept folders inside them are bound back after, command last', () => {
+  const home = '/srv/demo/home';
+  const names = ['stack-secrets', 'secrets', 'group-secrets', 'groups', 'stacks', 'projects', 'queue', 'log', 'work', 'tmp'];
+  const hidden = names.map((n) => `${home}/${n}`);
+  const start = ['--die-with-parent', '--new-session', '--unshare-all', '--share-net', '--bind', '/', '/', '--dev', '/dev', '--proc', '/proc'];
+  const tmpfs = (list) => list.flatMap((d) => ['--tmpfs', `${home}/${d}`]);
+  const bind = (list) => list.flatMap((d) => ['--bind', d, d]);
+
+  // Plain run: the work copy and the private temp folder sit inside hidden folders: all ten tmpfs first, then the two bind-backs.
+  const work = `${home}/work/proj`;
+  const priv = `${home}/tmp/u1`;
+  const args = lib.bwrapArgs({ hidden, keep: [work, priv], cmd: 'netlify', args: ['deploy', '--no-build'] });
+  assert.deepEqual(args, [...start, ...tmpfs(names), ...bind([work, priv]), '--', 'netlify', 'deploy', '--no-build']);
+
+  // An extra allowed folder inside a hidden one is bound back too; one outside the hidden folders needs nothing;
+  // one inside another kept folder is covered by it.
+  const extra = `${home}/projects/shared`;
+  const more = lib.bwrapArgs({ hidden, keep: [work, priv, extra, '/srv/demo/other', `${priv}/scratch`], cmd: 'apify', args: ['info'] });
+  assert.deepEqual(more, [...start, ...tmpfs(names), ...bind([work, priv, extra]), '--', 'apify', 'info']);
+
+  // A hidden folder inside a kept folder stays visible (kept wins, as on macOS); no bind-back for the ancestor.
+  assert.deepEqual(lib.bwrapArgs({ hidden, keep: [`${home}/work`], cmd: 'x' }),
+    [...start, ...tmpfs(names.filter((n) => n !== 'work')), '--', 'x']);
+  assert.deepEqual(lib.bwrapArgs({ hidden, keep: [home], cmd: 'x' }), [...start, '--', 'x']);
+});
+
+test('cloud actions on Linux run under bwrap with the broker folders hidden, and the token only in the CLI\'s environment', { skip: !lib.LINUX && 'Linux only' }, async () => {
+  const app = await folder('bwrapapp');
+  const tok = 'nfp_BWRAPtokenVALUE0123456789abcdef';
+  ok(admin(['apply', '--stack', 'bw', '--new-stack', '--project', 'bwrapapp', '--new-project', '--path', app, '--netlify-site', 'site-bw'], `stack:NETLIFY_AUTH_TOKEN=${tok}\n`));
+  const { call, log } = await fakeCli('netlify', 'echo "$NETLIFY_AUTH_TOKEN" > "$LOG"; echo ran');
+  await fs.writeFile(BWRAP_LOG, '');
+  const r = call(['netlify', 'deploy'], app);
+  assert.equal(r.status, 0, r.stderr);
+  assert.doesNotMatch(r.stderr, /not offered on Linux/);
+  assert.equal((await fs.readFile(log, 'utf8')).trim(), tok); // the token reaches the CLI through its environment ...
+  const lines = (await fs.readFile(BWRAP_LOG, 'utf8')).trim().split('\n');
+  assert.equal(lines.length, 2); // the start check, then the run
+  assert.ok(!lines.join('\n').includes(tok)); // ... never through bwrap's arguments
+  const real = await fs.realpath(path.join(dev, 'home'));
+  assert.ok(lines[1].includes(`--tmpfs ${real}/stack-secrets --tmpfs ${real}/secrets --tmpfs ${real}/group-secrets --tmpfs ${real}/groups `), lines[1]);
+  assert.ok(lines[1].endsWith(' -- netlify deploy --no-build --site site-bw'), lines[1]);
+});
+
+test('cloud action with no working bwrap: one line that names the fix, before any token is loaded or any child started', { skip: !lib.LINUX && 'Linux only' }, async () => {
+  const app = await folder('nobwrap');
+  const tok = 'nfp_NOBWRAPtokenVALUE0123456789abcde';
+  ok(admin(['apply', '--stack', 'nb', '--new-stack', '--project', 'nobwrap', '--new-project', '--path', app, '--netlify-site', 'site-nb'], `stack:NETLIFY_AUTH_TOKEN=${tok}\n`));
+  const { log } = await fakeCli('netlify', 'echo started > "$LOG"');
+  await fs.rm(log, { force: true });
+  const envLog = path.join(dev, 'blocked-bwrap-env.log');
+  const blocked = path.join(dev, 'bwrap-blocked.sh');
+  await fs.writeFile(blocked, `#!/bin/bash\nenv > '${envLog}'\necho "bwrap: setting up uid map: Permission denied" >&2\nexit 1\n`, { mode: 0o755 });
+  const bin = path.join(dev, 'repos', 'fake-netlify-bin');
+  const attempt = (bwrap) => spawnSync(process.execPath, [path.join(BIN, 'agent-broker.mjs'), 'netlify', 'deploy'],
+    { cwd: app, env: { ...env, PATH: `${bin}:${process.env.PATH}`, AGENT_BROKER_DEV_BWRAP: bwrap }, encoding: 'utf8' });
+
+  const denied = attempt(blocked);
+  assert.equal(denied.status, 2);
+  assert.equal(denied.stderr.trim().split('\n').length, 1);
+  assert.match(denied.stderr, /the sandbox cannot start \(setting up uid map: Permission denied\).*sudo install -m 644 .*apparmor\/bwrap \/etc\/apparmor\.d\/bwrap && sudo apparmor_parser -r/);
+  assert.doesNotMatch(denied.stderr, /not offered on Linux/);
+  const missing = attempt(path.join(dev, 'no-such-bwrap'));
+  assert.equal(missing.status, 2);
+  assert.equal(missing.stderr.trim().split('\n').length, 1);
+  assert.match(missing.stderr, /is missing: install it with  sudo apt install bubblewrap/);
+  for (const r of [denied, missing]) assert.ok(!(r.stdout + r.stderr).includes(tok));
+  // No child saw the token: the fake CLI never ran, and the stand-in's own environment holds no token.
+  assert.equal(await fs.lstat(log).catch(() => null), null);
+  assert.ok(!(await fs.readFile(envLog, 'utf8')).includes(tok));
 });

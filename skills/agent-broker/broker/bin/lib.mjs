@@ -2,7 +2,7 @@
 // copy and folder -> project resolution.
 // Runs as the _deployer user (sudo). Agents (the normal user) cannot read _deployer's home, where the tokens live.
 // Guide: agent-scripts/skills/agent-broker/SKILL.md
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
 import fs from 'node:fs/promises';
@@ -14,7 +14,7 @@ import path from 'node:path';
 const DEV = process.env.AGENT_BROKER_DEV_ROOT;
 if (DEV && os.userInfo().username === '_deployer') throw new Error('AGENT_BROKER_DEV_ROOT is not allowed for _deployer');
 
-// Linux brokers (homelab servers) run Docker Compose only: the cloud CLIs need the macOS sandbox (see run()).
+// Linux brokers (homelab servers) run the cloud CLIs under bubblewrap (bwrap), the macOS sandbox's counterpart (see run()).
 export const LINUX = process.platform === 'linux';
 export const ROOT = DEV ? path.join(DEV, 'opt') : '/opt/agent-broker';
 export const HOME = DEV ? path.join(DEV, 'home') : LINUX ? '/home/_deployer' : '/Users/_deployer';
@@ -400,8 +400,9 @@ export function assertNoSecret(buf, values, what) {
 // ---- Running CLIs ------------------------------------------------------------------------------------------------
 
 // The CLIs read the project's own config (netlify.toml publish / functions, .actor, supabase/config.toml), and the
-// agents write it: a path there could point at the broker's token files and upload them. Every CLI runs in a macOS
-// sandbox that cannot read or write the broker's own folders, except its working folder and a private temp folder.
+// agents write it: a path there could point at the broker's token files and upload them. Every CLI runs in a sandbox
+// (sandbox-exec on macOS, bwrap on Linux) that cannot read or write the broker's own folders, except its working folder
+// and a private temp folder.
 const PRIVATE = ['stackSecrets', 'secrets', 'groupSecrets', 'groups', 'stacks', 'projects', 'queue', 'log', 'work', 'tmp'];
 
 async function sandboxProfile(allowed) {
@@ -413,6 +414,43 @@ async function sandboxProfile(allowed) {
   return `(version 1)(allow default)(deny file-read-data file-write* ${sub(denied)})(allow file-read-data file-write* ${sub(ok)})`;
 }
 
+// Linux: bwrap with the whole file tree visible and writable as the broker user (what the macOS profile allows), except
+// the broker's own folders. Order matters and is the standard idiom: first every hidden folder as one whole `--tmpfs`
+// (nothing is listed, so a folder created in it later is hidden too), then each kept folder inside one is bound back
+// from the host tree. A kept folder that holds a hidden one wins, as on macOS ("later rules win").
+const BWRAP = (DEV && process.env.AGENT_BROKER_DEV_BWRAP) || '/usr/bin/bwrap';
+const bwrapStartArgs = ['--die-with-parent', '--new-session', '--unshare-all', '--share-net'];
+
+/** The bwrap argument list: `hidden` (real paths of the broker's folders), `keep` (real paths that stay usable), the command last. */
+export function bwrapArgs({ hidden, keep, cmd, args = [] }) {
+  const within = (p, dir) => p === dir || p.startsWith(`${dir}/`);
+  const tmpfs = hidden.filter((h) => !keep.some((k) => within(h, k)));
+  const back = [...new Set(keep)].filter((k) => tmpfs.some((h) => within(k, h)) && !keep.some((o) => o !== k && within(k, o)));
+  return [
+    ...bwrapStartArgs, '--bind', '/', '/', '--dev', '/dev', '--proc', '/proc',
+    ...tmpfs.flatMap((h) => ['--tmpfs', h]),
+    ...back.flatMap((k) => ['--bind', k, k]),
+    '--', cmd, ...args,
+  ];
+}
+
+/**
+ * Linux: before a cloud action loads any token, check that the sandbox starts. One line says what is wrong and the fix.
+ * (Ubuntu blocks the unprivileged user namespace bwrap needs until the AppArmor file is installed: apparmor/bwrap.)
+ */
+let sandboxChecked = false;
+export function sandboxReady() {
+  if (!LINUX || sandboxChecked) return;
+  const r = spawnSync(BWRAP, [...bwrapStartArgs, '--ro-bind', '/', '/', '--dev', '/dev', '--', '/usr/bin/true'], { encoding: 'utf8', timeout: 15000 });
+  if (r.error?.code === 'ENOENT') fail(`the sandbox tool ${BWRAP} is missing: install it with  sudo apt install bubblewrap`);
+  if (r.status === 0) {
+    sandboxChecked = true;
+    return;
+  }
+  const why = (r.error?.message ?? r.stderr ?? '').split('\n').find(Boolean) ?? `exit ${r.status}`;
+  fail(`the sandbox cannot start (${why.replace(/^bwrap: /, '')}); the owner installs the AppArmor file once:  sudo install -m 644 ${ROOT}/apparmor/bwrap /etc/apparmor.d/bwrap && sudo apparmor_parser -r /etc/apparmor.d/bwrap`);
+}
+
 /**
  * Runs a CLI from the broker's own tool folder with a fixed environment (tool PATH, _deployer HOME, plus the given
  * variables), sandboxed away from the broker's folders except `cwd` and `allow`. stdout/stderr are scrubbed; `out`
@@ -422,11 +460,18 @@ async function sandboxProfile(allowed) {
  * names, so a sandbox around the client would not keep anything out.
  */
 export async function run(cmd, args, { cwd, env = {}, scrub, out = process.stdout, allow = [], sandbox = true, stdin = 'ignore' }) {
-  if (sandbox && process.platform !== 'darwin') fail(`${cmd} needs the macOS sandbox; on Linux the broker runs compose only`);
+  if (sandbox && process.platform !== 'darwin' && !LINUX) fail(`${cmd} needs the macOS or Linux sandbox`);
+  if (sandbox && LINUX) await sandboxReady();
   const tmp = path.join(DIR.tmp, randomUUID());
   await fs.mkdir(tmp, { recursive: true, mode: 0o700 });
   try {
-    const [bin, argv] = sandbox ? ['/usr/bin/sandbox-exec', ['-p', await sandboxProfile([cwd, tmp, ...allow]), cmd, ...args]] : [cmd, args];
+    let bin = cmd;
+    let argv = args;
+    if (sandbox && LINUX) {
+      const keep = await Promise.all([cwd, tmp, ...allow].map((d) => fs.realpath(d)));
+      const hidden = (await Promise.all(PRIVATE.map((k) => fs.realpath(DIR[k]).catch(() => null)))).filter(Boolean);
+      [bin, argv] = [BWRAP, await bwrapArgs({ hidden, keep, cmd, args })];
+    } else if (sandbox) [bin, argv] = ['/usr/bin/sandbox-exec', ['-p', await sandboxProfile([cwd, tmp, ...allow]), cmd, ...args]];
     const child = spawn(bin, argv, {
       cwd,
       env: {

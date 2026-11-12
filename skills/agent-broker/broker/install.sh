@@ -4,8 +4,8 @@
 # Creates the hidden _deployer user (home /Users/_deployer on a Mac, /home/_deployer on Linux; only it can read it),
 # installs the broker with its own Node in /opt/agent-broker (root-owned, agents cannot change it), the commands
 # agent-broker and agent-broker-admin in /usr/local/bin, and the sudo rule /etc/sudoers.d/agent-broker.
-# Mac: also the cloud CLIs (netlify, vercel, supabase, apify) and their guard. Linux (homelab): Docker Compose only;
-# _deployer joins the owner's group (to read the project folders) and the docker group.
+# Also the cloud CLIs (netlify, vercel, supabase, apify) and their guard (macOS sandbox; on Linux bwrap, see apparmor/bwrap).
+# Linux: _deployer joins the owner's group (to read the project folders) and the docker group (Docker Compose).
 # Safe to run again after editing the files here: it updates the installed copy. Guide: ../SKILL.md
 set -euo pipefail
 
@@ -65,11 +65,14 @@ cp "$SRC/package.json" "$ROOT/package.json"
 rm -f "$ROOT"/bin/*
 cp "$SRC"/bin/*.mjs "$SRC/bin/supabase-ca.pem" "$ROOT/bin/"
 
-if [ "$OS" = mac ]; then
-  echo "3/6 CLIs (netlify, vercel, supabase, apify) in $ROOT/node_modules"
-  (cd "$ROOT" && PATH="$ROOT/node/bin:/usr/bin:/bin:/usr/sbin:/sbin" HOME=/var/root npm install --omit=dev --no-fund --no-audit --loglevel=error)
-else
-  echo "3/6 no cloud CLIs on Linux (they need the macOS sandbox): compose only"
+echo "3/6 CLIs (netlify, vercel, supabase, apify) in $ROOT/node_modules"
+[ "$OS" = mac ] && NPM_HOME=/var/root || NPM_HOME=/root
+(cd "$ROOT" && PATH="$ROOT/node/bin:/usr/bin:/bin:/usr/sbin:/sbin" HOME="$NPM_HOME" npm install --omit=dev --no-fund --no-audit --loglevel=error)
+rm -rf "$ROOT/apparmor"
+if [ "$OS" = linux ]; then
+  # Only a copy for the owner to install himself (see the file's header): the CLI sandbox (bwrap) needs it on Ubuntu.
+  mkdir -p "$ROOT/apparmor"
+  cp "$SRC/apparmor/bwrap" "$ROOT/apparmor/bwrap"
 fi
 chown -R root:"$ROOT_GROUP" "$ROOT"
 chmod -R go-w "$ROOT"
@@ -81,11 +84,11 @@ install -m 755 -o root -g "$ROOT_GROUP" "$SRC/wrappers/agent-broker" /usr/local/
 install -m 755 -o root -g "$ROOT_GROUP" "$SRC/wrappers/agent-broker-admin" /usr/local/bin/agent-broker-admin
 
 rm -rf "$ROOT/guard"
+echo "5/6 CLI guard: netlify / supabase / apify / vercel point account commands to agent-broker"
+mkdir -p "$ROOT/guard"
+install -m 755 -o root -g "$ROOT_GROUP" "$SRC/guard/cli-guard" "$ROOT/guard/cli-guard"
+for cli in netlify supabase apify vercel; do ln -sf cli-guard "$ROOT/guard/$cli"; done
 if [ "$OS" = mac ]; then
-  echo "5/6 CLI guard: netlify / supabase / apify / vercel point account commands to agent-broker"
-  mkdir -p "$ROOT/guard"
-  install -m 755 -o root -g wheel "$SRC/guard/cli-guard" "$ROOT/guard/cli-guard"
-  for cli in netlify supabase apify vercel; do ln -sf cli-guard "$ROOT/guard/$cli"; done
   # First in PATH for every zsh (agents run zsh -l -c / zsh -c; nvm in .zshrc would otherwise come first).
   GUARD_LINE='[ -d /opt/agent-broker/guard ] && path=(/opt/agent-broker/guard $path) # agent-broker CLI guard'
   for rc in "/Users/$OWNER/.zshenv" "/Users/$OWNER/.zshrc"; do
@@ -93,7 +96,25 @@ if [ "$OS" = mac ]; then
     grep -qF '# agent-broker CLI guard' "$rc" || printf '\n%s\n' "$GUARD_LINE" >>"$rc"
   done
 else
-  echo "5/6 no CLI guard on Linux (no cloud CLIs)"
+  # First in PATH for the owner's bash: login shells (.profile, and .bash_profile when there is one) and .bashrc. The
+  # .bashrc line goes on TOP: Ubuntu's .bashrc returns early for non-interactive shells, so a line at the end is never read.
+  # A shell that reads none of these files (plain `bash -c` with no BASH_ENV) is not covered. Rerun-safe: marker comment.
+  GUARD_LINE='[ -d /opt/agent-broker/guard ] && PATH=/opt/agent-broker/guard:$PATH # agent-broker CLI guard'
+  OWNER_GROUP=$(id -gn "$OWNER")
+  rcs=("$OWNER_HOME/.profile" "$OWNER_HOME/.bashrc")
+  [ -f "$OWNER_HOME/.bash_profile" ] && rcs+=("$OWNER_HOME/.bash_profile")
+  for rc in "${rcs[@]}"; do
+    [ -f "$rc" ] || { touch "$rc"; chown "$OWNER":"$OWNER_GROUP" "$rc"; }
+    grep -qF '# agent-broker CLI guard' "$rc" && continue
+    if [ "$rc" = "$OWNER_HOME/.bashrc" ]; then
+      tmp=$(mktemp)
+      { printf '%s\n' "$GUARD_LINE"; cat "$rc"; } >"$tmp"
+      cat "$tmp" >"$rc" # same file: owner and mode stay
+      rm -f "$tmp"
+    else
+      printf '\n%s\n' "$GUARD_LINE" >>"$rc"
+    fi
+  done
 fi
 
 echo "6/6 sudo rule"
@@ -106,3 +127,7 @@ rm -f "$tmp"
 
 (cd / && sudo -u _deployer "$ROOT/bin/agent-broker.mjs" projects >/dev/null)
 echo "Installed. Check as yourself:  agent-broker help"
+if [ "$OS" = linux ]; then
+  echo "Linux: the cloud CLIs run in a bwrap sandbox, which Ubuntu allows only with one AppArmor file. Install it yourself, once:"
+  echo "  sudo install -m 644 $ROOT/apparmor/bwrap /etc/apparmor.d/bwrap && sudo apparmor_parser -r /etc/apparmor.d/bwrap"
+fi
