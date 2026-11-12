@@ -10,8 +10,9 @@ import path from 'node:path';
 import { createNetlifySite, createReadOnlyUser, lookup, verifyPins } from './accounts.mjs';
 import {
   CA_FILE, DIR, LINUX, NAME, SERVICES, UsageError, allSecretValues, assertNoSecret, assertUnclaimed, audit, checkName,
-  checkRelative, effectiveStack, fail, gitRoot, listProjects, listStacks, loadProject, loadSecrets, loadStack,
-  loadStackSecrets, makeScrubber, mkdirs, parseArgs, projectSecrets, resolveProject, run, saveProject, saveSecrets,
+  checkRelative, effectiveStack, fail, gitRoot, listProjects, listStacks, loadGroup, loadGroupSecrets, loadProject,
+  loadSecrets, loadStack, loadStackSecrets, makeScrubber, mkdirs, parseArgs, projectSecrets, resolveProject, run,
+  saveProject, saveSecrets,
   stackFromAgentsMd, syncProject,
 } from './lib.mjs';
 
@@ -20,6 +21,8 @@ const HELP = `agent-broker <service> <action> [options]      run inside the proj
   agent-broker whoami        this folder's project, account stack, site and database
   agent-broker projects      all projects and their folders     agent-broker stacks   all account stacks
   agent-broker result <id>   result of an approved Supabase admin query
+  agent-broker run <group>   for a systemd unit's pre-start step only (ExecStartPre=+): fills the unit's RuntimeDirectory
+                             with the keys its group grants; refused for any other caller
 
 New project (a folder not registered yet; the user names the stack; stacks come from the owner's wizard):
   agent-broker init --stack S --list                     the stack's sites and databases (free or used by a project)
@@ -709,6 +712,56 @@ function takeFlags(args) {
   return { explicit, explicitStack, rest };
 }
 
+/**
+ * The systemd user unit the caller runs in, from the caller's own cgroup (sudo keeps it: no pam_systemd in the sudo
+ * stack). Accepts only .../user@<SUDO_UID>.service/app.slice/<unit>: the unit sits directly under that user's app slice.
+ * Tests only (dev root): the cgroup file can be replaced with AGENT_BROKER_DEV_CGROUP_FILE.
+ */
+async function callerUnit() {
+  const uid = process.env.SUDO_UID ?? '';
+  if (!/^[0-9]{1,10}$/.test(uid)) fail('run works only through the sudo wrapper (no SUDO_UID)');
+  const file = process.env.AGENT_BROKER_DEV_ROOT && process.env.AGENT_BROKER_DEV_CGROUP_FILE ? process.env.AGENT_BROKER_DEV_CGROUP_FILE : '/proc/self/cgroup';
+  const text = await fs.readFile(file, 'utf8').catch(() => fail('cannot read the caller\'s cgroup'));
+  const line = text.split('\n').find((l) => l.startsWith('0::'));
+  const parts = line ? line.slice(3).split('/').filter(Boolean) : [];
+  const n = parts.length;
+  if (n < 3 || parts[n - 3] !== `user@${uid}.service` || parts[n - 2] !== 'app.slice') fail('the caller is not a systemd user unit of this user (expected .../user@UID.service/app.slice/<unit>)');
+  return parts[n - 1];
+}
+
+/**
+ * agent-broker run <group>: the keys the caller's unit may have, as NUL-separated records on stdout and nothing else:
+ *   file\0<name>\0<value>\0     env\0<KEY>\0<value>\0
+ * The one output the broker never scrubs (it IS the secret). Read by the wrapper's `run`, which writes them into the
+ * unit's private runtime folder. Exit 2: no grant; 3: a required key has no stored value (nothing is printed then).
+ */
+async function runGroup(name) {
+  checkName(name ?? '', 'group');
+  const unit = await callerUnit();
+  const grant = (await loadGroup(name)).grants.find((g) => g.unit === unit);
+  if (!grant) fail(`no grant for ${unit} in group ${name}`);
+  const secrets = await loadGroupSecrets(name);
+  const optional = new Set(grant.optional ?? []);
+  const records = [];
+  const keys = [];
+  const missing = [];
+  const skipped = [];
+  const take = (kind, label, key) => {
+    if (key in secrets) { records.push(kind, label, secrets[key]); keys.push(key); } else (optional.has(key) ? skipped : missing).push(key);
+  };
+  for (const [file, key] of Object.entries(grant.files ?? {})) take('file', file, key);
+  for (const key of grant.env ?? []) take('env', key, key);
+  if (missing.length) {
+    await audit({ run: name, unit, error: 'missing', missing });
+    process.stderr.write(`agent-broker: group ${name} has no value for ${missing.join(', ')} (needed by ${unit})\n`);
+    return 3;
+  }
+  for (const key of skipped) process.stderr.write(`agent-broker: warning: optional ${key} has no value in group ${name}; ${unit} starts without it\n`);
+  await audit({ run: name, unit, keys, skipped });
+  process.stdout.write(records.length ? `${records.join('\0')}\0` : '');
+  return 0;
+}
+
 async function main(argv) {
   const cwd = process.cwd(); // the caller's folder (sudo keeps it): it decides the project
   await mkdirs();
@@ -718,6 +771,7 @@ async function main(argv) {
   if (service === 'projects') return projectsList();
   if (service === 'stacks') return stacksList();
   if (service === 'result') return result(action);
+  if (service === 'run') return runGroup(action);
   const after = [action, ...args].filter((a) => a !== undefined);
   if (service === 'whoami') return whoami(cwd, takeFlags(after));
   if (service === 'init') return init(cwd, after);

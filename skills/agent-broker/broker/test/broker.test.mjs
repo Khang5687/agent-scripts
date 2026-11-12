@@ -558,3 +558,170 @@ test('import-files stores key files with one call, values on stdin and never in 
   assert.match(files('import-files', 'ghost', `DEMO_FILE_ONE=${key}`).stderr, /unknown group: ghost/);
   await fs.rm(dir, { recursive: true, force: true });
 });
+
+// ---- run <group> -------------------------------------------------------------------------------------------------
+
+const RUN_FILE_VALUE = 'run-file-value-abc123';
+const RUN_OTHER_VALUE = 'run-other-value-def456';
+const RUN_ENV_VALUE = 'run env "quoted" \\ back $HOME # hash';
+const RUN_VALUES = [RUN_FILE_VALUE, RUN_OTHER_VALUE, RUN_ENV_VALUE];
+const cgroupOf = (unit, uid = 1000) => `0::/user.slice/user-${uid}.slice/user@${uid}.service/app.slice/${unit}\n`;
+
+/** Runs `agent-broker run <group>` as the broker does (dev root), from the cgroup text given. */
+async function brokerRun(group, cgroup, extraEnv = {}) {
+  const file = path.join(dev, `cgroup-${Math.random().toString(36).slice(2)}`);
+  await fs.writeFile(file, cgroup);
+  const r = spawnSync(process.execPath, [path.join(BIN, 'agent-broker.mjs'), 'run', group], {
+    cwd: dev, env: { ...env, SUDO_UID: '1000', AGENT_BROKER_DEV_CGROUP_FILE: file, ...extraEnv }, encoding: 'utf8',
+  });
+  await fs.rm(file);
+  return r;
+}
+const records = (stdout) => { const parts = stdout.split('\0'); parts.pop(); return Array.from({ length: parts.length / 3 }, (_, i) => parts.slice(i * 3, i * 3 + 3)); };
+
+test('run: a granted unit gets exactly its keys as NUL records; any other caller is refused with nothing on stdout', async () => {
+  ok(admin(['apply', '--group', 'runner', '--new-group',
+    '--grant-file', 'demo.service:file-key=RUN_FILE', '--grant-file', 'demo.service:other-key=RUN_OTHER', '--grant-env', 'demo.service:RUN_ENV',
+    '--grant-file', 'tiny.service:tiny=RUN_FILE'],
+  `group:RUN_FILE=${RUN_FILE_VALUE}\ngroup:RUN_OTHER=${RUN_OTHER_VALUE}\ngroup:RUN_ENV=${RUN_ENV_VALUE}\ngroup:RUN_UNGRANTED=ungranted-value-789\n`));
+  const r = await brokerRun('runner', cgroupOf('demo.service'));
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stderr, '');
+  assert.deepEqual(records(r.stdout), [['file', 'file-key', RUN_FILE_VALUE], ['file', 'other-key', RUN_OTHER_VALUE], ['env', 'RUN_ENV', RUN_ENV_VALUE]]);
+  assert.ok(!r.stdout.includes('ungranted-value'));
+  assert.deepEqual(records((await brokerRun('runner', cgroupOf('tiny.service'))).stdout), [['file', 'tiny', RUN_FILE_VALUE]]);
+  // The audit line names the keys, never a value.
+  const log = await fs.readFile(path.join(dev, 'home/log/broker.log'), 'utf8');
+  assert.match(log, /"run":"runner","unit":"demo.service","keys":\["RUN_FILE","RUN_OTHER","RUN_ENV"\]/);
+  for (const v of RUN_VALUES) assert.ok(!log.includes(v));
+
+  for (const [what, cgroup, extra] of [
+    ['unit without a grant', cgroupOf('other.service')],
+    ['paseo.service', cgroupOf('paseo.service')],
+    ['another user\'s slice', cgroupOf('demo.service', 1001)],
+    ['a sub-cgroup of the unit', `${cgroupOf('demo.service').trim()}/sub\n`],
+    ['outside app.slice', '0::/user.slice/user-1000.slice/user@1000.service/session.slice/demo.service\n'],
+    ['a system service', '0::/system.slice/demo.service\n'],
+    ['no cgroup line', 'garbage\n'],
+    ['no SUDO_UID', cgroupOf('demo.service'), { SUDO_UID: '' }],
+  ]) {
+    const bad = await brokerRun('runner', cgroup, extra);
+    assert.equal(bad.status, 2, what);
+    assert.equal(bad.stdout, '', what);
+    for (const v of RUN_VALUES) assert.ok(!bad.stderr.includes(v), what);
+  }
+  assert.match((await brokerRun('runner', cgroupOf('paseo.service'))).stderr, /no grant for paseo\.service in group runner/);
+  assert.match((await brokerRun('ghost', cgroupOf('demo.service'))).stderr, /unknown group: ghost/);
+});
+
+test('run: an optional key without a value starts with a warning; a required one stops with its name and prints nothing', async () => {
+  ok(admin(['apply', '--group', 'opt', '--new-group', '--grant-file', 'opt.service:needed=RUN_FILE', '--grant-file', 'opt.service:maybe=RUN_MAYBE', '--optional', 'RUN_MAYBE'], `group:RUN_FILE=${RUN_FILE_VALUE}\n`));
+  const r = await brokerRun('opt', cgroupOf('opt.service'));
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(records(r.stdout), [['file', 'needed', RUN_FILE_VALUE]]);
+  assert.match(r.stderr, /warning: optional RUN_MAYBE has no value in group opt/);
+  ok(admin(['apply', '--group', 'opt', '--grant-file', 'opt.service:needed=RUN_FILE', '--grant-file', 'opt.service:also=RUN_ALSO']));
+  const bad = await brokerRun('opt', cgroupOf('opt.service'));
+  assert.equal(bad.status, 3);
+  assert.equal(bad.stdout, '');
+  assert.match(bad.stderr, /no value for RUN_ALSO \(needed by opt\.service\)/);
+});
+
+test('run wrapper: writes files 0600 and an env file into the 0700 runtime folder, checks the folder, reports failures as status files, leaks no value', async () => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), 'agent-broker-run-'));
+  const root = path.join(base, 'run-user');
+  await fs.mkdir(root, { mode: 0o700 });
+  const statusLog = path.join(base, 'status.log');
+  const argvLog = path.join(base, 'argv.log');
+  const cgroupFile = path.join(base, 'cgroup');
+  const fakeBroker = path.join(base, 'broker.sh');
+  const fakeWriter = path.join(base, 'writer.sh');
+  await fs.writeFile(fakeBroker, `#!/bin/bash\nprintf '%s\\n' "$*" >> '${argvLog}'\nexec '${process.execPath}' '${path.join(BIN, 'agent-broker.mjs')}' "$@"\n`, { mode: 0o700 });
+  await fs.writeFile(fakeWriter, `#!/bin/bash\nprintf '%s\\n' "$*" >> '${statusLog}'\n`, { mode: 0o700 });
+  const wrapper = path.resolve(import.meta.dirname, '../wrappers/agent-broker');
+  const runIn = (unit, group, dir, extra = {}) => {
+    spawnSync('bash', ['-c', `printf '%s' "$1" > "$2"`, 'x', cgroupOf(unit), cgroupFile]);
+    const e = {
+      ...env, SUDO_UID: '1000', AGENT_BROKER_DEV_BROKER: fakeBroker, AGENT_BROKER_DEV_RUN_ROOT: root, AGENT_BROKER_DEV_CGROUP_FILE: cgroupFile,
+      AGENT_BROKER_STATUS_WRITER: fakeWriter, AGENT_BROKER_STATUS_DIR: path.join(base, 'status'), ...extra,
+    };
+    if (dir === undefined) delete e.RUNTIME_DIRECTORY; else e.RUNTIME_DIRECTORY = dir;
+    return spawnSync('bash', [wrapper, 'run', group], { env: e, encoding: 'utf8', cwd: dev });
+  };
+  const folderWith = async (name, mode) => { const d = path.join(root, name); await fs.mkdir(d, { mode }); await fs.chmod(d, mode); return d; };
+  const status = async () => fs.readFile(statusLog, 'utf8').catch(() => '');
+  const noLeak = (text, what) => { for (const v of RUN_VALUES) assert.ok(!text.includes(v), `${what} leaked a value`); };
+
+  // Success.
+  const dir = await folderWith('demo-keys', 0o700);
+  const r = runIn('demo.service', 'runner', dir);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout, '');
+  assert.equal(r.stderr, '');
+  assert.equal(await fs.readFile(path.join(dir, 'file-key'), 'utf8'), RUN_FILE_VALUE);
+  assert.equal(await fs.readFile(path.join(dir, 'other-key'), 'utf8'), RUN_OTHER_VALUE);
+  assert.equal(await fs.readFile(path.join(dir, 'env'), 'utf8'), 'RUN_ENV="run env \\"quoted\\" \\\\ back $HOME # hash"\n');
+  for (const f of ['file-key', 'other-key', 'env']) assert.equal((await fs.stat(path.join(dir, f))).mode & 0o777, 0o600, f);
+  assert.deepEqual((await fs.readdir(dir)).sort(), ['env', 'file-key', 'other-key']); // temporary files are gone
+  assert.match(await status(), /--job agent-broker-run-demo-service --result ok .*--dir /);
+  assert.equal(await fs.readFile(argvLog, 'utf8'), 'run runner\n'); // the broker is asked by group name only
+  noLeak(await status(), 'status');
+  noLeak(await fs.readFile(argvLog, 'utf8'), 'argv');
+
+  // A rerun replaces the env file instead of appending to it.
+  assert.equal(runIn('demo.service', 'runner', dir).status, 0);
+  assert.equal((await fs.readFile(path.join(dir, 'env'), 'utf8')).split('\n').length, 2);
+
+  // The runtime folder is checked before anything is asked or written.
+  const loose = await folderWith('loose-keys', 0o755);
+  const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'agent-broker-outside-'));
+  await fs.chmod(outside, 0o700);
+  const link = path.join(root, 'link-keys');
+  await fs.symlink(dir, link);
+  const cases = [
+    ['unset', undefined, /RUNTIME_DIRECTORY is not set/],
+    ['missing', path.join(root, 'nope'), /not a real folder/],
+    ['outside the run root', outside, /is not under /],
+    ['dotdot', `${root}/demo-keys/../demo-keys`, /\. or \.\. part/],
+    ['two folders', `${dir}:${dir}`, /more than one folder/],
+    ['a link', link, /not a real folder/],
+    ['mode 0755', loose, /mode 0700: set RuntimeDirectoryMode=0700/],
+  ];
+  for (const [what, d, pattern] of cases) {
+    await fs.writeFile(statusLog, '');
+    await fs.writeFile(argvLog, '');
+    const bad = runIn('demo.service', 'runner', d);
+    assert.equal(bad.status, 1, what);
+    assert.match(bad.stderr, pattern, what);
+    assert.match(await status(), /--job agent-broker-run-demo-service --result fail .*broker broken, so demo\.service cannot start: /, what);
+    assert.equal(await fs.readFile(argvLog, 'utf8'), '', `${what}: the broker must not be called`);
+  }
+  assert.deepEqual(await fs.readdir(loose), []);
+
+  // Broker refusals come through as the reason; nothing is written.
+  const d2 = await folderWith('other-keys', 0o700);
+  await fs.writeFile(statusLog, '');
+  const refused = runIn('other.service', 'runner', d2);
+  assert.equal(refused.status, 1);
+  assert.match(refused.stderr, /no grant for other\.service in group runner/);
+  assert.match(await status(), /--result fail --category host --service agent-broker --summary broker broken, so other\.service cannot start: no grant for other\.service in group runner/);
+  assert.deepEqual(await fs.readdir(d2), []);
+
+  // A required key without a value: non-zero, a fail status file, no key file written.
+  const d3 = await folderWith('opt-keys', 0o700);
+  await fs.writeFile(statusLog, '');
+  const missing = runIn('opt.service', 'opt', d3);
+  assert.equal(missing.status, 1);
+  assert.match(missing.stderr, /no value for RUN_ALSO/);
+  assert.match(await status(), /--job agent-broker-run-opt-service --result fail .*no value for RUN_ALSO/);
+  assert.deepEqual(await fs.readdir(d3), []);
+  noLeak(missing.stdout + missing.stderr + (await status()), 'a failed run');
+
+  // No status writer configured: the run still works and says nothing about it.
+  const d4 = await folderWith('quiet-keys', 0o700);
+  const quiet = runIn('demo.service', 'runner', d4, { AGENT_BROKER_STATUS_WRITER: '' });
+  assert.equal(quiet.status, 0, quiet.stderr);
+  assert.equal(quiet.stderr, '');
+  await fs.rm(base, { recursive: true, force: true });
+  await fs.rm(outside, { recursive: true, force: true });
+});

@@ -4,8 +4,88 @@
 # your folders). Guide: agent-scripts/skills/agent-broker/SKILL.md
 BROKER=(/usr/bin/sudo -n -u _deployer /opt/agent-broker/bin/agent-broker.mjs)
 WRITE=(/opt/agent-broker/node/bin/node /opt/agent-broker/bin/write-block.mjs)
+# Tests only: stand-ins for the sudo call and the /run/user root, honoured only together with the dev root.
+RUN_ROOT=/run/user/$(id -u)
+if [ -n "${AGENT_BROKER_DEV_ROOT:-}" ]; then
+  [ -z "${AGENT_BROKER_DEV_BROKER:-}" ] || BROKER=("$AGENT_BROKER_DEV_BROKER")
+  [ -z "${AGENT_BROKER_DEV_RUN_ROOT:-}" ] || RUN_ROOT=$AGENT_BROKER_DEV_RUN_ROOT
+fi
+
+# One status file for the control room, only when AGENT_BROKER_STATUS_WRITER names a writer (the units set it).
+# AGENT_BROKER_STATUS_DIR, when set, is the folder to write into. Never fails the caller; never gets a value.
+status() { # status <job> <ok|fail> <summary>
+  local w=${AGENT_BROKER_STATUS_WRITER:-}
+  [ -n "$w" ] && [ -r "$w" ] || return 0
+  local args=(--job "$1" --result "$2" --category host --service agent-broker --summary "$3")
+  [ -z "${AGENT_BROKER_STATUS_DIR:-}" ] || args+=(--dir "$AGENT_BROKER_STATUS_DIR")
+  case $w in *.py) python3 "$w" "${args[@]}" ;; *) "$w" "${args[@]}" ;; esac >/dev/null 2>&1 || true
+}
+
+# run <group>: from a systemd pre-start step (ExecStartPre=+...). Asks the broker for the keys this unit may have and
+# writes them into the unit's private runtime folder (RuntimeDirectory=, tmpfs, 0700): a file per file grant, and
+# <folder>/env (KEY="VALUE" lines for EnvironmentFile=) for env grants. Values live in shell memory and files only:
+# never in arguments, output or the status summary.
+run_group() {
+  [ $# -eq 2 ] || { echo "usage: agent-broker run <group>" >&2; exit 2; }
+  local group=$2 cg=/proc/self/cgroup line unit job dir tmp err rc=0 reason n i
+  [ -z "${AGENT_BROKER_DEV_ROOT:-}" ] || [ -z "${AGENT_BROKER_DEV_CGROUP_FILE:-}" ] || cg=$AGENT_BROKER_DEV_CGROUP_FILE
+  line=$(grep -m1 '^0::' "$cg" 2>/dev/null || true)
+  unit=${line##*/}
+  [ -n "$unit" ] || unit=unknown
+  job=$(printf 'agent-broker-run-%s' "$unit" | tr 'A-Z._@' 'a-z---' | tr -c 'a-z0-9-' '-')
+  job=${job:0:64}
+  die() { status "$job" fail "broker broken, so $unit cannot start: $1"; echo "agent-broker run: $1" >&2; exit 1; }
+
+  dir=${RUNTIME_DIRECTORY:-}
+  [ -n "$dir" ] || die "RUNTIME_DIRECTORY is not set (the unit needs RuntimeDirectory=)"
+  case $dir in *:*) die "RUNTIME_DIRECTORY names more than one folder" ;; esac
+  case $dir in "$RUN_ROOT"/?*) ;; *) die "RUNTIME_DIRECTORY is not under $RUN_ROOT/" ;; esac
+  case /$dir/ in */../* | */./*) die "RUNTIME_DIRECTORY has a . or .. part" ;; esac
+  { [ -d "$dir" ] && [ ! -L "$dir" ]; } || die "RUNTIME_DIRECTORY is not a real folder"
+  [ -O "$dir" ] || die "RUNTIME_DIRECTORY is not owned by the calling user"
+  [ -n "$(find "$dir" -maxdepth 0 -perm 700)" ] || die "RUNTIME_DIRECTORY must be mode 0700: set RuntimeDirectoryMode=0700 in the unit"
+
+  tmp=$(umask 077; mktemp "$dir/.run.XXXXXX") && err=$(umask 077; mktemp "$dir/.run.XXXXXX") || die "cannot create a temporary file in RUNTIME_DIRECTORY"
+  trap 'rm -f "$tmp" "$err"' EXIT
+  "${BROKER[@]}" run "$group" >"$tmp" 2>"$err" </dev/null || rc=$?
+  if [ $rc -ne 0 ]; then
+    reason=$(head -n1 "$err" | sed 's/^agent-broker: //' | cut -c1-200)
+    die "${reason:-the broker call failed (exit $rc)}"
+  fi
+
+  # Read every record first; write only when all of them are sound.
+  n=$(tr -cd '\0' <"$tmp" | wc -c | tr -d ' ')
+  [ $((n % 3)) -eq 0 ] || die "the broker's answer is garbled"
+  local kinds=() names=() values=() kind name value
+  while [ ${#names[@]} -lt $((n / 3)) ] && IFS= read -r -d '' kind && IFS= read -r -d '' name && IFS= read -r -d '' value; do
+    case $kind in
+      file) [[ $name =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && $name != env && $name != *..* ]] || die "the broker gave a bad file name" ;;
+      env) [[ $name =~ ^[A-Z][A-Z0-9_]*$ && $value != *$'\n'* ]] || die "the broker gave a bad env record" ;;
+      *) die "the broker's answer is garbled" ;;
+    esac
+    kinds+=("$kind") names+=("$name") values+=("$value")
+  done <"$tmp"
+  [ ${#names[@]} -eq $((n / 3)) ] || die "the broker's answer is garbled"
+
+  rm -f "$dir/env"
+  local esc
+  for i in "${!names[@]}"; do
+    if [ "${kinds[$i]}" = file ]; then
+      (umask 077; printf '%s' "${values[$i]}" >"$dir/${names[$i]}") || die "cannot write ${names[$i]} into RUNTIME_DIRECTORY"
+    else
+      esc=${values[$i]//\\/\\\\}
+      esc=${esc//\"/\\\"}
+      (umask 077; printf '%s="%s"\n' "${names[$i]}" "$esc" >>"$dir/env") || die "cannot write the env file into RUNTIME_DIRECTORY"
+    fi
+  done
+  cat "$err" >&2 # warnings (an optional key without a value)
+  status "$job" ok "keys delivered to $unit"
+  exit 0
+}
+
 
 case "${1:-}" in
+  run) run_group "$@" ;;
   init)
     "${BROKER[@]}" "$@" || exit $?
     for a in "$@"; do case "$a" in --list | --no-agents-md) exit 0 ;; esac; done
