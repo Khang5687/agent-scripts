@@ -11,7 +11,7 @@ import { createNetlifySite, createReadOnlyUser, lookup, verifyPins } from './acc
 import {
   CA_FILE, DIR, KEY, LINUX, NAME, SERVICES, UsageError, allSecretValues, assertNoSecret, assertUnclaimed, audit, checkName,
   checkRelative, effectiveStack, fail, gitRoot, listGroups, listProjects, listStacks, loadGroup, loadGroupSecrets, loadProject,
-  loadSecrets, loadStack, loadStackSecrets, makeScrubber, mkdirs, parseArgs, projectSecrets, resolveProject, run,
+  loadSecrets, loadStack, loadStackSecrets, loadSyncState, makeScrubber, mkdirs, parseArgs, projectSecrets, resolveProject, run,
   saveProject, saveSecrets, sandboxReady,
   stackFromAgentsMd, syncProject,
 } from './lib.mjs';
@@ -458,8 +458,8 @@ async function stacksList() {
   const projects = await Promise.all((await listProjects()).map(async (n) => [n, await effectiveStack(await loadProject(n))]));
   for (const name of await listStacks()) {
     const s = await loadStack(name);
-    out.push({ stack: name, is_default: name === 'global', accounts: s.accounts ?? {}, keys: Object.keys(await loadStackSecrets(name)).sort(),
-      projects: projects.filter(([, st]) => st === name).map(([n]) => n), note: s.note });
+    out.push({ stack: name, is_default: name === 'global', ...(s.followsMac ? { follows_mac: true } : {}), accounts: s.accounts ?? {},
+      keys: Object.keys(await loadStackSecrets(name)).sort(), projects: projects.filter(([, st]) => st === name).map(([n]) => n), note: s.note });
   }
   json(out);
   return 0;
@@ -848,6 +848,7 @@ async function health() {
   const causes = [];
   const stops = new Set();
   const notes = [];
+  const macNotes = [];
   let groups = 0;
   let grants = 0;
   for (const name of await listGroups()) {
@@ -888,10 +889,17 @@ async function health() {
       }
     }
   }
+  // Stacks that follow the Mac: when the last copy arrived. A note only: this side cannot know what the Mac still has queued.
+  const sync = await loadSyncState().catch(() => ({}));
+  for (const name of await listStacks()) {
+    if (!(await loadStack(name).catch(() => null))?.followsMac) continue;
+    const last = Object.values(sync[name] ?? {}).map((e) => e?.at).filter(Boolean).sort().at(-1);
+    macNotes.push(`stack ${name}: last copy from the Mac ${last ?? 'never'}`);
+  }
   const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
   const line = causes.length
     ? `broker broken (${causes.join('; ')}), so ${[...stops].join(', ')} cannot get keys`
-    : `ok: ${plural(groups, 'group')}, ${plural(grants, 'grant')}${notes.length ? `; optional without a value: ${notes.join(', ')}` : ''}`;
+    : `ok: ${plural(groups, 'group')}, ${plural(grants, 'grant')}${notes.length ? `; optional without a value: ${notes.join(', ')}` : ''}${macNotes.length ? `; ${macNotes.join('; ')}` : ''}`;
   process.stdout.write(`${line.replace(/[\r\n]+/g, ' ')}\n`);
   return causes.length ? 1 : 0;
 }

@@ -29,6 +29,8 @@ export const DIR = {
   queue: path.join(HOME, 'queue'), //                 <id>.json        admin queries waiting for approval
   log: path.join(HOME, 'log'), //                     broker.log       one line per call, no secret values
   tmp: path.join(HOME, 'tmp'),
+  sync: path.join(HOME, 'sync'), //                   seq.json         last copy received from the sending machine, per stack and key
+  ssh: path.join(HOME, '.ssh'), //                    authorized_keys  the one forced-command key of the sending machine
 };
 
 /** Account tokens live in the stack; a project value of the same name overrides it (e.g. a project-scoped token). */
@@ -326,11 +328,25 @@ export async function assertUnclaimed(folder) {
   }
 }
 
-async function writePrivate(file, body) {
+export async function writePrivate(file, body) {
   const tmp = `${file}.${process.pid}.tmp`;
   await fs.writeFile(tmp, body, { mode: 0o600 });
   await fs.rename(tmp, file);
 }
+
+/**
+ * What the sending machine last delivered, for stacks that follow it: { <stack>: { <KEY>: { seq, at } } }. A delete is
+ * remembered like a value, so an old copy can never bring a deleted or rotated token back.
+ */
+export async function loadSyncState() {
+  try {
+    return JSON.parse(await fs.readFile(path.join(DIR.sync, 'seq.json'), 'utf8'));
+  } catch (e) {
+    if (e.code === 'ENOENT') return {};
+    throw e;
+  }
+}
+export const saveSyncState = (state) => writePrivate(path.join(DIR.sync, 'seq.json'), `${JSON.stringify(state, null, 2)}\n`);
 
 export async function audit(entry) {
   const line = `${new Date().toISOString()} ${JSON.stringify(entry)}\n`;
@@ -403,7 +419,7 @@ export function assertNoSecret(buf, values, what) {
 // agents write it: a path there could point at the broker's token files and upload them. Every CLI runs in a sandbox
 // (sandbox-exec on macOS, bwrap on Linux) that cannot read or write the broker's own folders, except its working folder
 // and a private temp folder.
-const PRIVATE = ['stackSecrets', 'secrets', 'groupSecrets', 'groups', 'stacks', 'projects', 'queue', 'log', 'work', 'tmp'];
+const PRIVATE = ['stackSecrets', 'secrets', 'groupSecrets', 'groups', 'stacks', 'projects', 'queue', 'log', 'work', 'tmp', 'sync', 'ssh'];
 
 async function sandboxProfile(allowed) {
   const sub = (dirs) => dirs.map((d) => `(subpath ${JSON.stringify(d)})`).join(' ');

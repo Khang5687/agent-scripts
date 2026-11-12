@@ -3,15 +3,17 @@
 // _deployer through `sudo -u _deployer` WITH the owner's password / Touch ID (wrapper /usr/local/bin/agent-broker-admin),
 // so agents cannot use it. Values arrive on stdin and are never printed. The wizard (scripts/wizard.sh) drives it:
 // one `apply` per wizard action, so one approval each. Guide: agent-scripts/skills/agent-broker/SKILL.md
+import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
+import { isIP } from 'node:net';
 import path from 'node:path';
 import readline from 'node:readline/promises';
 import { accountLabel, createNetlifySite, lookup, verifyPins } from './accounts.mjs';
 import {
-  ACCOUNT_KEYS, DIR, KEY, SERVICES, UsageError, allSecretValues, audit, checkGrantFile, checkName, checkUnit, fail,
+  ACCOUNT_KEYS, DIR, KEY, NAME, ROOT, SERVICES, UsageError, allSecretValues, audit, checkGrantFile, checkName, checkUnit, fail,
   listGroups, listProjects, listStacks, loadGroup, loadGroupSecrets, loadProject, loadSecrets, loadStack,
-  loadStackSecrets, makeScrubber, mkdirs, parseArgs, projectSecrets, run, saveGroup, saveGroupSecrets, saveProject,
-  saveSecrets, saveStack, saveStackSecrets, validateGrants,
+  loadStackSecrets, loadSyncState, makeScrubber, mkdirs, parseArgs, projectSecrets, run, saveGroup, saveGroupSecrets,
+  saveProject, saveSecrets, saveStack, saveStackSecrets, saveSyncState, validateGrants, writePrivate,
 } from './lib.mjs';
 
 const HELP = `agent-broker-admin <command>   (asks for your password every time; Touch ID on a Mac)
@@ -39,7 +41,12 @@ On a Mac usually run by the wizard: ~/git/agent-scripts/skills/agent-broker/scri
                                   run as yourself: backs up to F.pre-broker, stores the keys, rewrites the lines, one password
   unset <project> <KEY> | unset-stack <stack> <KEY> | unset-group <group> <KEY>
   list                            stacks, projects and groups (key names and grants, never values)
-  remove-project <name> | remove-stack <name> | remove-group <name>
+  remove-project <name> | remove-stack <name> [--stop-following] | remove-group <name>
+                                  a stack that follows the Mac is changed there; --stop-following drops it here only
+  receive-from-mac                the Mac's one forced SSH command: one JSON line on stdin (stack, key, value, seq); not for typing
+  trust-mac '<ssh-ed25519 key line>' --from <address>    let the Mac send tokens: writes the one restricted key line
+                                  (this machine's SSH host keys are printed: pin them on the Mac)
+  untrust-mac                     removes that key line
   pending | approve <id> | reject <id>               Supabase admin queries waiting for you
   log [lines]                     recent broker calls`;
 
@@ -176,6 +183,7 @@ async function apply(args) {
   const moveFrom = opts['stack-from-project'] && checkName(opts['stack-from-project']);
   if (opts.stack) {
     checkName(opts.stack, 'stack');
+    if (values.stack && (Object.keys(values.stack).length || moveFrom)) await assertLocalStack(opts.stack);
     const known = await exists(listStacks, opts.stack);
     if (opts['new-stack'] && known) fail(`stack ${opts.stack} already exists`);
     if (!opts['new-stack'] && !known) fail(`unknown stack ${opts.stack} (add --new-stack to create it)`);
@@ -294,7 +302,7 @@ async function lookupStack(name) {
 async function list() {
   for (const name of await listStacks()) {
     const s = await loadStack(name);
-    console.log(JSON.stringify({ stack: name, accounts: s.accounts, keys: Object.keys(await loadStackSecrets(name)).sort(), note: s.note }, null, 2));
+    console.log(JSON.stringify({ stack: name, accounts: s.accounts, keys: Object.keys(await loadStackSecrets(name)).sort(), note: s.note, followsMac: s.followsMac }, null, 2));
   }
   for (const name of await listProjects()) {
     const p = await loadProject(name);
@@ -316,6 +324,7 @@ const KINDS = {
 async function setValues(kind, name, entries) {
   const k = KINDS[kind];
   checkName(name, kind);
+  if (kind === 'stack') await assertLocalStack(name);
   await k.load(name);
   const secrets = await k.loadSecrets(name);
   for (const [key, v] of entries) {
@@ -332,6 +341,7 @@ async function setValues(kind, name, entries) {
 
 async function unset(kind, name, key) {
   const k = KINDS[kind];
+  if (kind === 'stack') await assertLocalStack(name);
   const secrets = await k.loadSecrets(checkName(name, kind));
   if (!(key in secrets)) fail(`${kind} ${name} has no ${key}`);
   delete secrets[key];
@@ -388,14 +398,14 @@ async function pending() {
   return 0;
 }
 
-async function remove(kind, name) {
+async function remove(kind, name, stopFollowing = false) {
   if (kind === 'group') {
     checkName(name, 'group');
     await loadGroup(name);
     for (const f of [path.join(DIR.groups, `${name}.json`), path.join(DIR.groupSecrets, `${name}.env`)]) await fs.rm(f, { force: true });
   } else if (kind === 'stack') {
     checkName(name, 'stack');
-    await loadStack(name);
+    if ((await loadStack(name)).followsMac && !stopFollowing) fail('this stack follows the Mac; change it there (to drop it on this machine only: remove-stack NAME --stop-following)');
     for (const p of await listProjects()) if ((await loadProject(p)).stack === name) fail(`project ${p} still uses stack ${name}: move it first`);
     for (const f of [path.join(DIR.stacks, `${name}.json`), path.join(DIR.stackSecrets, `${name}.env`)]) await fs.rm(f, { force: true });
   } else {
@@ -424,6 +434,197 @@ function envValue(key, raw) {
   return out.replaceAll('$$', '$');
 }
 
+// ---- Copy from the sending machine (a Mac) -------------------------------------------------------------------------
+
+/** A refusal with a code the sender can act on. Exit 2 = refused for good, 3 = stale (already applied or replaced), 4 = busy (retry). */
+class Refused extends UsageError {
+  constructor(code, message, exit = 2) {
+    super(`refused (${code}): ${message}`);
+    this.exit = exit;
+  }
+}
+
+/** Stacks that follow the Mac are changed there only: one source of truth. */
+async function assertLocalStack(name) {
+  const s = await loadStack(checkName(name, 'stack')).catch(() => null);
+  if (s?.followsMac) fail('this stack follows the Mac; change it there');
+}
+
+const SYNC_LINE_MAX = 64 * 1024;
+
+/** stdin must hold exactly one line (a final newline is fine), at most SYNC_LINE_MAX bytes. */
+async function readMessageLine() {
+  if (process.stdin.isTTY) throw new Refused('bad-message', 'no message on stdin');
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of process.stdin) {
+    size += chunk.length;
+    if (size > SYNC_LINE_MAX + 1) throw new Refused('too-large', `the message is longer than ${SYNC_LINE_MAX} bytes`);
+    chunks.push(chunk);
+  }
+  const text = Buffer.concat(chunks).toString('utf8');
+  const line = text.endsWith('\n') ? text.slice(0, -1) : text;
+  if (!line) throw new Refused('bad-message', 'the message is empty');
+  if (/[\r\n]/.test(line)) throw new Refused('bad-message', 'the message must be one line');
+  return line;
+}
+
+const text = (v, max) => typeof v === 'string' && v.length <= max && !/[\u0000-\u001f\u007f]/.test(v);
+
+/** Account labels as the stack record holds them (name, email, teams, orgs per service); anything else is dropped. */
+function cleanAccounts(raw) {
+  const out = {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  for (const service of SERVICES) {
+    const a = raw[service];
+    if (!a || typeof a !== 'object' || Array.isArray(a)) continue;
+    const label = {};
+    for (const f of ['name', 'email']) if (text(a[f], 200)) label[f] = a[f];
+    for (const f of ['teams', 'orgs']) if (Array.isArray(a[f]) && a[f].length <= 50 && a[f].every((t) => text(t, 100))) label[f] = a[f];
+    if (Object.keys(label).length) out[service] = label;
+  }
+  return out;
+}
+
+function parseMessage(line) {
+  let msg;
+  try {
+    msg = JSON.parse(line);
+  } catch {
+    throw new Refused('bad-message', 'the message is not JSON');
+  }
+  if (!msg || typeof msg !== 'object' || Array.isArray(msg)) throw new Refused('bad-message', 'the message must be a JSON object');
+  for (const f of Object.keys(msg)) if (!['v', 'stack', 'key', 'value', 'seq', 'accounts'].includes(f)) throw new Refused('bad-message', `unknown field ${JSON.stringify(f.slice(0, 40))}`);
+  if (msg.v !== 1) throw new Refused('bad-version', 'v must be 1');
+  if (typeof msg.stack !== 'string' || !NAME.test(msg.stack)) throw new Refused('bad-stack', 'invalid stack name');
+  if (!ACCOUNT_KEYS.includes(msg.key)) throw new Refused('bad-key', `only account tokens are accepted (${ACCOUNT_KEYS.join(', ')})`);
+  if (!Number.isSafeInteger(msg.seq) || msg.seq < 1) throw new Refused('bad-seq', 'seq must be a positive integer');
+  if (msg.value !== null && (typeof msg.value !== 'string' || !msg.value || /[\r\n\0]/.test(msg.value))) {
+    throw new Refused('bad-value', 'value must be null (delete) or a non-empty text without line breaks');
+  }
+  return msg;
+}
+
+/** One copy at a time: a lock folder (stale after 30 s). */
+async function withSyncLock(fn) {
+  const lock = path.join(DIR.sync, 'lock');
+  for (let tries = 0; ; tries++) {
+    try {
+      await fs.mkdir(lock, { mode: 0o700 });
+      break;
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      const born = (await fs.stat(lock).catch(() => null))?.mtimeMs ?? Date.now();
+      if (Date.now() - born > 30000) await fs.rmdir(lock).catch(() => {});
+      else if (tries > 100) throw new Refused('busy', 'another copy is being stored; try again', 4);
+      else await new Promise((r) => setTimeout(r, 50));
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    await fs.rmdir(lock).catch(() => {});
+  }
+}
+
+async function storeCopy(msg) {
+  const known = await exists(listStacks, msg.stack);
+  const stack = known ? await loadStack(msg.stack) : { accounts: {} };
+  if (known && !stack.followsMac) throw new Refused('local-stack', 'this stack was made here; it does not follow the Mac');
+  const state = await loadSyncState();
+  const last = state[msg.stack]?.[msg.key]?.seq ?? 0;
+  if (msg.seq <= last) throw new Refused('stale-seq', `seq ${msg.seq} is not higher than ${last} for ${msg.key} in stack ${msg.stack}`, 3);
+  const secrets = known ? await loadStackSecrets(msg.stack) : {};
+  if (msg.value === null) delete secrets[msg.key];
+  else secrets[msg.key] = msg.value;
+  // Value first, the remembered seq last: a crash in between lets the sender's retry land instead of being called stale.
+  await saveStack(msg.stack, { ...stack, followsMac: true, accounts: { ...stack.accounts, ...cleanAccounts(msg.accounts) } });
+  await saveStackSecrets(msg.stack, secrets);
+  await saveSyncState({ ...state, [msg.stack]: { ...state[msg.stack], [msg.key]: { seq: msg.seq, at: new Date().toISOString() } } });
+  return msg.value === null ? `deleted ${msg.key} from stack ${msg.stack} (seq ${msg.seq})` : `stored ${msg.key} in stack ${msg.stack} (seq ${msg.seq})`;
+}
+
+/**
+ * The forced command of the Mac's SSH key. Everything it trusts is one JSON line on stdin; SSH_ORIGINAL_COMMAND and any
+ * other argument are ignored. Prints one line without the value; the audit line has stack, key, seq and the result.
+ */
+async function receiveFromMac() {
+  const seen = {};
+  try {
+    const msg = parseMessage(await readMessageLine());
+    Object.assign(seen, { stack: msg.stack, key: msg.key, seq: msg.seq });
+    const line = await withSyncLock(() => storeCopy(msg));
+    await audit({ admin: 'receive-from-mac', ...seen, result: line.split(' ')[0] });
+    console.log(line);
+    return 0;
+  } catch (e) {
+    if (e instanceof UsageError) await audit({ admin: 'receive-from-mac', ...seen, result: e.message });
+    throw e;
+  }
+}
+
+const TRUST_MARK = '# agent-broker:trust-mac';
+const SSH_KEY = /^ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI[A-Za-z0-9+/]{43}( [A-Za-z0-9@._+ -]{1,100})?$/;
+const authorizedKeys = () => path.join(DIR.ssh, 'authorized_keys');
+
+async function readKeyLines() {
+  const raw = await fs.readFile(authorizedKeys(), 'utf8').catch((e) => (e.code === 'ENOENT' ? '' : Promise.reject(e)));
+  return raw.split('\n').filter(Boolean);
+}
+
+async function writeKeyLines(lines) {
+  await fs.mkdir(DIR.ssh, { recursive: true, mode: 0o700 });
+  await fs.chmod(DIR.ssh, 0o700);
+  await writePrivate(authorizedKeys(), lines.length ? `${lines.join('\n')}\n` : '');
+}
+
+/** This machine's SSH host public keys (type and key only), to pin on the sending side: it must never trust on first use. */
+async function hostKeys() {
+  const dir = process.env.AGENT_BROKER_DEV_ROOT ? path.join(process.env.AGENT_BROKER_DEV_ROOT, 'etc-ssh') : '/etc/ssh';
+  const out = [];
+  for (const f of (await fs.readdir(dir).catch(() => [])).filter((n) => /^ssh_host_.*_key\.pub$/.test(n)).sort()) {
+    const [type, key] = (await fs.readFile(path.join(dir, f), 'utf8').catch(() => '')).trim().split(/\s+/);
+    if (type && key) out.push(`${type} ${key}`);
+  }
+  return { dir, out };
+}
+
+async function trustMac(args) {
+  const { opts, positional } = parseArgs(args, { from: 'string' });
+  const key = positional.join(' ');
+  if (/[\r\n]/.test(key)) fail('give one key line (no line breaks)');
+  if (!SSH_KEY.test(key)) fail("the key must be one plain ssh-ed25519 public key line: ssh-ed25519 AAAA... [comment] (no options, no other key type)");
+  const from = opts.from ?? fail('--from <address> is required: the sending machine\'s address (IPv4 or IPv6)');
+  if (!/^[0-9A-Fa-f:.]+$/.test(from) || !isIP(from)) fail(`--from must be a plain IPv4 or IPv6 address: ${from.slice(0, 60)}`);
+  const command = `${path.join(ROOT, 'bin', 'agent-broker-admin.mjs')} receive-from-mac`;
+  if (!/^[\w./ -]+$/.test(command)) fail('the installed admin path has characters that cannot go in an authorized_keys command');
+  const ours = `restrict,from="${from}",command="${command}" ${key} ${TRUST_MARK}`;
+  const lines = await readKeyLines();
+  const others = lines.filter((l) => !l.endsWith(TRUST_MARK));
+  for (const l of others) if (!l.startsWith('#')) console.error(`warning: ${authorizedKeys()} has a key line agent-broker did not write (left alone; it may let someone in): ${l.slice(0, 50)}...`);
+  await writeKeyLines([...others, ours]);
+  const fingerprint = `SHA256:${createHash('sha256').update(Buffer.from(key.split(' ')[1], 'base64')).digest('base64').replace(/=+$/, '')}`;
+  await audit({ admin: 'trust-mac', from, fingerprint });
+  console.log(`trusted ${fingerprint} from ${from}; it may run only: ${command}`);
+  const { dir, out } = await hostKeys();
+  if (!out.length) console.log(`no SSH host keys found in ${dir}: is sshd installed here? Pin the host key on the sending machine once it is.`);
+  for (const k of out) console.log(`host key (pin it on the sending machine, never trust on first use): ${k}`);
+  return 0;
+}
+
+async function untrustMac() {
+  const lines = await readKeyLines();
+  const kept = lines.filter((l) => !l.endsWith(TRUST_MARK));
+  if (kept.length === lines.length) {
+    console.log('no trust-mac key line to remove');
+    return 0;
+  }
+  await writeKeyLines(kept);
+  await audit({ admin: 'untrust-mac' });
+  console.log('removed the trust-mac key line');
+  return 0;
+}
+
 async function main([cmd, ...args]) {
   await mkdirs();
   process.chdir(DIR.tmp);
@@ -433,6 +634,9 @@ async function main([cmd, ...args]) {
     case 'list': return list();
     case 'set': return setValues('project', args[0], [[args[1], (await readStdin()).replace(/\r?\n$/, '')]]);
     case 'set-stack': return setValues('stack', args[0], [[args[1], (await readStdin()).replace(/\r?\n$/, '')]]);
+    case 'receive-from-mac': return receiveFromMac();
+    case 'trust-mac': return trustMac(args);
+    case 'untrust-mac': return untrustMac();
     case 'import': {
       const entries = pairs(await readStdin()).map(([k, v]) => [k, envValue(k, v)]);
       if (!entries.length) fail('no KEY=VALUE lines on stdin');
@@ -449,7 +653,11 @@ async function main([cmd, ...args]) {
     }
     case 'unset-group': return unset('group', args[0], args[1]);
     case 'remove-group': return remove('group', args[0]);
-    case 'remove-stack': return remove('stack', args[0]);
+    case 'remove-stack': {
+      const flags = args.slice(1);
+      if (flags.some((f) => f !== '--stop-following')) fail(`unknown option ${flags.find((f) => f !== '--stop-following')}`);
+      return remove('stack', args[0], flags.length > 0);
+    }
     case 'pending': return pending();
     case 'approve': return approve(args[0]);
     case 'reject': return reject(args[0]);
@@ -470,6 +678,6 @@ main(process.argv.slice(2)).then(
   async (e) => {
     const msg = e instanceof UsageError ? e.message : `internal error: ${e?.message ?? e}`;
     console.error(`agent-broker-admin: ${makeScrubber(await allSecretValues().catch(() => []))(msg)}`);
-    process.exitCode = e instanceof UsageError ? 2 : 1;
+    process.exitCode = e instanceof Refused ? e.exit : e instanceof UsageError ? 2 : 1;
   },
 );

@@ -1224,3 +1224,221 @@ test('cloud action with no working bwrap: one line that names the fix, before an
   assert.equal(await fs.lstat(log).catch(() => null), null);
   assert.ok(!(await fs.readFile(envLog, 'utf8')).includes(tok));
 });
+
+// ---- Copy from the sending machine: receive-from-mac, trust-mac ---------------------------------------------------
+
+const SYNC_VALUE = 'nfp_SYNCtokenVALUE0123456789abcdef';
+const SYNC_ROTATED = 'nfp_SYNCrotatedVALUE0123456789abcd';
+const send = (o, extra = '') => admin(['receive-from-mac'], `${JSON.stringify({ v: 1, stack: 'macshared', key: 'NETLIFY_AUTH_TOKEN', value: SYNC_VALUE, seq: 1, ...o })}\n${extra}`);
+const stackFile = (name) => path.join(dev, 'home', 'stacks', `${name}.json`);
+const tokenFile = (name) => path.join(dev, 'home', 'stack-secrets', `${name}.env`);
+const readText = (file) => fs.readFile(file, 'utf8').catch(() => null);
+
+test('receive-from-mac: first copy creates a marked stack; only a higher seq replaces; a delete is remembered', async () => {
+  const first = send({ accounts: { netlify: { email: 'a@b.c', teams: ['demo'], evil: 'x' }, bogus: { name: 'x' }, apify: 'not an object' } });
+  assert.equal(first.status, 0, first.stderr);
+  assert.equal(first.stdout, 'stored NETLIFY_AUTH_TOKEN in stack macshared (seq 1)\n');
+  const record = JSON.parse(await fs.readFile(stackFile('macshared'), 'utf8'));
+  assert.equal(record.followsMac, true);
+  assert.deepEqual(record.accounts, { netlify: { email: 'a@b.c', teams: ['demo'] } }); // unknown fields and services dropped
+  assert.equal(await readText(tokenFile('macshared')), `NETLIFY_AUTH_TOKEN=${SYNC_VALUE}\n`);
+
+  const second = send({ seq: 2, value: SYNC_ROTATED });
+  assert.equal(second.status, 0, second.stderr);
+  assert.equal(await readText(tokenFile('macshared')), `NETLIFY_AUTH_TOKEN=${SYNC_ROTATED}\n`);
+  for (const seq of [2, 1]) { // equal and lower: refused as stale (exit 3), nothing changes
+    const old = send({ seq, value: SYNC_VALUE });
+    assert.equal(old.status, 3);
+    assert.match(old.stderr, /refused \(stale-seq\): seq \d is not higher than 2 for NETLIFY_AUTH_TOKEN in stack macshared/);
+  }
+  assert.equal(await readText(tokenFile('macshared')), `NETLIFY_AUTH_TOKEN=${SYNC_ROTATED}\n`);
+
+  const other = send({ key: 'VERCEL_TOKEN', value: 'vercel-token-value', seq: 1 }); // seq is per key
+  assert.equal(other.status, 0, other.stderr);
+
+  const gone = send({ value: null, seq: 3 });
+  assert.equal(gone.status, 0, gone.stderr);
+  assert.equal(gone.stdout, 'deleted NETLIFY_AUTH_TOKEN from stack macshared (seq 3)\n');
+  assert.equal(await readText(tokenFile('macshared')), 'VERCEL_TOKEN=vercel-token-value\n');
+  const back = send({ value: SYNC_ROTATED, seq: 2 }); // an old copy cannot bring a deleted token back
+  assert.equal(back.status, 3);
+  assert.equal(await readText(tokenFile('macshared')), 'VERCEL_TOKEN=vercel-token-value\n');
+  const state = JSON.parse(await fs.readFile(path.join(dev, 'home', 'sync', 'seq.json'), 'utf8'));
+  assert.equal(state.macshared.NETLIFY_AUTH_TOKEN.seq, 3);
+  assert.equal(state.macshared.VERCEL_TOKEN.seq, 1);
+
+  // The forced command ignores SSH_ORIGINAL_COMMAND and extra arguments.
+  const viaSsh = spawnSync(process.execPath, [path.join(BIN, 'agent-broker-admin.mjs'), 'receive-from-mac', 'rm', '-rf', '/'], {
+    env: { ...env, SSH_ORIGINAL_COMMAND: 'rm -rf /' }, encoding: 'utf8',
+    input: `${JSON.stringify({ v: 1, stack: 'macshared', key: 'APIFY_TOKEN', value: 'apify-value', seq: 1 })}\n`,
+  });
+  assert.equal(viaSsh.status, 0, viaSsh.stderr);
+  assert.equal(await readText(tokenFile('macshared')), 'APIFY_TOKEN=apify-value\nVERCEL_TOKEN=vercel-token-value\n');
+
+  // Never a value in any output or in the audit log.
+  const audit = await fs.readFile(path.join(dev, 'home', 'log', 'broker.log'), 'utf8');
+  assert.match(audit, /receive-from-mac.*"seq":3.*deleted/);
+  for (const v of [SYNC_VALUE, SYNC_ROTATED, 'vercel-token-value', 'apify-value']) {
+    for (const r of [first, second, other, gone, back, viaSsh]) assert.ok(!(r.stdout + r.stderr).includes(v));
+    assert.ok(!audit.includes(v));
+  }
+});
+
+test('receive-from-mac refuses what it should not trust, and changes nothing', async () => {
+  const stateBefore = await readText(path.join(dev, 'home', 'sync', 'seq.json'));
+  const good = { v: 1, stack: 'refusals', key: 'NETLIFY_AUTH_TOKEN', value: SYNC_VALUE, seq: 1 };
+  const bad = {
+    'a key that is not an account token': [{ ...good, key: 'DATABASE_URL' }, /\(bad-key\)/],
+    'a bad stack name': [{ ...good, stack: 'Bad Name' }, /\(bad-stack\)/],
+    'a path as the stack name': [{ ...good, stack: '../stacks/x' }, /\(bad-stack\)/],
+    'v 2': [{ ...good, v: 2 }, /\(bad-version\)/],
+    'a value with a line break': [{ ...good, value: 'a\nb' }, /\(bad-value\)/],
+    'an empty value': [{ ...good, value: '' }, /\(bad-value\)/],
+    'a number as the value': [{ ...good, value: 5 }, /\(bad-value\)/],
+    'seq 0': [{ ...good, seq: 0 }, /\(bad-seq\)/],
+    'a fractional seq': [{ ...good, seq: 1.5 }, /\(bad-seq\)/],
+    'a seq beyond the safe integers': [{ ...good, seq: 2 ** 60 }, /\(bad-seq\)/],
+    'an unknown field': [{ ...good, command: 'x' }, /\(bad-message\)/],
+  };
+  for (const [what, [message, pattern]] of Object.entries(bad)) {
+    const r = admin(['receive-from-mac'], `${JSON.stringify(message)}\n`);
+    assert.equal(r.status, 2, `${what}: ${r.stderr}`);
+    assert.match(r.stderr, pattern, what);
+    assert.ok(!(r.stdout + r.stderr).includes(SYNC_VALUE), what);
+  }
+  const line = JSON.stringify(good);
+  const shape = {
+    'two lines': [`${line}\n${line}\n`, /one line/],
+    'bad JSON': ['{"v":1,', /not JSON/],
+    'an array': ['[1]\n', /JSON object/],
+    'nothing': ['', /empty/],
+    'an oversized line': [`${JSON.stringify({ ...good, value: 'x'.repeat(70000) })}\n`, /\(too-large\)/],
+  };
+  for (const [what, [input, pattern]] of Object.entries(shape)) {
+    const r = admin(['receive-from-mac'], input);
+    assert.equal(r.status, 2, `${what}: ${r.stderr}`);
+    assert.match(r.stderr, pattern, what);
+  }
+  assert.equal(await readText(stackFile('refusals')), null);
+  assert.equal(await readText(tokenFile('refusals')), null);
+  assert.equal(await readText(path.join(dev, 'home', 'sync', 'seq.json')), stateBefore);
+
+  // A stack made here never takes copies: it does not follow the Mac.
+  ok(admin(['apply', '--stack', 'localone', '--new-stack'], 'stack:NETLIFY_AUTH_TOKEN=local-token-value\n'));
+  const mine = send({ stack: 'localone', value: SYNC_VALUE, seq: 9 });
+  assert.equal(mine.status, 2);
+  assert.match(mine.stderr, /refused \(local-stack\): this stack was made here; it does not follow the Mac/);
+  assert.equal(await readText(tokenFile('localone')), 'NETLIFY_AUTH_TOKEN=local-token-value\n');
+  assert.equal(JSON.parse(await fs.readFile(stackFile('localone'), 'utf8')).followsMac, undefined);
+  assert.equal(JSON.parse(await readText(path.join(dev, 'home', 'sync', 'seq.json'))).localone, undefined);
+});
+
+test('a stack that follows the Mac cannot be changed here; list and stacks show the mark; health notes the last copy', async () => {
+  const refused = /this stack follows the Mac; change it there/;
+  for (const [what, r] of Object.entries({
+    'set-stack': admin(['set-stack', 'macshared', 'APIFY_TOKEN'], 'other-value'),
+    'unset-stack': admin(['unset-stack', 'macshared', 'APIFY_TOKEN']),
+    'apply with a stack value': admin(['apply', '--stack', 'macshared'], 'stack:APIFY_TOKEN=other-value\n'),
+    'remove-stack': admin(['remove-stack', 'macshared']),
+  })) {
+    assert.equal(r.status, 2, what);
+    assert.match(r.stderr, refused, what);
+  }
+  assert.equal(await readText(tokenFile('macshared')), 'APIFY_TOKEN=apify-value\nVERCEL_TOKEN=vercel-token-value\n');
+  const listed = ok(admin(['list'])).stdout.split('\n}\n').filter(Boolean).map((b) => JSON.parse(`${b}\n}`));
+  assert.equal(listed.find((s) => s.stack === 'macshared').followsMac, true);
+  assert.equal(listed.find((s) => s.stack === 'localone').followsMac, undefined);
+  const stacks = JSON.parse(ok(broker(['stacks'])).stdout);
+  assert.equal(stacks.find((s) => s.stack === 'macshared').follows_mac, true);
+  assert.equal(stacks.find((s) => s.stack === 'localone').follows_mac, undefined);
+  assert.equal(stacks.find((s) => s.stack === 'macshared').keys.includes('VERCEL_TOKEN'), true);
+
+  // A project may still use the stack; the way out is explicit and keeps the seq memory.
+  const app = await folder('followapp');
+  ok(admin(['apply', '--stack', 'macshared', '--project', 'followapp', '--new-project', '--path', app]));
+  assert.match(admin(['remove-stack', 'macshared', '--stop-following']).stderr, /project followapp still uses stack macshared/);
+  ok(admin(['remove-project', 'followapp']));
+  assert.match(admin(['remove-stack', 'macshared', '--frobnicate']).stderr, /unknown option/);
+  ok(admin(['remove-stack', 'macshared', '--stop-following']));
+  assert.equal(await readText(stackFile('macshared')), null);
+  assert.equal(send({ value: SYNC_VALUE, seq: 3 }).status, 3); // the old copy still cannot come back
+  assert.equal(send({ value: SYNC_VALUE, seq: 4 }).status, 0); // a newer one recreates the stack
+  assert.equal(JSON.parse(await fs.readFile(stackFile('macshared'), 'utf8')).followsMac, true);
+});
+
+test('trust-mac writes exactly one restricted key line and prints the host keys; untrust-mac removes it', async () => {
+  const key = `ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI${'Abc1'.repeat(11).slice(0, 43)}`;
+  const authFile = path.join(dev, 'home', '.ssh', 'authorized_keys');
+  const hostDir = path.join(dev, 'etc-ssh');
+  await fs.mkdir(hostDir, { recursive: true });
+  await fs.writeFile(path.join(hostDir, 'ssh_host_ed25519_key.pub'), 'ssh-ed25519 AAAAHOSTed25519 root@somewhere\n');
+  await fs.writeFile(path.join(hostDir, 'ssh_host_rsa_key.pub'), 'ssh-rsa AAAAHOSTrsa root@somewhere\n');
+  await fs.writeFile(path.join(hostDir, 'ssh_host_ed25519_key'), 'PRIVATE-HOST-KEY\n');
+
+  const first = ok(admin(['trust-mac', `${key} mac-broker`, '--from', '100.64.0.7']));
+  const line = /^restrict,from="100\.64\.0\.7",command="[^"]*\/bin\/agent-broker-admin\.mjs receive-from-mac" ssh-ed25519 AAAA\S+ mac-broker # agent-broker:trust-mac$/;
+  const lines = (await fs.readFile(authFile, 'utf8')).split('\n');
+  assert.equal(lines.length, 2); // one line and the final newline
+  assert.match(lines[0], line);
+  assert.equal((await fs.stat(authFile)).mode & 0o777, 0o600);
+  assert.equal((await fs.stat(path.dirname(authFile))).mode & 0o777, 0o700);
+  assert.match(first.stdout, /trusted SHA256:\S+ from 100\.64\.0\.7/);
+  assert.match(first.stdout, /host key \(pin it on the sending machine[^)]*\): ssh-ed25519 AAAAHOSTed25519\n/);
+  assert.match(first.stdout, /ssh-rsa AAAAHOSTrsa/);
+  assert.ok(!first.stdout.includes('PRIVATE-HOST-KEY') && !first.stdout.includes('root@somewhere'));
+
+  // Rerun: replaces its own line, never a second one.
+  ok(admin(['trust-mac', key, '--from', 'fd7a:115c:a1e0::1']));
+  const again = (await fs.readFile(authFile, 'utf8')).trim().split('\n');
+  assert.equal(again.length, 1);
+  assert.match(again[0], /^restrict,from="fd7a:115c:a1e0::1",command="[^"]*receive-from-mac" ssh-ed25519 AAAA\S+ # agent-broker:trust-mac$/);
+
+  // A foreign line is left alone, with a warning.
+  await fs.appendFile(authFile, 'ssh-rsa AAAAB3foreign someone\n');
+  const withForeign = ok(admin(['trust-mac', key, '--from', '100.64.0.7']));
+  assert.match(withForeign.stderr, /warning: .*did not write/);
+  const mixed = (await fs.readFile(authFile, 'utf8')).trim().split('\n');
+  assert.equal(mixed.length, 2);
+  assert.equal(mixed.filter((l) => l.endsWith('# agent-broker:trust-mac')).length, 1);
+  assert.ok(mixed.includes('ssh-rsa AAAAB3foreign someone'));
+
+  // Refused: options, a second line, another key type, a bad or missing address. The file does not change.
+  const before = await fs.readFile(authFile, 'utf8');
+  const refusals = [
+    [[`command="x" ${key}`, '--from', '100.64.0.7'], /plain ssh-ed25519/],
+    [[`restrict ${key}`, '--from', '100.64.0.7'], /plain ssh-ed25519/],
+    [[`${key}\n${key}`, '--from', '100.64.0.7'], /no line breaks/],
+    [[key.replace('ssh-ed25519', 'ssh-rsa'), '--from', '100.64.0.7'], /plain ssh-ed25519/],
+    [[`${key} comment with "quote"`, '--from', '100.64.0.7'], /plain ssh-ed25519/],
+    [[key], /--from/],
+    [[key, '--from', 'example.com'], /plain IPv4 or IPv6/],
+    [[key, '--from', '100.64.0'], /plain IPv4 or IPv6/],
+    [[key, '--from', '100.64.0.7",command="x'], /plain IPv4 or IPv6/],
+    [[key, '--from', 'fe80::1%eth0'], /plain IPv4 or IPv6/],
+  ];
+  for (const [args, pattern] of refusals) {
+    const r = admin(['trust-mac', ...args]);
+    assert.equal(r.status, 2, args.join(' '));
+    assert.match(r.stderr, pattern, args.join(' '));
+  }
+  assert.equal(await fs.readFile(authFile, 'utf8'), before);
+
+  assert.match(ok(admin(['untrust-mac'])).stdout, /removed/);
+  assert.equal(await fs.readFile(authFile, 'utf8'), 'ssh-rsa AAAAB3foreign someone\n');
+  assert.match(ok(admin(['untrust-mac'])).stdout, /no trust-mac key line/);
+  const audit = await fs.readFile(path.join(dev, 'home', 'log', 'broker.log'), 'utf8');
+  assert.match(audit, /"admin":"trust-mac","from":"100\.64\.0\.7","fingerprint":"SHA256:/);
+});
+
+test('health: a stack that follows the Mac gets a note with the time of its last copy', async () => {
+  const hdev = await fs.mkdtemp(path.join(os.tmpdir(), 'agent-broker-health-'));
+  const henv = { ...process.env, AGENT_BROKER_DEV_ROOT: hdev, AGENT_BROKER_SKIP_VERIFY: '1' };
+  const run = (script, args, input) => spawnSync(process.execPath, [path.join(BIN, script), ...args], { cwd: hdev, env: henv, input, encoding: 'utf8' });
+  assert.match(run('agent-broker.mjs', ['health']).stdout, /^ok: 0 groups, 0 grants\n$/);
+  assert.equal(run('agent-broker-admin.mjs', ['receive-from-mac'], `${JSON.stringify({ v: 1, stack: 'demo', key: 'APIFY_TOKEN', value: 'apify-health-value', seq: 7 })}\n`).status, 0);
+  const h = run('agent-broker.mjs', ['health']);
+  assert.equal(h.status, 0);
+  assert.match(h.stdout, /^ok: 0 groups, 0 grants; stack demo: last copy from the Mac 20\d\d-\d\d-\d\dT[\d:.]+Z\n$/);
+  assert.ok(!h.stdout.includes('apify-health-value'));
+  await fs.rm(hdev, { recursive: true, force: true });
+});

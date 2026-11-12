@@ -47,6 +47,10 @@ if [ "$OS" = mac ]; then
 else
   id _deployer >/dev/null 2>&1 \
     || useradd --system --user-group --home-dir "$HOME_D" --no-create-home --shell /usr/sbin/nologin --comment "Agent broker" _deployer
+  # sshd runs a forced command through the account's shell, so /bin/sh (it was /usr/sbin/nologin) lets the Mac's one
+  # restricted key deliver tokens (agent-broker-admin trust-mac). The account still has no password: it is reached only
+  # through sudo (owner, password) or that one key, which can run receive-from-mac and nothing else.
+  usermod -s /bin/sh _deployer
   # The owner's group: reads the project folders (Ubuntu homes are 750), as staff does on a Mac. docker: runs compose.
   usermod -aG "$(id -gn "$OWNER")" _deployer
   if getent group docker >/dev/null; then usermod -aG docker _deployer; else echo "  note: no docker group yet; rerun after installing Docker" >&2; fi
