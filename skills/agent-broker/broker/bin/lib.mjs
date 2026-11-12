@@ -23,6 +23,8 @@ export const DIR = {
   stackSecrets: path.join(HOME, 'stack-secrets'), //  <stack>.env      account tokens, KEY=VALUE per line
   projects: path.join(HOME, 'projects'), //           <project>.json   folders, stack, pinned site/ref (no secrets)
   secrets: path.join(HOME, 'secrets'), //             <project>.env    per-project values (database URLs, ...)
+  groups: path.join(HOME, 'groups'), //               <group>.json     who may get which key, and how (no secrets)
+  groupSecrets: path.join(HOME, 'group-secrets'), //  <group>.env      values for services and programs, KEY=VALUE per line
   work: path.join(HOME, 'work'), //                   <project>/       copies of the project folders that CLIs run in
   queue: path.join(HOME, 'queue'), //                 <id>.json        admin queries waiting for approval
   log: path.join(HOME, 'log'), //                     broker.log       one line per call, no secret values
@@ -61,7 +63,7 @@ async function readJson(dir, name, what) {
   try {
     return JSON.parse(await fs.readFile(path.join(dir, `${checkName(name, what)}.json`), 'utf8'));
   } catch (e) {
-    if (e.code === 'ENOENT') fail(`unknown ${what}: ${name} (list them with: agent-broker ${what === 'stack' ? 'stacks' : 'projects'})`);
+    if (e.code === 'ENOENT') fail(`unknown ${what}: ${name}${what === 'group' ? '' : ` (list them with: agent-broker ${what === 'stack' ? 'stacks' : 'projects'})`}`);
     throw e;
   }
 }
@@ -114,6 +116,68 @@ export const saveSecrets = (name, secrets) => writeEnv(path.join(DIR.secrets, `$
 export const loadStackSecrets = (name) => readEnv(path.join(DIR.stackSecrets, `${checkName(name, 'stack')}.env`));
 export const saveStackSecrets = (name, secrets) => writeEnv(path.join(DIR.stackSecrets, `${checkName(name, 'stack')}.env`), secrets);
 
+// ---- Groups ------------------------------------------------------------------------------------------------------
+
+const UNIT = /^[A-Za-z0-9_.@-]{1,100}\.service$/;
+const GRANT_FILE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/;
+export const checkUnit = (unit) => (UNIT.test(unit ?? '') && !unit.includes('..') ? unit : fail(`invalid unit name: ${unit ?? '(missing)'} (expected something like demo.service)`));
+export const checkGrantFile = (name) => (GRANT_FILE.test(name ?? '') && !name.includes('..') ? name : fail(`invalid file name in a grant: ${name ?? '(missing)'}`));
+const checkKey = (k) => (KEY.test(k ?? '') ? k : fail(`invalid key name: ${k ?? '(missing)'}`));
+const keyList = (list, what) => (Array.isArray(list) ? list.map(checkKey) : fail(`${what} must be a list of key names`));
+
+/**
+ * Checks and normalizes a group's grants. Three kinds:
+ *   { unit, files?: { fileName: KEY }, env?: [KEY], optional?: [KEY] }   one systemd user unit
+ *   { root: true, keys?: [KEY], write?: [KEY] }                           the owner's root-run setup scripts
+ *   { omp: true, cgroup, exe, keys: [KEY] }                               OMP processes, found by cgroup and binary folder
+ * Used on save and on load, so a hand-edited record cannot carry a malformed grant into the later steps.
+ */
+export function validateGrants(grants) {
+  if (!Array.isArray(grants)) fail('grants must be a list');
+  const seen = new Set();
+  return grants.map((g) => {
+    if (!g || typeof g !== 'object') fail('a grant must be an object');
+    const kinds = ['unit', 'root', 'omp'].filter((k) => k in g);
+    if (kinds.length !== 1) fail('a grant has exactly one of: unit, root, omp');
+    const [kind] = kinds;
+    const id = kind === 'unit' ? g.unit : kind;
+    if (seen.has(id)) fail(`two grants for ${id}`);
+    seen.add(id);
+    if (kind === 'unit') {
+      const files = Object.fromEntries(Object.entries(g.files ?? {}).map(([f, k]) => [checkGrantFile(f), checkKey(k)]));
+      const env = keyList(g.env ?? [], 'env');
+      const optional = keyList(g.optional ?? [], 'optional');
+      const granted = new Set([...Object.values(files), ...env]);
+      for (const k of optional) if (!granted.has(k)) fail(`${k} is optional but not granted to ${g.unit}`);
+      if (!granted.size) fail(`the grant for ${g.unit} lists no key`);
+      return { unit: checkUnit(g.unit), ...(Object.keys(files).length && { files }), ...(env.length && { env }), ...(optional.length && { optional }) };
+    }
+    if (kind === 'root') {
+      if (g.root !== true) fail('root must be true');
+      const keys = keyList(g.keys ?? [], 'keys');
+      const write = keyList(g.write ?? [], 'write');
+      if (!keys.length && !write.length) fail('the root grant lists no key');
+      return { root: true, ...(keys.length && { keys }), ...(write.length && { write }) };
+    }
+    if (g.omp !== true) fail('omp must be true');
+    if (!UNIT.test(g.cgroup ?? '')) fail(`invalid cgroup unit: ${g.cgroup ?? '(missing)'}`);
+    if (typeof g.exe !== 'string' || !path.isAbsolute(g.exe) || g.exe.split('/').includes('..')) fail('the omp grant needs an absolute exe folder without ".."');
+    const keys = keyList(g.keys ?? [], 'keys');
+    if (!keys.length) fail('the omp grant lists no key');
+    return { omp: true, cgroup: g.cgroup, exe: g.exe, keys };
+  });
+}
+
+/** A group: { grants: [...] } (no secrets). */
+export async function loadGroup(name) {
+  const g = await readJson(DIR.groups, name, 'group');
+  return { ...g, grants: validateGrants(g.grants ?? []) };
+}
+export const saveGroup = (name, config) => writePrivate(path.join(DIR.groups, `${checkName(name, 'group')}.json`), `${JSON.stringify({ ...config, grants: validateGrants(config.grants ?? []) }, null, 2)}\n`);
+export const listGroups = () => listNames(DIR.groups);
+export const loadGroupSecrets = (name) => readEnv(path.join(DIR.groupSecrets, `${checkName(name, 'group')}.env`));
+export const saveGroupSecrets = (name, secrets) => writeEnv(path.join(DIR.groupSecrets, `${checkName(name, 'group')}.env`), secrets);
+
 /** The effective stack for a project: its explicit stack, or 'global' if a global stack exists. */
 export async function effectiveStack(project) {
   if (project.stack) return project.stack;
@@ -127,11 +191,12 @@ export async function projectSecrets(name, project) {
   return { ...(stack ? await loadStackSecrets(stack) : {}), ...(await loadSecrets(name)) };
 }
 
-/** Every stored value of every stack and project: the scrubber removes all of them, not only the caller's. */
+/** Every stored value of every stack, project and group: the scrubber removes all of them, not only the caller's. */
 export async function allSecretValues() {
   const values = [];
   for (const name of await listStacks()) values.push(...Object.values(await loadStackSecrets(name)));
   for (const name of await listProjects()) values.push(...Object.values(await loadSecrets(name)));
+  for (const name of await listGroups()) values.push(...Object.values(await loadGroupSecrets(name)));
   return values;
 }
 
@@ -337,7 +402,7 @@ export function assertNoSecret(buf, values, what) {
 // The CLIs read the project's own config (netlify.toml publish / functions, .actor, supabase/config.toml), and the
 // agents write it: a path there could point at the broker's token files and upload them. Every CLI runs in a macOS
 // sandbox that cannot read or write the broker's own folders, except its working folder and a private temp folder.
-const PRIVATE = ['stackSecrets', 'secrets', 'stacks', 'projects', 'queue', 'log', 'work', 'tmp'];
+const PRIVATE = ['stackSecrets', 'secrets', 'groupSecrets', 'groups', 'stacks', 'projects', 'queue', 'log', 'work', 'tmp'];
 
 async function sandboxProfile(allowed) {
   const sub = (dirs) => dirs.map((d) => `(subpath ${JSON.stringify(d)})`).join(' ');

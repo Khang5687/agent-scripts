@@ -8,9 +8,10 @@ import path from 'node:path';
 import readline from 'node:readline/promises';
 import { accountLabel, createNetlifySite, lookup, verifyPins } from './accounts.mjs';
 import {
-  ACCOUNT_KEYS, DIR, KEY, SERVICES, UsageError, allSecretValues, audit, checkName, fail, listProjects,
-  listStacks, loadProject, loadSecrets, loadStack, loadStackSecrets, makeScrubber, mkdirs, parseArgs, projectSecrets,
-  run, saveProject, saveSecrets, saveStack, saveStackSecrets,
+  ACCOUNT_KEYS, DIR, KEY, SERVICES, UsageError, allSecretValues, audit, checkGrantFile, checkName, checkUnit, fail,
+  listGroups, listProjects, listStacks, loadGroup, loadGroupSecrets, loadProject, loadSecrets, loadStack,
+  loadStackSecrets, makeScrubber, mkdirs, parseArgs, projectSecrets, run, saveGroup, saveGroupSecrets, saveProject,
+  saveSecrets, saveStack, saveStackSecrets, validateGrants,
 } from './lib.mjs';
 
 const HELP = `agent-broker-admin <command>   (asks for your password every time; Touch ID on a Mac)
@@ -18,18 +19,24 @@ const HELP = `agent-broker-admin <command>   (asks for your password every time;
 On a Mac usually run by the wizard: ~/git/agent-scripts/skills/agent-broker/scripts/wizard.sh (on Linux: run it directly)
 
   apply [options] < values        one change, checked before anything is saved; values on stdin as
-                                  stack:KEY=VALUE or project:KEY=VALUE lines
+                                  stack:KEY=VALUE, project:KEY=VALUE or group:KEY=VALUE lines
      --stack NAME [--new-stack] [--stack-note T] [--stack-from-project P]   account stack (tokens: stack:KEY lines)
      --project NAME [--new-project] [--note T]                              project (uses --stack when given)
      --path DIR | --add-path DIR | --remove-path DIR                        its folders
      --netlify-site ID | --netlify-new NAME [--netlify-team T] | --supabase-ref REF | --apify
      --vercel-org ID --vercel-project ID | --remove-service SERVICE
+     --group NAME [--new-group]     a group: secrets for a service or program (values: group:KEY=VALUE lines).
+        A grant is replaced as a whole by the unit / root / omp it names:
+        --grant-file UNIT:FILE=KEY  (UNIT is e.g. demo.service)   --grant-env UNIT:KEY   --optional KEY
+        --grant-root KEY  --grant-root-write KEY                  --grant-omp KEY [--omp-exe DIR] [--omp-cgroup UNIT]
+        --remove-grant UNIT|root|omp
   lookup <stack>                  who the stack's tokens belong to; their sites and databases
-  set <project> <KEY> | set-stack <stack> <KEY>     store one value (typed hidden)
+  set <project> <KEY> | set-stack <stack> <KEY> | set-group <group> <KEY>     store one value (typed hidden)
   import <project> <env-file> <KEY>...              move keys out of a .env file
-  unset <project> <KEY> | unset-stack <stack> <KEY>
-  list                            stacks and projects (key names, never values)
-  remove-project <name> | remove-stack <name>
+  import-group <group>            KEY=VALUE lines on stdin, taken literally (used by: agent-broker-admin import-files)
+  unset <project> <KEY> | unset-stack <stack> <KEY> | unset-group <group> <KEY>
+  list                            stacks, projects and groups (key names and grants, never values)
+  remove-project <name> | remove-stack <name> | remove-group <name>
   pending | approve <id> | reject <id>               Supabase admin queries waiting for you
   log [lines]                     recent broker calls`;
 
@@ -40,17 +47,89 @@ const readStdin = async () => {
   return s;
 };
 
-/** stdin lines `stack:KEY=VALUE` / `project:KEY=VALUE` (a bare KEY=VALUE counts as project). */
+/** stdin lines `stack:KEY=VALUE` / `project:KEY=VALUE` / `group:KEY=VALUE` (a bare KEY=VALUE counts as project). */
 function parseValues(text) {
-  const out = { stack: {}, project: {} };
+  const out = { stack: {}, project: {}, group: {} };
   for (const line of text.split('\n')) {
     if (!line) continue;
-    const m = line.match(/^(?:(stack|project):)?([A-Z][A-Z0-9_]{0,62})=(.*)$/s);
-    if (!m) fail('stdin lines must look like stack:KEY=VALUE or project:KEY=VALUE');
+    const m = line.match(/^(?:(stack|project|group):)?([A-Z][A-Z0-9_]{0,62})=(.*)$/s);
+    if (!m) fail('stdin lines must look like stack:KEY=VALUE, project:KEY=VALUE or group:KEY=VALUE');
     if (!m[3] || /[\r\0]/.test(m[3])) fail(`${m[2]}: empty or invalid value`);
     out[m[1] ?? 'project'][m[2]] = m[3];
   }
   return out;
+}
+
+/** `--grant-file UNIT:FILE=KEY` / `--grant-env UNIT:KEY` -> [unit, rest]. A unit name never holds ":" or "=". */
+function splitUnit(spec, flag) {
+  const i = spec.indexOf(':');
+  if (i < 1) fail(`--${flag} expects UNIT:...`);
+  return [checkUnit(spec.slice(0, i)), spec.slice(i + 1)];
+}
+
+/** One change to a group: its grants (each named grant replaced whole) and its values. Nothing is saved until all is checked. */
+async function applyGroup(opts, values) {
+  const name = checkName(opts.group, 'group');
+  if (opts.stack || opts.project || Object.keys(values.stack).length || Object.keys(values.project).length) fail('--group cannot be combined with --stack, --project or their values');
+  const known = await exists(listGroups, name);
+  if (opts['new-group'] && known) fail(`group ${name} already exists`);
+  if (!opts['new-group'] && !known) fail(`unknown group ${name} (add --new-group to create it)`);
+  const group = known ? await loadGroup(name) : { grants: [] };
+  const idOf = (g) => g.unit ?? (g.root ? 'root' : 'omp');
+  const grants = new Map(group.grants.map((g) => [idOf(g), g]));
+  const summary = [];
+
+  for (const id of opts['remove-grant'] ?? []) {
+    if (!grants.delete(id === 'root' || id === 'omp' ? id : checkUnit(id))) fail(`group ${name} has no grant for ${id}`);
+    summary.push(`group ${name}: removed the grant for ${id}`);
+  }
+
+  const units = new Map();
+  const unitGrant = (unit) => { if (!units.has(unit)) units.set(unit, { unit, files: {}, env: [] }); return units.get(unit); };
+  for (const spec of opts['grant-file'] ?? []) {
+    const [unit, rest] = splitUnit(spec, 'grant-file');
+    const eq = rest.indexOf('=');
+    if (eq < 1) fail('--grant-file expects UNIT:FILE=KEY');
+    unitGrant(unit).files[checkGrantFile(rest.slice(0, eq))] = rest.slice(eq + 1);
+  }
+  for (const spec of opts['grant-env'] ?? []) {
+    const [unit, key] = splitUnit(spec, 'grant-env');
+    unitGrant(unit).env.push(key);
+  }
+  const optional = opts.optional ?? [];
+  if (optional.length && !units.size) fail('--optional goes with --grant-file or --grant-env');
+  const granted = new Set();
+  for (const g of units.values()) {
+    const keys = new Set([...Object.values(g.files), ...g.env]);
+    for (const k of keys) granted.add(k);
+    g.optional = optional.filter((k) => keys.has(k));
+    grants.set(g.unit, g);
+    summary.push(`group ${name}: grant for ${g.unit} (${[...keys].join(', ')})`);
+  }
+  for (const k of optional) if (!granted.has(k)) fail(`${k} is optional but not named in any --grant-file / --grant-env`);
+
+  if (opts['grant-root'] || opts['grant-root-write']) {
+    grants.set('root', { root: true, keys: opts['grant-root'] ?? [], write: opts['grant-root-write'] ?? [] });
+    summary.push(`group ${name}: root grant`);
+  }
+  if (opts['grant-omp'] || opts['omp-exe'] || opts['omp-cgroup']) {
+    const old = grants.get('omp');
+    const exe = opts['omp-exe'] ?? old?.exe;
+    if (!opts['grant-omp']) fail('--omp-exe and --omp-cgroup go with --grant-omp KEY');
+    if (!exe) fail('--grant-omp needs --omp-exe DIR (the folder the OMP program runs from)');
+    grants.set('omp', { omp: true, cgroup: opts['omp-cgroup'] ?? old?.cgroup ?? 'paseo.service', exe, keys: opts['grant-omp'] });
+    summary.push(`group ${name}: omp grant`);
+  }
+
+  const next = validateGrants([...grants.values()]);
+  const secrets = { ...(known ? await loadGroupSecrets(name) : {}), ...values.group };
+  await saveGroup(name, { ...group, grants: next });
+  await saveGroupSecrets(name, secrets);
+  if (Object.keys(values.group).length) summary.push(`group ${name}: stored ${Object.keys(values.group).join(', ')}`);
+  if (!summary.length) summary.push(`group ${name}: ${known ? 'unchanged' : 'created'}`);
+  await audit({ admin: 'apply', group: name, keys: Object.keys(values.group), grants: next.map(idOf) });
+  for (const line of summary) console.log(`✓ ${line}`);
+  return 0;
 }
 
 const exists = async (list, name) => (await list()).includes(name);
@@ -70,9 +149,17 @@ async function apply(args) {
     'netlify-site': 'string', 'netlify-new': 'string', 'netlify-team': 'string',
     'supabase-ref': 'string', apify: 'bool',
     'vercel-org': 'string', 'vercel-project': 'string', 'remove-service': 'list',
+    group: 'string', 'new-group': 'bool', 'grant-file': 'list', 'grant-env': 'list', optional: 'list',
+    'grant-root': 'list', 'grant-root-write': 'list', 'grant-omp': 'list', 'omp-exe': 'string', 'omp-cgroup': 'string',
+    'remove-grant': 'list',
   });
   if (positional.length) fail(`unexpected arguments: ${positional.join(' ')}`);
   const values = parseValues(await readStdin());
+  if (opts.group) return applyGroup(opts, values);
+  if (Object.keys(values.group).length) fail('group:KEY values need --group NAME');
+  for (const f of ['new-group', 'grant-file', 'grant-env', 'optional', 'grant-root', 'grant-root-write', 'grant-omp', 'omp-exe', 'omp-cgroup', 'remove-grant']) {
+    if (opts[f]) fail(`--${f} needs --group NAME`);
+  }
   // Tests only (dev root, never for _deployer): no calls to the services to check tokens and pins.
   const skipVerify = Boolean(process.env.AGENT_BROKER_DEV_ROOT) && process.env.AGENT_BROKER_SKIP_VERIFY === '1';
   const summary = [];
@@ -207,32 +294,42 @@ async function list() {
     const p = await loadProject(name);
     console.log(JSON.stringify({ project: name, ...p, keys: Object.keys(await loadSecrets(name)).sort() }, null, 2));
   }
+  for (const name of await listGroups()) {
+    const g = await loadGroup(name);
+    console.log(JSON.stringify({ group: name, ...g, keys: Object.keys(await loadGroupSecrets(name)).sort() }, null, 2));
+  }
   return 0;
 }
 
+const KINDS = {
+  project: { load: loadProject, loadSecrets, saveSecrets },
+  stack: { load: loadStack, loadSecrets: loadStackSecrets, saveSecrets: saveStackSecrets },
+  group: { load: loadGroup, loadSecrets: loadGroupSecrets, saveSecrets: saveGroupSecrets },
+};
+
 async function setValues(kind, name, entries) {
-  const isStack = kind === 'stack';
+  const k = KINDS[kind];
   checkName(name, kind);
-  isStack ? await loadStack(name) : await loadProject(name);
-  const secrets = isStack ? await loadStackSecrets(name) : await loadSecrets(name);
-  for (const [k, v] of entries) {
-    if (!KEY.test(k)) fail(`invalid key name: ${k}`);
-    if (isStack && !ACCOUNT_KEYS.includes(k)) fail(`${k} is not an account token (stack keys: ${ACCOUNT_KEYS.join(', ')})`);
-    if (!v || /[\r\n\0]/.test(v)) fail(`${k}: the value is empty or has line breaks`);
-    secrets[k] = v;
+  await k.load(name);
+  const secrets = await k.loadSecrets(name);
+  for (const [key, v] of entries) {
+    if (!KEY.test(key)) fail(`invalid key name: ${key}`);
+    if (kind === 'stack' && !ACCOUNT_KEYS.includes(key)) fail(`${key} is not an account token (stack keys: ${ACCOUNT_KEYS.join(', ')})`);
+    if (!v || /[\r\n\0]/.test(v)) fail(`${key}: the value is empty or has line breaks`);
+    secrets[key] = v;
   }
-  await (isStack ? saveStackSecrets : saveSecrets)(name, secrets);
-  await audit({ admin: `set-${kind}`, [kind]: name, keys: entries.map(([k]) => k) });
-  console.log(`stored for ${kind} ${name}: ${entries.map(([k]) => k).join(', ')} (values not shown)`);
+  await k.saveSecrets(name, secrets);
+  await audit({ admin: `set-${kind}`, [kind]: name, keys: entries.map(([key]) => key) });
+  console.log(`stored for ${kind} ${name}: ${entries.map(([key]) => key).join(', ')} (values not shown)`);
   return 0;
 }
 
 async function unset(kind, name, key) {
-  const isStack = kind === 'stack';
-  const secrets = isStack ? await loadStackSecrets(checkName(name, kind)) : await loadSecrets(checkName(name));
+  const k = KINDS[kind];
+  const secrets = await k.loadSecrets(checkName(name, kind));
   if (!(key in secrets)) fail(`${kind} ${name} has no ${key}`);
   delete secrets[key];
-  await (isStack ? saveStackSecrets : saveSecrets)(name, secrets);
+  await k.saveSecrets(name, secrets);
   await audit({ admin: `unset-${kind}`, [kind]: name, key });
   console.log(`deleted ${key} from ${kind} ${name}`);
   return 0;
@@ -286,7 +383,11 @@ async function pending() {
 }
 
 async function remove(kind, name) {
-  if (kind === 'stack') {
+  if (kind === 'group') {
+    checkName(name, 'group');
+    await loadGroup(name);
+    for (const f of [path.join(DIR.groups, `${name}.json`), path.join(DIR.groupSecrets, `${name}.env`)]) await fs.rm(f, { force: true });
+  } else if (kind === 'stack') {
     checkName(name, 'stack');
     await loadStack(name);
     for (const p of await listProjects()) if ((await loadProject(p)).stack === name) fail(`project ${p} still uses stack ${name}: move it first`);
@@ -334,6 +435,14 @@ async function main([cmd, ...args]) {
     case 'unset': return unset('project', args[0], args[1]);
     case 'unset-stack': return unset('stack', args[0], args[1]);
     case 'remove-project': return remove('project', args[0]);
+    case 'set-group': return setValues('group', args[0], [[args[1], (await readStdin()).replace(/\r?\n$/, '')]]);
+    case 'import-group': {
+      const entries = pairs(await readStdin());
+      if (!entries.length) fail('no KEY=VALUE lines on stdin');
+      return setValues('group', args[0], entries);
+    }
+    case 'unset-group': return unset('group', args[0], args[1]);
+    case 'remove-group': return remove('group', args[0]);
     case 'remove-stack': return remove('stack', args[0]);
     case 'pending': return pending();
     case 'approve': return approve(args[0]);

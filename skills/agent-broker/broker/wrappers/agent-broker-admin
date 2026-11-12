@@ -4,9 +4,11 @@
 # Guide: agent-scripts/skills/agent-broker/SKILL.md
 set -euo pipefail
 ADMIN=(/usr/bin/sudo -u _deployer /opt/agent-broker/bin/agent-broker-admin.mjs)
+# Tests only: a stand-in for the sudo call, honoured only together with the dev root (as in bin/lib.mjs).
+if [ -n "${AGENT_BROKER_DEV_ROOT:-}" ] && [ -n "${AGENT_BROKER_DEV_ADMIN:-}" ]; then ADMIN=("$AGENT_BROKER_DEV_ADMIN"); fi
 
 case "${1:-}" in
-  set | set-stack)
+  set | set-stack | set-group)
     [ $# -eq 3 ] || { echo "usage: agent-broker-admin $1 <name> <KEY>" >&2; exit 2; }
     if [ -t 0 ]; then
       IFS= read -rsp "Value for $3 (hidden, paste then Enter): " value
@@ -34,6 +36,28 @@ case "${1:-}" in
     kept=$(grep -vE "${pattern%|}" "$file" || true)
     printf '%s\n' "$kept" > "$file" # same file (same permissions), without the moved keys
     echo "removed $* from $file"
+    ;;
+  import-files)
+    # import-files <group> KEY=file...: reads each key file (yours, mode 0600 or tighter) and stores the values in the
+    # group with ONE password. Values travel on stdin, never in arguments. The files are left as they are.
+    [ $# -ge 3 ] || { echo "usage: agent-broker-admin import-files <group> KEY=file..." >&2; exit 2; }
+    group=$2
+    shift 2
+    lines="" names=""
+    for spec in "$@"; do
+      key=${spec%%=*} file=${spec#*=}
+      [[ $spec == *=* && $key =~ ^[A-Z][A-Z0-9_]*$ ]] || { echo "expected KEY=file, got: $key" >&2; exit 2; }
+      [ -f "$file" ] || { echo "no such file: $file" >&2; exit 2; }
+      [ -z "$(find "$file" -maxdepth 0 \( -perm -040 -o -perm -020 -o -perm -010 -o -perm -004 -o -perm -002 -o -perm -001 \))" ] || { echo "$file is readable by others; chmod 600 it first" >&2; exit 2; }
+      [ "$(LC_ALL=C tr -d -c '\0' < "$file" | wc -c | tr -d ' ')" = 0 ] || { echo "$file holds a NUL byte; not a text key" >&2; exit 2; }
+      value=$(cat "$file")
+      [ -n "$value" ] || { echo "$file is empty" >&2; exit 2; }
+      case $value in *$'\n'* | *$'\r'*) echo "$file has more than one line" >&2; exit 2 ;; esac
+      lines+="$key=$value"$'\n'
+      names+=" $key"
+    done
+    printf '%s' "$lines" | "${ADMIN[@]}" import-group "$group"
+    echo "imported$names into group $group (files not changed)"
     ;;
   *)
     exec "${ADMIN[@]}" "$@"

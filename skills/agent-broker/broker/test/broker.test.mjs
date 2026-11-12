@@ -435,3 +435,126 @@ test('admin import stores .env values as Compose reads them; a $ Compose would e
   assert.match(admin(['import', 'immich'], 'E=pa$word\n').stderr, /E: the value has a \$ that Compose expands/);
   assert.equal((await lib.loadSecrets('immich')).E, undefined);
 });
+
+// ---- Groups ------------------------------------------------------------------------------------------------------
+
+const GROUP_VALUE = 'demo-group-secret-value-123';
+const groupOf = (name) => ok(admin(['list'])).stdout.split(/\n(?=\{)/).map((j) => JSON.parse(j)).find((j) => j.group === name);
+
+test('a group keeps grants and values apart: list shows names only, and every broker output scrubs the value', async () => {
+  const r = ok(admin(
+    ['apply', '--group', 'demo', '--new-group',
+      '--grant-file', 'demo.service:demo-key=DEMO_KEY', '--grant-file', 'demo.service:other-key=DEMO_OTHER', '--optional', 'DEMO_OTHER',
+      '--grant-env', 'demo-two.service:DEMO_ENV',
+      '--grant-root', 'DEMO_KEY', '--grant-root-write', 'DEMO_OTHER',
+      '--grant-omp', 'DEMO_KEY', '--omp-exe', '/opt/demo-omp/'],
+    `group:DEMO_KEY=${GROUP_VALUE}\n`,
+  ));
+  assert.ok(!(r.stdout + r.stderr).includes(GROUP_VALUE));
+  const listed = ok(admin(['list']));
+  assert.ok(!listed.stdout.includes(GROUP_VALUE));
+  const group = groupOf('demo');
+  assert.deepEqual(group.keys, ['DEMO_KEY']);
+  assert.deepEqual(group.grants, [
+    { unit: 'demo.service', files: { 'demo-key': 'DEMO_KEY', 'other-key': 'DEMO_OTHER' }, optional: ['DEMO_OTHER'] },
+    { unit: 'demo-two.service', env: ['DEMO_ENV'] },
+    { root: true, keys: ['DEMO_KEY'], write: ['DEMO_OTHER'] },
+    { omp: true, cgroup: 'paseo.service', exe: '/opt/demo-omp/', keys: ['DEMO_KEY'] },
+  ]);
+  assert.equal((await fs.stat(path.join(dev, 'home/group-secrets/demo.env'))).mode & 0o777, 0o600);
+  assert.equal((await fs.stat(path.join(dev, 'home/groups/demo.json'))).mode & 0o777, 0o600);
+  // The scrubber behind every broker output knows the group value.
+  const scrub = lib.makeScrubber(await lib.allSecretValues());
+  assert.equal(scrub(`leak ${GROUP_VALUE} end`), 'leak [secret] end');
+  // set-group / unset-group work like set-stack / unset-stack; the value never comes back.
+  assert.ok(!ok(admin(['set-group', 'demo', 'DEMO_OTHER'], 'second-demo-value-456\n')).stdout.includes('second-demo'));
+  assert.match(ok(admin(['unset-group', 'demo', 'DEMO_OTHER'])).stdout, /deleted DEMO_OTHER from group demo/);
+  assert.match(admin(['unset-group', 'demo', 'DEMO_OTHER']).stderr, /has no DEMO_OTHER/);
+});
+
+test('a grant is replaced whole by the unit it names, and removed by --remove-grant', () => {
+  ok(admin(['apply', '--group', 'demo', '--grant-file', 'demo.service:new-name=DEMO_KEY']));
+  assert.deepEqual(groupOf('demo').grants.find((g) => g.unit === 'demo.service'), { unit: 'demo.service', files: { 'new-name': 'DEMO_KEY' } });
+  ok(admin(['apply', '--group', 'demo', '--remove-grant', 'demo-two.service', '--remove-grant', 'root', '--remove-grant', 'omp']));
+  assert.deepEqual(groupOf('demo').grants.map((g) => g.unit), ['demo.service']);
+  assert.match(admin(['apply', '--group', 'demo', '--remove-grant', 'root']).stderr, /has no grant for root/);
+});
+
+test('groups refuse bad unit names, bad key names, bad file names, unknown groups and stray options', () => {
+  const refused = (args, input, pattern) => {
+    const r = admin(args, input);
+    assert.equal(r.status, 2, `${args.join(' ')}: ${r.stdout}`);
+    assert.match(r.stderr, pattern);
+  };
+  for (const unit of ['demo', 'demo.timer', '../demo.service', 'a/b.service', 'demo service.service', '.service']) {
+    refused(['apply', '--group', 'demo', '--grant-file', `${unit}:f=DEMO_KEY`], '', /invalid unit name|expects UNIT/);
+  }
+  refused(['apply', '--group', 'demo', '--grant-env', 'demo.service:lower_case'], '', /invalid key name/);
+  refused(['apply', '--group', 'demo', '--grant-root', 'bad-key'], '', /invalid key name/);
+  refused(['apply', '--group', 'demo', '--grant-file', 'demo.service:../etc=DEMO_KEY'], '', /invalid file name/);
+  refused(['apply', '--group', 'demo', '--grant-file', 'demo.service:a/b=DEMO_KEY'], '', /invalid file name/);
+  refused(['apply', '--group', 'demo', '--grant-file', 'demo.service:f=DEMO_KEY', '--optional', 'DEMO_NOPE'], '', /optional but not named/);
+  refused(['apply', '--group', 'demo', '--optional', 'DEMO_KEY'], '', /goes with --grant-file/);
+  refused(['apply', '--group', 'demo', '--grant-omp', 'DEMO_KEY'], '', /needs --omp-exe/);
+  refused(['apply', '--group', 'demo', '--grant-omp', 'DEMO_KEY', '--omp-exe', '/opt/../etc'], '', /absolute exe folder/);
+  refused(['apply', '--group', 'ghost', '--grant-root', 'DEMO_KEY'], '', /unknown group ghost/);
+  refused(['apply', '--group', 'demo', '--new-group'], '', /already exists/);
+  refused(['apply', '--group', 'Bad Name', '--new-group'], '', /invalid group name/);
+  refused(['apply', '--group', 'demo', '--stack', 'studio'], '', /cannot be combined/);
+  refused(['apply', '--grant-root', 'DEMO_KEY'], '', /needs --group/);
+  refused(['apply'], 'group:DEMO_KEY=x\n', /need --group/);
+  refused(['set-group', 'ghost', 'DEMO_KEY'], 'x\n', /unknown group: ghost/);
+  refused(['set-group', 'demo', 'lower'], 'x\n', /invalid key name/);
+  refused(['set-group', 'demo', 'DEMO_KEY'], 'two\nlines\n', /empty or has line breaks/);
+});
+
+test('import-files stores key files with one call, values on stdin and never in argv; loose or odd files are refused', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'agent-broker-files-'));
+  const argsLog = path.join(dir, 'argv.log');
+  const stdinLog = path.join(dir, 'stdin.log');
+  const fakeAdmin = path.join(dir, 'admin.sh');
+  await fs.writeFile(fakeAdmin, `#!/bin/bash\nprintf '%s\\n' "$*" >> '${argsLog}'\ntee -a '${stdinLog}' | '${process.execPath}' '${path.join(BIN, 'agent-broker-admin.mjs')}' "$@"\n`, { mode: 0o700 });
+  const wrapper = path.resolve(import.meta.dirname, '../wrappers/agent-broker-admin');
+  const files = (...args) => spawnSync('bash', [wrapper, ...args], { env: { ...env, AGENT_BROKER_DEV_ADMIN: fakeAdmin }, encoding: 'utf8' });
+  const key = path.join(dir, 'tts-key');
+  const second = path.join(dir, 'token');
+  await fs.writeFile(key, 'file-value-one-abc\n', { mode: 0o600 });
+  await fs.writeFile(second, 'file-value-two-def', { mode: 0o400 });
+
+  const r = files('import-files', 'demo', `DEMO_FILE_ONE=${key}`, `DEMO_FILE_TWO=${second}`);
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(!(r.stdout + r.stderr).includes('file-value'));
+  assert.match(r.stdout, /imported DEMO_FILE_ONE DEMO_FILE_TWO into group demo/);
+  assert.equal(await fs.readFile(argsLog, 'utf8'), 'import-group demo\n');
+  assert.equal(await fs.readFile(stdinLog, 'utf8'), 'DEMO_FILE_ONE=file-value-one-abc\nDEMO_FILE_TWO=file-value-two-def\n');
+  assert.equal(await fs.readFile(key, 'utf8'), 'file-value-one-abc\n'); // the source file is left alone
+  const secretsFile = path.join(dev, 'home/group-secrets/demo.env');
+  const stored = await fs.readFile(secretsFile, 'utf8');
+  assert.match(stored, /^DEMO_FILE_ONE=file-value-one-abc$/m);
+  assert.match(stored, /^DEMO_FILE_TWO=file-value-two-def$/m);
+  assert.ok(!ok(admin(['list'])).stdout.includes('file-value'));
+
+  const loose = path.join(dir, 'loose');
+  await fs.writeFile(loose, 'loose-value-xyz', { mode: 0o644 });
+  const multi = path.join(dir, 'multi');
+  await fs.writeFile(multi, 'a\nb\n', { mode: 0o600 });
+  const empty = path.join(dir, 'empty');
+  await fs.writeFile(empty, '\n', { mode: 0o600 });
+  for (const [spec, pattern] of [
+    [`DEMO_LOOSE=${loose}`, /readable by others/],
+    [`DEMO_MULTI=${multi}`, /more than one line/],
+    [`DEMO_EMPTY=${empty}`, /is empty/],
+    [`DEMO_GONE=${path.join(dir, 'nope')}`, /no such file/],
+    [`lower=${key}`, /expected KEY=file/],
+    [key, /expected KEY=file/],
+  ]) {
+    const bad = files('import-files', 'demo', spec);
+    assert.equal(bad.status, 2, spec);
+    assert.match(bad.stderr, pattern);
+  }
+  // One bad file in the list: nothing at all is stored.
+  assert.equal(files('import-files', 'demo', `DEMO_LATE=${key}`, `DEMO_LOOSE=${loose}`).status, 2);
+  assert.ok(!(await fs.readFile(secretsFile, 'utf8')).includes('DEMO_LATE'));
+  assert.match(files('import-files', 'ghost', `DEMO_FILE_ONE=${key}`).stderr, /unknown group: ghost/);
+  await fs.rm(dir, { recursive: true, force: true });
+});
