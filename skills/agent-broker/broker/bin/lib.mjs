@@ -167,7 +167,9 @@ export function validateGrants(grants) {
     if (typeof g.exe !== 'string' || !path.isAbsolute(g.exe) || g.exe.split('/').includes('..')) fail('the omp grant needs an absolute exe folder without ".."');
     const keys = keyList(g.keys ?? [], 'keys');
     if (!keys.length) fail('the omp grant lists no key');
-    return { omp: true, cgroup: g.cgroup, exe: g.exe, keys };
+    const names = g.names ?? [];
+    if (!Array.isArray(names) || names.some((n) => typeof n !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(n))) fail('omp program names must be bare names (letters, digits, . _ -, no "/")');
+    return { omp: true, cgroup: g.cgroup, exe: g.exe, ...(names.length && { names: [...new Set(names)] }), keys };
   });
 }
 
@@ -431,15 +433,20 @@ async function sandboxProfile(allowed) {
   return `(version 1)(allow default)(deny file-read-data file-write* ${sub(denied)})(allow file-read-data file-write* ${sub(ok)})`;
 }
 
-// Linux: bwrap with the whole file tree visible and writable as the broker user (what the macOS profile allows), except
-// the broker's own folders. Order matters and is the standard idiom: first every hidden folder as one whole `--tmpfs`
-// (nothing is listed, so a folder created in it later is hidden too), then each kept folder inside one is bound back
-// from the host tree. A kept folder that holds a hidden one wins, as on macOS ("later rules win").
+// Linux: bwrap with the whole file tree visible and writable as the broker user, except the broker's own home (what
+// the macOS profile hides, plus the whole home top level: on a Mac that is a user with no Docker socket, here `_deployer`
+// is in the docker group, so every path it could write and later run from is hidden too). Order is the standard idiom:
+// ONE `--tmpfs` over the home (nothing in it is listed, so a file created there later is hidden too; it is also the
+// CLI's throwaway HOME), then each kept folder inside it is bound back from the host tree. A kept folder that holds a
+// hidden one wins ("later rules win"). The container sockets are masked so a CLI cannot reach the Docker daemon (root).
 const BWRAP = (DEV && process.env.AGENT_BROKER_DEV_BWRAP) || '/usr/bin/bwrap';
 const bwrapStartArgs = ['--die-with-parent', '--new-session', '--unshare-all', '--share-net'];
 
-/** The bwrap argument list: `hidden` (real paths of the broker's folders), `keep` (real paths that stay usable), the command last. */
-export function bwrapArgs({ hidden, keep, cmd, args = [] }) {
+/**
+ * The bwrap argument list: `hidden` (real paths hidden whole: the broker home, plus any broker folder outside it), `keep`
+ * (real paths that stay usable), `masks` (existing socket files replaced by /dev/null), the command last.
+ */
+export function bwrapArgs({ hidden, keep, masks = [], cmd, args = [] }) {
   const within = (p, dir) => p === dir || p.startsWith(`${dir}/`);
   const tmpfs = hidden.filter((h) => !keep.some((k) => within(h, k)));
   const back = [...new Set(keep)].filter((k) => tmpfs.some((h) => within(k, h)) && !keep.some((o) => o !== k && within(k, o)));
@@ -447,8 +454,20 @@ export function bwrapArgs({ hidden, keep, cmd, args = [] }) {
     ...bwrapStartArgs, '--bind', '/', '/', '--dev', '/dev', '--proc', '/proc',
     ...tmpfs.flatMap((h) => ['--tmpfs', h]),
     ...back.flatMap((k) => ['--bind', k, k]),
+    ...masks.flatMap((m) => ['--ro-bind', '/dev/null', m]),
     '--', cmd, ...args,
   ];
+}
+
+// Container daemons' sockets (any is root on the host). A path counts once, and only when it exists: bwrap would have to create the rest.
+const SOCKETS = ['/run/docker.sock', '/var/run/docker.sock', '/run/podman/podman.sock', '/run/containerd/containerd.sock'];
+async function socketMasks() {
+  const found = new Set();
+  for (const s of SOCKETS) {
+    const real = await fs.realpath(path.dirname(s)).then((d) => path.join(d, path.basename(s)), () => null);
+    if (real && (await fs.lstat(real).catch(() => null))) found.add(real);
+  }
+  return [...found];
 }
 
 /**
@@ -476,7 +495,7 @@ export function sandboxReady() {
  * `sandbox: false` only for docker compose: the Docker daemon runs as root and mounts whatever the compose file
  * names, so a sandbox around the client would not keep anything out.
  */
-export async function run(cmd, args, { cwd, env = {}, scrub, out = process.stdout, allow = [], sandbox = true, stdin = 'ignore' }) {
+export async function run(cmd, args, { cwd, env = {}, scrub, outScrub = scrub, out = process.stdout, allow = [], sandbox = true, stdin = 'ignore' }) {
   if (sandbox && process.platform !== 'darwin' && !LINUX) fail(`${cmd} needs the macOS or Linux sandbox`);
   if (sandbox && LINUX) await sandboxReady();
   const tmp = path.join(DIR.tmp, randomUUID());
@@ -486,8 +505,9 @@ export async function run(cmd, args, { cwd, env = {}, scrub, out = process.stdou
     let argv = args;
     if (sandbox && LINUX) {
       const keep = await Promise.all([cwd, tmp, ...allow].map((d) => fs.realpath(d)));
-      const hidden = (await Promise.all(PRIVATE.map((k) => fs.realpath(DIR[k]).catch(() => null)))).filter(Boolean);
-      [bin, argv] = [BWRAP, await bwrapArgs({ hidden, keep, cmd, args })];
+      const home = await fs.realpath(HOME);
+      const outside = (await Promise.all(Object.values(DIR).map((d) => fs.realpath(d).catch(() => null)))).filter((d) => d && d !== home && !d.startsWith(`${home}/`));
+      [bin, argv] = [BWRAP, await bwrapArgs({ hidden: [home, ...new Set(outside)], keep, masks: await socketMasks(), cmd, args })];
     } else if (sandbox) [bin, argv] = ['/usr/bin/sandbox-exec', ['-p', await sandboxProfile([cwd, tmp, ...allow]), cmd, ...args]];
     const child = spawn(bin, argv, {
       cwd,
@@ -507,7 +527,7 @@ export async function run(cmd, args, { cwd, env = {}, scrub, out = process.stdou
       child.on('error', reject);
       child.on('close', (code, signal) => resolve(code ?? (signal ? 1 : 0)));
     });
-    await Promise.all([scrubStream(child.stdout, out, scrub), scrubStream(child.stderr, process.stderr, scrub)]);
+    await Promise.all([scrubStream(child.stdout, out, outScrub), scrubStream(child.stderr, process.stderr, scrub)]);
     return await done;
   } finally {
     await fs.rm(tmp, { recursive: true, force: true });
@@ -526,7 +546,7 @@ const isEnvFile = (name) => name === '.env' || name.startsWith('.env.');
  * The project folder belongs to the agents, so nothing in it is trusted:
  *  - symlinks that point outside the project are skipped (a link to a token file must never be followed);
  *  - files and folders the broker user cannot read (the owner's private files) are skipped;
- *  - files are opened without following links;
+ *  - files are opened without following links, and the opened file must really live under the project (a folder swapped for a link in between is caught);
  *  - every changed file is checked for stored secret values, and the sync fails if one is found.
  * Returns { changed: count of copied files, skipped: links and unreadable entries left out }.
  */
@@ -592,6 +612,10 @@ export async function syncProject(src, dest, secretValues) {
         try {
           const fst = await fh.stat();
           if (!fst.isFile()) { skipped.push(r); continue; }
+          // A folder swapped for a link after the lstat above would lead here: the opened file must really live under the project.
+          // (Linux: /proc/self/fd names the opened file; no /proc, no check.)
+          const real = await fs.realpath(`/proc/self/fd/${fh.fd}`).catch(() => null);
+          if (real && real !== root && !real.startsWith(root + path.sep)) { seen.delete(r); skipped.push(r); continue; }
           const body = await fh.readFile();
           assertNoSecret(body, secretValues, `project file ${r}`);
           await fs.writeFile(d, body, { mode: fst.mode & 0o755 });

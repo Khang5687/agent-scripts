@@ -106,7 +106,8 @@ A service or program gets its keys from its **group**, through the owner's grant
 belongs to its own caller (the unit, OMP, root); an agent has no use for them and the secret guard refuses them:
 
 - a systemd user unit: its own pre-start step, `ExecStartPre=+/usr/local/bin/agent-broker run <group>`, writes the unit's
-  keys into its `RuntimeDirectory=` (tmpfs, 0700);
+  keys into its `RuntimeDirectory=` (tmpfs, 0700). The folder must be named `<unit>-keys`: the secret guard hides only
+  `-keys` folders, and `run` refuses any other name;
 - OMP: a `models.yml` key line, `apiKey: "!/usr/local/bin/agent-broker key <group> <KEY>"`;
 - the owner's root-run setup scripts: `agent-broker-admin get <group> <KEY>`.
 
@@ -146,8 +147,11 @@ Each `agent-broker-admin` call asks your password.
 4. Key files into a group: `agent-broker-admin import-files <group> KEY=<file> ...` (one password; the files stay, delete
    them once the service works). Add the grant with `apply --group <group> --grant-file <unit>:<file>=KEY` (or
    `--grant-env`, `--grant-root`, `--grant-root-write`, `--grant-omp`).
-5. OMP's literal provider keys: `agent-broker-admin omp-move --exe <OMP binary folder>`. It backs up `models.yml` to
-   `models.yml.pre-broker`, stores the keys in group `omp`, and rewrites each line to a key line.
+5. OMP's literal provider keys. First prove one key line on a test key: add a throwaway group and a `models.yml` line
+   that calls `agent-broker key <group> <KEY>`, and make one real OMP request with it. Then
+   `agent-broker-admin omp-move --exe <OMP binary folder> [--name omp]` (`--name` when some OMP process starts under its
+   bare name; look at the processes' command lines first). It backs up `models.yml` to `models.yml.pre-broker`, stores the keys in
+   group `omp`, and rewrites each line to a key line. Shred the backup once OMP works.
 6. Health check every 15 minutes: copy `broker/systemd/agent-broker-health.service` and `.timer` to
    `~/.config/systemd/user/`, then `systemctl --user daemon-reload && systemctl --user enable --now agent-broker-health.timer`.
    The control-room status writer is set in the service file: `AGENT_BROKER_STATUS_WRITER` and
@@ -158,7 +162,8 @@ Each `agent-broker-admin` call asks your password.
    2. Sender: `agent-broker-admin sync-setup --to <receiver address> --host-key '<that line>'` (`--user`, `--port`
       optional); it opens no connection and prints the sender's public key line. On a Mac, rerun the install first
       (wizard menu 7): it adds the job that retries waiting copies every 10 minutes.
-   3. Receiver: `agent-broker-admin trust-mac '<that public key line>' --from <sender address>`.
+   3. Receiver: `agent-broker-admin trust-mac '<that public key line>' --from <sender address> --stacks <a,b>`. The
+      sender may copy only into the stacks named there (never `global`); a rerun replaces the list, and `list` shows it.
    4. Sender: `agent-broker-admin share-stack <stack>`; from then on each `set-stack`/`unset-stack` copies at once, and
       `agent-broker-admin sync-push --all` resends everything. The receiver holds the stack as `followsMac`: changes
       there are refused. `unshare-stack` stops future copies; the receiver keeps what it has until
@@ -178,10 +183,15 @@ Each `agent-broker-admin` call asks your password.
 - **Tokens agents saw before the broker** (2026-10) stay valid until rotated (wizard → 2).
 - **Linux, guard not wall**: the secret guard stops an agent that runs `run`, `key` or `get`; root can read the broker's
   files anyway, and the `get` / root-write checks are an interface for scripts. The program check for `key` reads a
-  process's command line, so a process started with an OMP binary's path imitates OMP. A unit name can be imitated by
-  the user's own systemd (an own unit with the same name gets that unit's keys).
-- **Linux, unproven**: the env file for `env` grants (written by the pre-start step, read by `EnvironmentFile=`);
-  that the bwrap sandbox hides the broker's folders in a live run (waits for the AppArmor file).
-- **Linux: `docker` / `lxd` group = root.** An agent user in those groups can read any secret back (`docker inspect`
-  shows a container's environment). The Linux broker stops accidental `.env` reads, not a determined agent; a real wall
-  means taking the agent user out of both groups.
+  process's command line, so a process started with an OMP binary's path (or a bare name the grant lists) imitates OMP.
+  A unit name can be imitated by the user's own systemd (an own unit with the same name gets that unit's keys). The
+  `run` check trusts the caller's cgroup, and any process of the user can join one.
+- **Linux, unproven**: the env file for `env` grants (written by the pre-start step, read by `EnvironmentFile=`; a file
+  grant has no quoting question, so prefer file grants); that the bwrap sandbox hides the broker's folders in a live run
+  (waits for the AppArmor file); that the cloud CLIs work with an empty home folder inside the sandbox.
+- **Linux: the agent user is in the `docker` group (owner's choice: a guard, not a wall).** That group is root. The
+  secret guard and `agent-broker compose` refuse the common routes (a container that mounts the broker's home, the
+  Docker socket or `/`; `privileged`, `pid: host`, `devices`; compose files that point a secret, config or build at
+  the broker's home). They do not stop a determined agent: `docker exec` into a running container, a socket under
+  another name, a path swapped after the check, or `docker`/`lxc` run by the agent itself. A real wall means taking the
+  agent user out of `docker` and `lxd`.

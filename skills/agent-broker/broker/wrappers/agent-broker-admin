@@ -60,7 +60,7 @@ case "${1:-}" in
     echo "imported$names into group $group (files not changed)"
     ;;
   omp-move)
-    # omp-move --exe DIR [--file models.yml] [--group omp]: moves the literal provider keys out of OMP's models file into a
+    # omp-move --exe DIR [--name omp] [--file models.yml] [--group omp]: moves the literal provider keys out of OMP's models file into a
     # broker group (one password) and leaves a key line behind. Runs as YOU (the broker user cannot read your models file);
     # the helper does the reading, the backup and the rewrite, and makes one admin call. Values travel on its stdin only.
     shift

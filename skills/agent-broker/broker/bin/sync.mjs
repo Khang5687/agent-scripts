@@ -127,7 +127,7 @@ export async function setup({ to, hostKeys, user, port, newKey }) {
     'your public key (give it to the receiving machine):',
     publicLine,
     'on the receiving machine, run:',
-    `  sudo agent-broker-admin trust-mac '${publicLine}' --from <this machine's address>`,
+    `  agent-broker-admin trust-mac '${publicLine}' --from <this machine's address> --stacks <the stacks it may copy into, a,b>`,
   );
   return lines;
 }

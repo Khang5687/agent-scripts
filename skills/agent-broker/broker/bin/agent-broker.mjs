@@ -9,13 +9,14 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createNetlifySite, createReadOnlyUser, lookup, verifyPins } from './accounts.mjs';
 import {
-  CA_FILE, DIR, KEY, LINUX, NAME, SERVICES, UsageError, allSecretValues, assertNoSecret, assertUnclaimed, audit, checkName,
+  CA_FILE, DIR, HOME, KEY, LINUX, NAME, SERVICES, UsageError, allSecretValues, assertNoSecret, assertUnclaimed, audit, checkName,
   checkRelative, effectiveStack, fail, gitRoot, listGroups, listProjects, listStacks, loadGroup, loadGroupSecrets, loadProject,
   loadSecrets, loadStack, loadStackSecrets, loadSyncState, makeScrubber, mkdirs, parseArgs, projectSecrets, resolveProject, run,
   saveProject, saveSecrets, sandboxReady,
   stackFromAgentsMd, syncProject,
 } from './lib.mjs';
 import { deliver, describeDelivery, healthNotes } from './sync.mjs';
+import { configProblems, cpProblems, needsCheck, runVolumeProblems } from './compose-guard.mjs';
 
 const HELP = `agent-broker <service> <action> [options]      run inside the project's folder: the folder picks the project
 
@@ -23,7 +24,8 @@ const HELP = `agent-broker <service> <action> [options]      run inside the proj
   agent-broker projects      all projects and their folders     agent-broker stacks   all account stacks
   agent-broker result <id>   result of an approved Supabase admin query
   agent-broker run <group>   for a systemd unit's pre-start step only (ExecStartPre=+): fills the unit's RuntimeDirectory
-                             with the keys its group grants; refused for any other caller
+                             with the keys its group grants; refused for any other caller (a guard: any process of this
+                             user can join a unit's cgroup, so a caller that does is not told apart)
   agent-broker key <group> <KEY>   for a program's key line (OMP apiKey "!..."): prints that one value to the
                              program the group's program grant names; refused for anything else
   agent-broker health        can the broker serve every key its groups promise? one line, no values; exit 0 = healthy
@@ -419,10 +421,47 @@ async function compose(cwd, args) {
     opts.push(flag, kind === 'file' ? checkRelative(v, flag) : v);
   }
   if (i >= args.length) fail('give a compose command: agent-broker compose ps | up -d | logs <service> | ...');
-  const code = await run('docker', ['compose', ...opts, ...args.slice(i)],
-    { cwd: P.root, env: await loadSecrets(P.name), scrub: makeScrubber(await allSecretValues()), sandbox: false, stdin: 'inherit' });
-  await audit({ service: 'compose', command: args[i], project: P.name, code });
+  const [command, ...rest] = args.slice(i);
+  const secrets = await loadSecrets(P.name);
+  const scrub = makeScrubber(await allSecretValues());
+  if (needsCheck(command)) {
+    const problems = await composeProblems(P, opts, command, rest, secrets);
+    if (problems.length) {
+      await audit({ service: 'compose', command, project: P.name, refused: problems[0] });
+      fail(`compose ${command} refused, nothing was started: ${problems.slice(0, 5).join('; ')}. The broker does not give a container its own folders or the Docker socket.`);
+    }
+  } else if (command === 'cp') {
+    const problems = cpProblems(rest, P.root);
+    if (problems.length) fail(`compose cp refused: ${problems.join('; ')}`);
+  }
+  const code = await run('docker', ['compose', ...opts, command, ...rest],
+    { cwd: P.root, env: secrets, scrub, sandbox: false, stdin: 'inherit' });
+  await audit({ service: 'compose', command, project: P.name, code });
   return code;
+}
+
+/**
+ * Why a compose command that can start or change containers must not run, from the resolved config the real call would
+ * use (same files, same environment, every profile: `up web` turns on a profile by itself). The JSON stays in memory:
+ * it holds this project's own values, so it is never printed. A stored value that is not this project's, found in it,
+ * also refuses (an env_file of broker files has no path left in the resolved output).
+ */
+async function composeProblems(P, opts, command, rest, secrets) {
+  const problems = command === 'run' ? await runVolumeProblems(rest, { home: HOME, cwd: P.root }) : [];
+  const chunks = [];
+  const code = await run('docker', ['compose', ...opts.filter((o) => o !== '--dry-run'), '--profile', '*', 'config', '--format', 'json'], {
+    cwd: P.root, env: secrets, scrub: makeScrubber(await allSecretValues()), outScrub: (s) => s, out: { write: (s) => chunks.push(s) }, sandbox: false,
+  });
+  if (code !== 0) fail(`compose could not resolve this project's configuration (exit ${code}), so ${command} was not started`);
+  let config;
+  try {
+    config = JSON.parse(chunks.join(''));
+  } catch {
+    fail(`compose config did not give JSON, so ${command} was not started`);
+  }
+  const own = new Set(Object.values(secrets));
+  const otherValues = (await allSecretValues()).filter((v) => !own.has(v));
+  return [...problems, ...(await configProblems(config, { home: HOME, cwd: P.root, otherValues }))];
 }
 
 const ACTIONS = { netlify, vercel, supabase, apify };
@@ -805,9 +844,10 @@ async function ancestors() {
  * agent-broker key <group> <KEY>: one raw value on stdout (+ newline), for a program's `!command` key line (OMP).
  * All must hold: the caller's cgroup is the grant's (directly under the user's app.slice); an ancestor process was
  * started from the grant's program folder; the key is granted and stored. Exit 2 refused, 3 granted but no stored value.
- * The program check reads argv[0] from /proc/<pid>/cmdline (the broker user cannot read another user's /proc/<pid>/exe):
- * a caller can fake it, so this is a guard against the wrong program, not a wall. Audit: pid + program name, never
- * command lines or values.
+ * The program check reads argv[0] from /proc/<pid>/cmdline (the broker user cannot read another user's /proc/<pid>/exe).
+ * An ancestor passes when its argv[0] is an absolute path under the grant's folder, or a bare name (no "/") the grant
+ * lists in `names` (the real OMP here starts as bare `omp`). A caller can fake argv[0], so this is a guard against the
+ * wrong program, not a wall. Audit: pid + program name, never command lines or values.
  */
 async function keyValue(group, key) {
   checkName(group ?? '', 'group');
@@ -821,8 +861,9 @@ async function keyValue(group, key) {
     if (unit !== grant.cgroup) { result = 'bad-caller'; fail(`the caller is ${unit}, not ${grant.cgroup}`); }
     chain = await ancestors();
     const prefix = grant.exe.endsWith('/') ? grant.exe : `${grant.exe}/`;
-    const fromProgram = (a) => a.startsWith(prefix) && !a.split('/').some((p) => p === '..' || p === '.');
-    if (!chain.some((a) => fromProgram(a.arg0))) { result = 'no-program'; fail(`no process above the caller was started from ${grant.exe}`); }
+    const names = grant.names ?? [];
+    const fromProgram = (a) => (a.startsWith(prefix) && !a.split('/').some((p) => p === '..' || p === '.')) || (!a.includes('/') && names.includes(a));
+    if (!chain.some((a) => fromProgram(a.arg0))) { result = 'no-program'; fail(`no process above the caller was started from ${grant.exe}${names.length ? ` or as ${names.join('/')}` : ''}`); }
     if (!grant.keys.includes(key)) { result = 'not-granted'; fail(`${key} is not granted in group ${group}`); }
     const value = (await loadGroupSecrets(group))[key];
     if (value === undefined) {
@@ -877,7 +918,7 @@ async function health() {
     }
     for (const g of group.grants) {
       grants++;
-      const label = g.unit ?? (g.root ? 'root setup scripts' : `programs from ${g.exe}`);
+      const label = g.unit ?? (g.root ? 'root setup scripts' : `programs from ${g.exe}${g.names?.length ? ` (also named ${g.names.join(', ')})` : ''}`);
       const optional = new Set(g.optional ?? []);
       const needed = g.unit ? [...Object.values(g.files ?? {}), ...(g.env ?? [])] : (g.keys ?? []);
       for (const key of new Set(needed)) {

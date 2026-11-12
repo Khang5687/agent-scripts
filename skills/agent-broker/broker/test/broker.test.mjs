@@ -4,6 +4,7 @@
 // Runs without sudo: AGENT_BROKER_DEV_ROOT puts the broker's home in a temp folder.
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
+import fsSync from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -714,6 +715,7 @@ test('run wrapper: writes files 0600 and an env file into the 0700 runtime folde
     ['two folders', `${dir}:${dir}`, /more than one folder/],
     ['a link', link, /not a real folder/],
     ['mode 0755', loose, /mode 0700: set RuntimeDirectoryMode=0700/],
+    ['a folder not named *-keys', await folderWith('plainkeys', 0o700), /must end in -keys/],
   ];
   for (const [what, d, pattern] of cases) {
     await fs.writeFile(statusLog, '');
@@ -852,6 +854,35 @@ test('key: the value goes only to a caller in the granted cgroup with the grante
   assert.match(log2, /"name":"KEY_C","result":"not-granted"/);
   assert.match(log2, /"name":"KEY_B","result":"no-value"/);
   assert.ok(!log2.includes(KEY_VALUE));
+  for (const d of dirs) await fs.rm(d, { recursive: true, force: true });
+});
+
+// A real OMP can start with argv[0] = `omp` (bare) and its exe in the granted folder: a bare name must be granted by name.
+test('key: a bare program name passes only when the grant names it; ./omp, x/omp and other bare names are refused', async () => {
+  const dirs = [];
+  const proc = async (...a) => { const d = await fakeProc(...a); dirs.push(d); return d; };
+  const sudo = ['sudo', '/usr/bin/sudo', '-n', '-u', 'broker-user', '/opt/agent-broker/bin/agent-broker.mjs', 'key', 'barename', 'KEY_A'];
+  const bare = await proc([sudo, ['bash', 'bash', '-c', 'x'], ['omp', 'omp'], ['paseo-daemon', 'Paseo Daemon']]);
+  // Without the name granted, bare `omp` is refused (the real-host form must not pass by accident).
+  ok(admin(['apply', '--group', 'barename', '--new-group', '--grant-omp', 'KEY_A', '--omp-exe', '/opt/demo-omp/'], `group:KEY_A=${KEY_VALUE}\n`));
+  const refused = await brokerKey(bare, 'barename', 'KEY_A');
+  assert.equal(refused.status, 2);
+  assert.equal(refused.stdout, '');
+  // Granted by name: the bare form passes, and the value is the only output.
+  ok(admin(['apply', '--group', 'barename', '--omp-exe', '/opt/demo-omp/', '--omp-name', 'omp', '--add-grant-omp', 'KEY_A']));
+  const good = await brokerKey(bare, 'barename', 'KEY_A');
+  assert.equal(good.status, 0, good.stderr);
+  assert.equal(good.stdout, `${KEY_VALUE}\n`);
+  // The absolute form still passes with a name granted; names only widen, never replace, the folder rule.
+  assert.equal((await brokerKey(await proc([sudo, ['x', PROGRAM]]), 'barename', 'KEY_A')).status, 0);
+  for (const [what, argv0] of [['a bare name that is not granted', 'omp-evil'], ['./omp', './omp'], ['x/omp', 'x/omp'], ['/omp (absolute, outside the folder)', '/omp'], ['an empty name', '']]) {
+    const bad = await brokerKey(await proc([sudo, ['x', argv0]]), 'barename', 'KEY_A');
+    assert.equal(bad.status, 2, what);
+    assert.equal(bad.stdout, '', what);
+    assert.match(bad.stderr, /no process above the caller was started from \/opt\/demo-omp\/ or as omp/, what);
+  }
+  // A name with a slash is not a valid grant name.
+  assert.notEqual(admin(['apply', '--group', 'barename', '--omp-exe', '/opt/demo-omp/', '--omp-name', 'x/omp', '--add-grant-omp', 'KEY_A']).status, 0);
   for (const d of dirs) await fs.rm(d, { recursive: true, force: true });
 });
 
@@ -1153,30 +1184,27 @@ test('omp-move: literal keys move into the group, lines are rewritten, the rest 
 
 // ---- Linux sandbox (bwrap) ---------------------------------------------------------------------------------------
 
-test('bwrap argument list: every hidden folder is one whole tmpfs, kept folders inside them are bound back after, command last', () => {
+test('bwrap argument list: the broker home is one whole tmpfs, kept folders inside it are bound back after, sockets are masked, command last', () => {
   const home = '/srv/demo/home';
-  const names = ['stack-secrets', 'secrets', 'group-secrets', 'groups', 'stacks', 'projects', 'queue', 'log', 'work', 'tmp'];
-  const hidden = names.map((n) => `${home}/${n}`);
   const start = ['--die-with-parent', '--new-session', '--unshare-all', '--share-net', '--bind', '/', '/', '--dev', '/dev', '--proc', '/proc'];
-  const tmpfs = (list) => list.flatMap((d) => ['--tmpfs', `${home}/${d}`]);
   const bind = (list) => list.flatMap((d) => ['--bind', d, d]);
 
-  // Plain run: the work copy and the private temp folder sit inside hidden folders: all ten tmpfs first, then the two bind-backs.
+  // Plain run: the work copy and the private temp folder sit inside the home: ONE tmpfs over it, then the two bind-backs.
   const work = `${home}/work/proj`;
   const priv = `${home}/tmp/u1`;
-  const args = lib.bwrapArgs({ hidden, keep: [work, priv], cmd: 'netlify', args: ['deploy', '--no-build'] });
-  assert.deepEqual(args, [...start, ...tmpfs(names), ...bind([work, priv]), '--', 'netlify', 'deploy', '--no-build']);
+  const args = lib.bwrapArgs({ hidden: [home], keep: [work, priv], cmd: 'netlify', args: ['deploy', '--no-build'] });
+  assert.deepEqual(args, [...start, '--tmpfs', home, ...bind([work, priv]), '--', 'netlify', 'deploy', '--no-build']);
 
-  // An extra allowed folder inside a hidden one is bound back too; one outside the hidden folders needs nothing;
-  // one inside another kept folder is covered by it.
+  // An extra allowed folder inside the home is bound back too; one outside it needs nothing; one inside another kept folder is covered by it.
   const extra = `${home}/projects/shared`;
-  const more = lib.bwrapArgs({ hidden, keep: [work, priv, extra, '/srv/demo/other', `${priv}/scratch`], cmd: 'apify', args: ['info'] });
-  assert.deepEqual(more, [...start, ...tmpfs(names), ...bind([work, priv, extra]), '--', 'apify', 'info']);
+  const more = lib.bwrapArgs({ hidden: [home], keep: [work, priv, extra, '/srv/demo/other', `${priv}/scratch`], cmd: 'apify', args: ['info'] });
+  assert.deepEqual(more, [...start, '--tmpfs', home, ...bind([work, priv, extra]), '--', 'apify', 'info']);
 
-  // A hidden folder inside a kept folder stays visible (kept wins, as on macOS); no bind-back for the ancestor.
-  assert.deepEqual(lib.bwrapArgs({ hidden, keep: [`${home}/work`], cmd: 'x' }),
-    [...start, ...tmpfs(names.filter((n) => n !== 'work')), '--', 'x']);
-  assert.deepEqual(lib.bwrapArgs({ hidden, keep: [home], cmd: 'x' }), [...start, '--', 'x']);
+  // A broker folder outside the home is its own tmpfs; the sockets are masked after the bind-backs, before the command.
+  const masked = lib.bwrapArgs({ hidden: [home, '/srv/other-broker-dir'], keep: [work], masks: ['/run/docker.sock'], cmd: 'x' });
+  assert.deepEqual(masked, [...start, '--tmpfs', home, '--tmpfs', '/srv/other-broker-dir', ...bind([work]), '--ro-bind', '/dev/null', '/run/docker.sock', '--', 'x']);
+  // The home itself kept (nothing to hide): no tmpfs.
+  assert.deepEqual(lib.bwrapArgs({ hidden: [home], keep: [home], cmd: 'x' }), [...start, '--', 'x']);
 });
 
 test('cloud actions on Linux run under bwrap with the broker folders hidden, and the token only in the CLI\'s environment', { skip: !lib.LINUX && 'Linux only' }, async () => {
@@ -1193,7 +1221,11 @@ test('cloud actions on Linux run under bwrap with the broker folders hidden, and
   assert.equal(lines.length, 2); // the start check, then the run
   assert.ok(!lines.join('\n').includes(tok)); // ... never through bwrap's arguments
   const real = await fs.realpath(path.join(dev, 'home'));
-  assert.ok(lines[1].includes(`--tmpfs ${real}/stack-secrets --tmpfs ${real}/secrets --tmpfs ${real}/group-secrets --tmpfs ${real}/groups `), lines[1]);
+  const sockets = ['/run/docker.sock', '/var/run/docker.sock'].map((s) => path.join(fsSync.realpathSync(path.dirname(s)), path.basename(s))).filter((s) => fsSync.existsSync(s));
+  assert.equal((lines[1].match(/--tmpfs/g) ?? []).length, 1, lines[1]); // the home is ONE tmpfs ...
+  assert.ok(lines[1].includes(`--tmpfs ${real} --bind ${real}/work/`), lines[1]); // ... with the work copy bound back
+  assert.ok(!lines[1].includes(`${real}/stack-secrets`), lines[1]); // no folder is named one by one
+  for (const s of new Set(sockets)) assert.ok(lines[1].includes(`--ro-bind /dev/null ${s} `), lines[1]); // every existing container socket is masked
   assert.ok(lines[1].endsWith(' -- netlify deploy --no-build --site site-bw'), lines[1]);
 });
 
@@ -1230,6 +1262,9 @@ test('cloud action with no working bwrap: one line that names the fix, before an
 const SYNC_VALUE = 'nfp_SYNCtokenVALUE0123456789abcdef';
 const SYNC_ROTATED = 'nfp_SYNCrotatedVALUE0123456789abcd';
 const send = (o, extra = '') => admin(['receive-from-mac'], `${JSON.stringify({ v: 1, stack: 'macshared', key: 'NETLIFY_AUTH_TOKEN', value: SYNC_VALUE, seq: 1, ...o })}\n${extra}`);
+// The receiving side takes copies only for the stacks the owner named in trust-mac.
+const TRUST_KEY = `ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI${'Abc1'.repeat(11).slice(0, 43)}`;
+ok(admin(['trust-mac', TRUST_KEY, '--from', '100.64.0.7', '--stacks', 'macshared,refusals,localone']));
 const stackFile = (name) => path.join(dev, 'home', 'stacks', `${name}.json`);
 const tokenFile = (name) => path.join(dev, 'home', 'stack-secrets', `${name}.env`);
 const readText = (file) => fs.readFile(file, 'utf8').catch(() => null);
@@ -1333,6 +1368,34 @@ test('receive-from-mac refuses what it should not trust, and changes nothing', a
   assert.equal(JSON.parse(await readText(path.join(dev, 'home', 'sync', 'seq.json'))).localone, undefined);
 });
 
+test('receive-from-mac: only the stacks the owner allowed (never "global"); a seq far ahead of the clock is refused and freezes nothing', async () => {
+  const globalBefore = await readText(tokenFile('global'));
+  const stateBefore = await readText(path.join(dev, 'home', 'sync', 'seq.json'));
+  const stacksBefore = await fs.readdir(path.join(dev, 'home', 'stacks'));
+  for (const stack of ['global', 'unlisted', 'macshare']) { // not on the list (also a near miss of a listed name)
+    const r = send({ stack, seq: 5 });
+    assert.equal(r.status, 2, stack);
+    assert.match(r.stderr, new RegExp(`refused \\(stack-not-allowed\\): stack ${stack} is not on the list`), stack);
+    assert.match(r.stderr, /trust-mac .* --stacks/);
+    assert.ok(!(r.stdout + r.stderr).includes(SYNC_VALUE));
+  }
+  assert.deepEqual(await fs.readdir(path.join(dev, 'home', 'stacks')), stacksBefore); // no stack was made
+  assert.equal(await readText(path.join(dev, 'home', 'sync', 'seq.json')), stateBefore);
+  assert.equal(await readText(tokenFile('global')), globalBefore); // the real global stack is untouched
+
+  // A seq more than a day ahead of this machine's clock is refused (exit 2, its own code); a real copy after it still lands.
+  const now = Math.floor(Date.now() / 1000);
+  for (const seq of [Number.MAX_SAFE_INTEGER, now + 86400 + 60]) {
+    const r = send({ stack: 'refusals', seq });
+    assert.equal(r.status, 2, String(seq));
+    assert.match(r.stderr, /refused \(seq-too-far\): seq is more than one day ahead/);
+  }
+  assert.equal(send({ stack: 'refusals', seq: now + 3600 }).status, 0); // within a day: fine
+  assert.equal(send({ stack: 'refusals', seq: now + 7200 }).status, 0);
+  const state = JSON.parse(await fs.readFile(path.join(dev, 'home', 'sync', 'seq.json'), 'utf8'));
+  assert.equal(state.refusals.NETLIFY_AUTH_TOKEN.seq, now + 7200);
+});
+
 test('a stack that follows the Mac cannot be changed here; list and stacks show the mark; health notes the last copy', async () => {
   const refused = /this stack follows the Mac; change it there/;
   for (const [what, r] of Object.entries({
@@ -1355,7 +1418,15 @@ test('a stack that follows the Mac cannot be changed here; list and stacks show 
 
   // A project may still use the stack; the way out is explicit and keeps the seq memory.
   const app = await folder('followapp');
+  // apply never writes a stack that follows the Mac (its copy could be older than one that landed meanwhile): neither file is touched.
+  const mtimes = async () => [(await fs.stat(stackFile('macshared'))).mtimeMs, (await fs.stat(tokenFile('macshared'))).mtimeMs];
+  const filesBefore = [await readText(stackFile('macshared')), await readText(tokenFile('macshared'))];
+  const stampsBefore = await mtimes();
+  await new Promise((r) => setTimeout(r, 30));
   ok(admin(['apply', '--stack', 'macshared', '--project', 'followapp', '--new-project', '--path', app]));
+  assert.deepEqual(await mtimes(), stampsBefore);
+  assert.deepEqual([await readText(stackFile('macshared')), await readText(tokenFile('macshared'))], filesBefore);
+  assert.match(admin(['apply', '--stack', 'macshared', '--stack-note', 'mine']).stderr, /follows the Mac/); // a note is a change too
   assert.match(admin(['remove-stack', 'macshared', '--stop-following']).stderr, /project followapp still uses stack macshared/);
   ok(admin(['remove-project', 'followapp']));
   assert.match(admin(['remove-stack', 'macshared', '--frobnicate']).stderr, /unknown option/);
@@ -1375,7 +1446,11 @@ test('trust-mac writes exactly one restricted key line and prints the host keys;
   await fs.writeFile(path.join(hostDir, 'ssh_host_rsa_key.pub'), 'ssh-rsa AAAAHOSTrsa root@somewhere\n');
   await fs.writeFile(path.join(hostDir, 'ssh_host_ed25519_key'), 'PRIVATE-HOST-KEY\n');
 
-  const first = ok(admin(['trust-mac', `${key} mac-broker`, '--from', '100.64.0.7']));
+  const first = ok(admin(['trust-mac', `${key} mac-broker`, '--from', '100.64.0.7', '--stacks', 'macshared,other']));
+  assert.deepEqual(JSON.parse(await fs.readFile(path.join(dev, 'home', 'sync', 'allowed-stacks.json'), 'utf8')), { stacks: ['macshared', 'other'] });
+  assert.match(first.stdout, /for stacks macshared, other;/);
+  const shown = ok(admin(['list'])).stdout.split('\n}\n').filter(Boolean).map((b) => JSON.parse(`${b}\n}`)).find((b) => b.trust_mac);
+  assert.deepEqual(shown, { trust_mac: { stacks: ['macshared', 'other'], key_line: true } });
   const line = /^restrict,from="100\.64\.0\.7",command="[^"]*\/bin\/agent-broker-admin\.mjs receive-from-mac" ssh-ed25519 AAAA\S+ mac-broker # agent-broker:trust-mac$/;
   const lines = (await fs.readFile(authFile, 'utf8')).split('\n');
   assert.equal(lines.length, 2); // one line and the final newline
@@ -1388,14 +1463,15 @@ test('trust-mac writes exactly one restricted key line and prints the host keys;
   assert.ok(!first.stdout.includes('PRIVATE-HOST-KEY') && !first.stdout.includes('root@somewhere'));
 
   // Rerun: replaces its own line, never a second one.
-  ok(admin(['trust-mac', key, '--from', 'fd7a:115c:a1e0::1']));
+  ok(admin(['trust-mac', key, '--from', 'fd7a:115c:a1e0::1', '--stacks', 'one']));
+  assert.deepEqual(JSON.parse(await fs.readFile(path.join(dev, 'home', 'sync', 'allowed-stacks.json'), 'utf8')), { stacks: ['one'] }); // a rerun replaces the list
   const again = (await fs.readFile(authFile, 'utf8')).trim().split('\n');
   assert.equal(again.length, 1);
   assert.match(again[0], /^restrict,from="fd7a:115c:a1e0::1",command="[^"]*receive-from-mac" ssh-ed25519 AAAA\S+ # agent-broker:trust-mac$/);
 
   // A foreign line is left alone, with a warning.
   await fs.appendFile(authFile, 'ssh-rsa AAAAB3foreign someone\n');
-  const withForeign = ok(admin(['trust-mac', key, '--from', '100.64.0.7']));
+  const withForeign = ok(admin(['trust-mac', key, '--from', '100.64.0.7', '--stacks', 'one']));
   assert.match(withForeign.stderr, /warning: .*did not write/);
   const mixed = (await fs.readFile(authFile, 'utf8')).trim().split('\n');
   assert.equal(mixed.length, 2);
@@ -1411,10 +1487,14 @@ test('trust-mac writes exactly one restricted key line and prints the host keys;
     [[key.replace('ssh-ed25519', 'ssh-rsa'), '--from', '100.64.0.7'], /plain ssh-ed25519/],
     [[`${key} comment with "quote"`, '--from', '100.64.0.7'], /plain ssh-ed25519/],
     [[key], /--from/],
-    [[key, '--from', 'example.com'], /plain IPv4 or IPv6/],
-    [[key, '--from', '100.64.0'], /plain IPv4 or IPv6/],
-    [[key, '--from', '100.64.0.7",command="x'], /plain IPv4 or IPv6/],
-    [[key, '--from', 'fe80::1%eth0'], /plain IPv4 or IPv6/],
+    [[key, '--from', '100.64.0.7'], /--stacks a,b is required/],
+    [[key, '--from', '100.64.0.7', '--stacks', 'one,global'], /"global" can never be allowed/],
+    [[key, '--from', '100.64.0.7', '--stacks', 'one,Bad Name'], /invalid stack name/],
+    [[key, '--from', '100.64.0.7', '--stacks', 'one,,two'], /invalid stack name/],
+    [[key, '--from', 'example.com', '--stacks', 'one'], /plain IPv4 or IPv6/],
+    [[key, '--from', '100.64.0', '--stacks', 'one'], /plain IPv4 or IPv6/],
+    [[key, '--from', '100.64.0.7",command="x', '--stacks', 'one'], /plain IPv4 or IPv6/],
+    [[key, '--from', 'fe80::1%eth0', '--stacks', 'one'], /plain IPv4 or IPv6/],
   ];
   for (const [args, pattern] of refusals) {
     const r = admin(['trust-mac', ...args]);
@@ -1422,9 +1502,11 @@ test('trust-mac writes exactly one restricted key line and prints the host keys;
     assert.match(r.stderr, pattern, args.join(' '));
   }
   assert.equal(await fs.readFile(authFile, 'utf8'), before);
+  assert.deepEqual(JSON.parse(await fs.readFile(path.join(dev, 'home', 'sync', 'allowed-stacks.json'), 'utf8')), { stacks: ['one'] }); // a refusal leaves the list alone
 
   assert.match(ok(admin(['untrust-mac'])).stdout, /removed/);
   assert.equal(await fs.readFile(authFile, 'utf8'), 'ssh-rsa AAAAB3foreign someone\n');
+  assert.equal(await readText(path.join(dev, 'home', 'sync', 'allowed-stacks.json')), null); // untrust-mac takes the list away too
   assert.match(ok(admin(['untrust-mac'])).stdout, /no trust-mac key line/);
   const audit = await fs.readFile(path.join(dev, 'home', 'log', 'broker.log'), 'utf8');
   assert.match(audit, /"admin":"trust-mac","from":"100\.64\.0\.7","fingerprint":"SHA256:/);
@@ -1435,10 +1517,34 @@ test('health: a stack that follows the Mac gets a note with the time of its last
   const henv = { ...process.env, AGENT_BROKER_DEV_ROOT: hdev, AGENT_BROKER_SKIP_VERIFY: '1' };
   const run = (script, args, input) => spawnSync(process.execPath, [path.join(BIN, script), ...args], { cwd: hdev, env: henv, input, encoding: 'utf8' });
   assert.match(run('agent-broker.mjs', ['health']).stdout, /^ok: 0 groups, 0 grants\n$/);
+  assert.equal(run('agent-broker-admin.mjs', ['trust-mac', TRUST_KEY, '--from', '100.64.0.7', '--stacks', 'demo']).status, 0);
   assert.equal(run('agent-broker-admin.mjs', ['receive-from-mac'], `${JSON.stringify({ v: 1, stack: 'demo', key: 'APIFY_TOKEN', value: 'apify-health-value', seq: 7 })}\n`).status, 0);
   const h = run('agent-broker.mjs', ['health']);
   assert.equal(h.status, 0);
   assert.match(h.stdout, /^ok: 0 groups, 0 grants; stack demo: last copy from the Mac 20\d\d-\d\d-\d\dT[\d:.]+Z\n$/);
   assert.ok(!h.stdout.includes('apify-health-value'));
   await fs.rm(hdev, { recursive: true, force: true });
+});
+
+test('receive-from-mac gives up on a connection that never finishes its message (exit 4, retry later), and holds no lock', async () => {
+  const child = spawn(process.execPath, [path.join(BIN, 'agent-broker-admin.mjs'), 'receive-from-mac'], {
+    env: { ...env, AGENT_BROKER_DEV_STDIN_MS: '300' }, stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  let err = '';
+  child.stderr.on('data', (d) => { err += d; });
+  child.stdin.write('{"v":1,'); // never finished, never closed
+  const code = await new Promise((resolve) => child.on('close', resolve));
+  assert.equal(code, 4);
+  assert.match(err, /refused \(timeout\): no complete message within 0\.3 seconds/);
+  ok(admin(['trust-mac', TRUST_KEY, '--from', '100.64.0.7', '--stacks', 'refusals'])); // the earlier trust-mac test removed the list
+  assert.equal(send({ stack: 'refusals', seq: Math.floor(Date.now() / 1000) + 9000 }).status, 0); // the next copy is not blocked
+});
+
+test('get logs only names that passed the checks: a value in the KEY slot never reaches broker.log', async () => {
+  const mistaken = 'sk-MISTAKEN-VALUE-IN-KEY-SLOT';
+  const r = admin(['get', 'nogroup', mistaken]);
+  assert.equal(r.status, 2);
+  const log = await fs.readFile(path.join(dev, 'home', 'log', 'broker.log'), 'utf8');
+  assert.ok(!log.includes(mistaken));
+  assert.match(log, /"admin":"get","group":"nogroup","key":"\(invalid\)"/);
 });

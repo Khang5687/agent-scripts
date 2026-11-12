@@ -169,16 +169,19 @@ async function main(argv) {
   const sep = argv.indexOf('--');
   const flags = sep === -1 ? argv : argv.slice(0, sep);
   const admin = sep === -1 ? [] : argv.slice(sep + 1);
-  const opt = { file: path.join(process.env.HOME ?? '', '.omp/agent/models.yml'), group: 'omp' };
+  const opt = { file: path.join(process.env.HOME ?? '', '.omp/agent/models.yml'), group: 'omp', names: [] };
   for (let i = 0; i < flags.length; i++) {
     const f = flags[i];
     const name = f.replace(/^--/, '');
-    if (!['file', 'group', 'exe'].includes(name) || !f.startsWith('--')) fail(`unexpected argument: ${f}\nusage: agent-broker-admin omp-move --exe DIR [--file models.yml] [--group omp]`);
-    opt[name] = flags[++i] ?? fail(`--${name} needs a value`);
+    if (!['file', 'group', 'exe', 'name'].includes(name) || !f.startsWith('--')) fail(`unexpected argument: ${f}\nusage: agent-broker-admin omp-move --exe DIR [--name omp] [--file models.yml] [--group omp]`);
+    const value = flags[++i] ?? fail(`--${name} needs a value`);
+    if (name === 'name') opt.names.push(value);
+    else opt[name] = value;
   }
   if (!opt.exe) fail('--exe DIR is required: the folder OMP runs from (the broker only hands keys to a program started from there)');
   if (!path.isAbsolute(opt.exe) || opt.exe.split('/').includes('..')) fail('--exe must be an absolute folder without ".."');
   if (!GROUP.test(opt.group)) fail(`invalid group name: ${opt.group}`);
+  for (const n of opt.names) if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(n)) fail(`--name must be a bare program name (no "/"): ${n}`);
   if (!admin.length) fail('no admin command given (run this through agent-broker-admin omp-move)');
 
   const file = await fs.realpath(opt.file).catch(() => fail(`no such file: ${opt.file}`));
@@ -220,7 +223,7 @@ async function main(argv) {
   }
 
   const keys = moves.map((m) => m.key);
-  const args = ['apply', '--group', opt.group, '--ensure-group', '--omp-exe', opt.exe, ...keys.flatMap((k) => ['--add-grant-omp', k])];
+  const args = ['apply', '--group', opt.group, '--ensure-group', '--omp-exe', opt.exe, ...opt.names.flatMap((n) => ['--omp-name', n]), ...keys.flatMap((k) => ['--add-grant-omp', k])];
   const code = await adminCall(admin, args, moves.map((m) => `group:${m.key}=${m.value}\n`).join(''));
   if (code !== 0) {
     await fs.rm(backup, { force: true });
@@ -243,7 +246,7 @@ async function main(argv) {
     fail(`the keys are stored in group ${opt.group}, but ${file} was not rewritten (${e.message}); it is unchanged and the backup is removed. Run the command again.`, 1);
   }
 
-  report(`moved ${moves.length} provider key${moves.length === 1 ? '' : 's'} from ${file} into group ${opt.group} (program grant: ${opt.exe}):`);
+  report(`moved ${moves.length} provider key${moves.length === 1 ? '' : 's'} from ${file} into group ${opt.group} (program grant: ${opt.exe}${opt.names.length ? `, or named ${opt.names.join(', ')}` : ''}):`);
   console.log(`backup of the old file, holding the old keys (mode 0600): ${backup}`);
   console.log('Next, you:');
   console.log(`  1. Start a test agent on each moved provider (${[...new Set(moves.map((m) => m.provider))].join(', ')}); one short prompt each should answer.`);

@@ -31,7 +31,8 @@ On a Mac usually run by the wizard: ~/git/agent-scripts/skills/agent-broker/scri
      --group NAME [--new-group]     a group: secrets for a service or program (values: group:KEY=VALUE lines).
         A grant is replaced as a whole by the unit / root / omp it names:
         --grant-file UNIT:FILE=KEY  (UNIT is e.g. demo.service)   --grant-env UNIT:KEY   --optional KEY
-        --grant-root KEY  --grant-root-write KEY                  --grant-omp KEY [--omp-exe DIR] [--omp-cgroup UNIT]
+        --grant-root KEY  --grant-root-write KEY                  --grant-omp KEY [--omp-exe DIR] [--omp-cgroup UNIT] [--omp-name NAME]
+        (--omp-name: a bare program name, e.g. omp, that also counts as the OMP program; the real OMP starts with argv[0] = omp)
         --add-grant-omp KEY  (adds to the omp grant's keys instead of replacing them)   --remove-grant UNIT|root|omp
      --ensure-group                 like --new-group, but fine when the group already exists
   lookup <stack>                  who the stack's tokens belong to; their sites and databases
@@ -48,7 +49,8 @@ On a Mac usually run by the wizard: ~/git/agent-scripts/skills/agent-broker/scri
   remove-project <name> | remove-stack <name> [--stop-following] | remove-group <name>
                                   a stack that follows the Mac is changed there; --stop-following drops it here only
   receive-from-mac                the Mac's one forced SSH command: one JSON line on stdin (stack, key, value, seq); not for typing
-  trust-mac '<ssh-ed25519 key line>' --from <address>    let the Mac send tokens: writes the one restricted key line
+  trust-mac '<ssh-ed25519 key line>' --from <address> --stacks a,b    let the Mac send tokens for those stacks only: writes the one
+                                  restricted key line and the list (rerun replaces both; "global" can never be on it)
                                   (this machine's SSH host keys are printed: pin them on the Mac)
   untrust-mac                     removes that key line
   share-stack <stack> | unshare-stack <stack>     copy this stack's account tokens to the other machine; each change is
@@ -132,14 +134,15 @@ async function applyGroup(opts, values) {
     grants.set('root', { root: true, keys: opts['grant-root'] ?? [], write: opts['grant-root-write'] ?? [] });
     summary.push(`group ${name}: root grant`);
   }
-  if (opts['grant-omp'] || opts['add-grant-omp'] || opts['omp-exe'] || opts['omp-cgroup']) {
+  if (opts['grant-omp'] || opts['add-grant-omp'] || opts['omp-exe'] || opts['omp-cgroup'] || opts['omp-name']) {
     if (opts['grant-omp'] && opts['add-grant-omp']) fail('--grant-omp replaces the keys, --add-grant-omp adds to them: use one');
     const old = grants.get('omp');
     const exe = opts['omp-exe'] ?? old?.exe;
-    if (!opts['grant-omp'] && !opts['add-grant-omp']) fail('--omp-exe and --omp-cgroup go with --grant-omp KEY or --add-grant-omp KEY');
+    if (!opts['grant-omp'] && !opts['add-grant-omp']) fail('--omp-exe, --omp-cgroup and --omp-name go with --grant-omp KEY or --add-grant-omp KEY');
     if (!exe) fail('--grant-omp needs --omp-exe DIR (the folder the OMP program runs from)');
     const keys = opts['grant-omp'] ?? [...new Set([...(old?.keys ?? []), ...opts['add-grant-omp']])];
-    grants.set('omp', { omp: true, cgroup: opts['omp-cgroup'] ?? old?.cgroup ?? 'paseo.service', exe, keys });
+    const names = opts['omp-name'] ?? old?.names ?? [];
+    grants.set('omp', { omp: true, cgroup: opts['omp-cgroup'] ?? old?.cgroup ?? 'paseo.service', exe, ...(names.length && { names }), keys });
     summary.push(`group ${name}: omp grant`);
   }
 
@@ -172,14 +175,14 @@ async function apply(args) {
     'supabase-ref': 'string', apify: 'bool',
     'vercel-org': 'string', 'vercel-project': 'string', 'remove-service': 'list',
     group: 'string', 'new-group': 'bool', 'grant-file': 'list', 'grant-env': 'list', optional: 'list',
-    'grant-root': 'list', 'grant-root-write': 'list', 'grant-omp': 'list', 'omp-exe': 'string', 'omp-cgroup': 'string',
+    'grant-root': 'list', 'grant-root-write': 'list', 'grant-omp': 'list', 'omp-exe': 'string', 'omp-cgroup': 'string', 'omp-name': 'list',
     'remove-grant': 'list', 'ensure-group': 'bool', 'add-grant-omp': 'list',
   });
   if (positional.length) fail(`unexpected arguments: ${positional.join(' ')}`);
   const values = parseValues(await readStdin());
   if (opts.group) return applyGroup(opts, values);
   if (Object.keys(values.group).length) fail('group:KEY values need --group NAME');
-  for (const f of ['new-group', 'ensure-group', 'grant-file', 'grant-env', 'optional', 'grant-root', 'grant-root-write', 'grant-omp', 'add-grant-omp', 'omp-exe', 'omp-cgroup', 'remove-grant']) {
+  for (const f of ['new-group', 'ensure-group', 'grant-file', 'grant-env', 'optional', 'grant-root', 'grant-root-write', 'grant-omp', 'add-grant-omp', 'omp-exe', 'omp-cgroup', 'omp-name', 'remove-grant']) {
     if (opts[f]) fail(`--${f} needs --group NAME`);
   }
   // Tests only (dev root, never for _deployer): no calls to the services to check tokens and pins.
@@ -193,7 +196,7 @@ async function apply(args) {
   const moveFrom = opts['stack-from-project'] && checkName(opts['stack-from-project']);
   if (opts.stack) {
     checkName(opts.stack, 'stack');
-    if (values.stack && (Object.keys(values.stack).length || moveFrom)) await assertLocalStack(opts.stack);
+    if ((values.stack && (Object.keys(values.stack).length || moveFrom)) || opts['stack-note']) await assertLocalStack(opts.stack);
     const known = await exists(listStacks, opts.stack);
     if (opts['new-stack'] && known) fail(`stack ${opts.stack} already exists`);
     if (!opts['new-stack'] && !known) fail(`unknown stack ${opts.stack} (add --new-stack to create it)`);
@@ -280,9 +283,15 @@ async function apply(args) {
   if (!stack && !project) fail('nothing to do: give --stack and/or --project');
 
   // Everything checked: save.
-  if (stack) {
-    await saveStack(opts.stack, stack);
-    await saveStackSecrets(opts.stack, stackSecrets);
+  // A stack that follows the Mac is never written here: apply's copy of it can be older than a copy that landed meanwhile
+  // (the checks above include network calls). A local stack is written under the receive lock, after one more look at the disk,
+  // so a stack the receiver made in the meantime is not overwritten.
+  if (stack && !stack.followsMac) {
+    await withSyncLock(async () => {
+      if ((await loadStack(opts.stack).catch(() => null))?.followsMac) fail('this stack follows the Mac; change it there');
+      await saveStack(opts.stack, stack);
+      await saveStackSecrets(opts.stack, stackSecrets);
+    });
   }
   if (moveFrom && moveFrom !== opts.project) {
     const from = await loadSecrets(moveFrom);
@@ -325,6 +334,10 @@ async function list() {
     const g = await loadGroup(name);
     console.log(JSON.stringify({ group: name, ...g, keys: Object.keys(await loadGroupSecrets(name)).sort() }, null, 2));
   }
+  const allowed = await allowedStacks();
+  if ((await readKeyLines()).some((l) => l.endsWith(TRUST_MARK)) || allowed.length) {
+    console.log(JSON.stringify({ trust_mac: { stacks: allowed, key_line: (await readKeyLines()).some((l) => l.endsWith(TRUST_MARK)) } }, null, 2));
+  }
   return 0;
 }
 
@@ -353,7 +366,8 @@ async function getValue(group, key) {
     process.stdout.write(`${value}\n`);
     return 0;
   } finally {
-    await audit({ admin: 'get', group: String(group).slice(0, 64), key: String(key).slice(0, 64), result });
+    // Only names that passed the checks are logged: a value given in the KEY slot by mistake must not reach the log.
+    await audit({ admin: 'get', group: NAME.test(String(group)) ? group : '(invalid)', key: KEY.test(String(key)) ? key : '(invalid)', result });
   }
 }
 
@@ -512,17 +526,31 @@ async function assertLocalStack(name) {
 
 const SYNC_LINE_MAX = 64 * 1024;
 
-/** stdin must hold exactly one line (a final newline is fine), at most SYNC_LINE_MAX bytes. */
+/** stdin must hold exactly one line (a final newline is fine), at most SYNC_LINE_MAX bytes, all within a few seconds. */
 async function readMessageLine() {
   if (process.stdin.isTTY) throw new Refused('bad-message', 'no message on stdin');
-  const chunks = [];
-  let size = 0;
-  for await (const chunk of process.stdin) {
-    size += chunk.length;
-    if (size > SYNC_LINE_MAX + 1) throw new Refused('too-large', `the message is longer than ${SYNC_LINE_MAX} bytes`);
-    chunks.push(chunk);
+  const ms = (process.env.AGENT_BROKER_DEV_ROOT && Number(process.env.AGENT_BROKER_DEV_STDIN_MS)) || 10000;
+  let timer;
+  const late = new Promise((_, reject) => {
+    timer = setTimeout(() => { process.stdin.destroy(); reject(new Refused('timeout', `no complete message within ${ms / 1000} seconds`, 4)); }, ms);
+  });
+  const read = (async () => {
+    const chunks = [];
+    let size = 0;
+    for await (const chunk of process.stdin) {
+      size += chunk.length;
+      if (size > SYNC_LINE_MAX + 1) throw new Refused('too-large', `the message is longer than ${SYNC_LINE_MAX} bytes`);
+      chunks.push(chunk);
+    }
+    return Buffer.concat(chunks).toString('utf8');
+  })();
+  read.catch(() => {}); // when the timer wins, a later failure of the read is not an unhandled rejection
+  let text;
+  try {
+    text = await Promise.race([read, late]);
+  } finally {
+    clearTimeout(timer);
   }
-  const text = Buffer.concat(chunks).toString('utf8');
   const line = text.endsWith('\n') ? text.slice(0, -1) : text;
   if (!line) throw new Refused('bad-message', 'the message is empty');
   if (/[\r\n]/.test(line)) throw new Refused('bad-message', 'the message must be one line');
@@ -559,6 +587,8 @@ function parseMessage(line) {
   if (typeof msg.stack !== 'string' || !NAME.test(msg.stack)) throw new Refused('bad-stack', 'invalid stack name');
   if (!ACCOUNT_KEYS.includes(msg.key)) throw new Refused('bad-key', `only account tokens are accepted (${ACCOUNT_KEYS.join(', ')})`);
   if (!Number.isSafeInteger(msg.seq) || msg.seq < 1) throw new Refused('bad-seq', 'seq must be a positive integer');
+  // The sender seeds seq from its clock: a number far ahead would make every later real copy look stale.
+  if (msg.seq > Math.floor(Date.now() / 1000) + 86400) throw new Refused('seq-too-far', 'seq is more than one day ahead of this machine\'s clock');
   if (msg.value !== null && (typeof msg.value !== 'string' || !msg.value || /[\r\n\0]/.test(msg.value))) {
     throw new Refused('bad-value', 'value must be null (delete) or a non-empty text without line breaks');
   }
@@ -567,6 +597,7 @@ function parseMessage(line) {
 
 /** One copy at a time: a lock folder (stale after 30 s). */
 async function withSyncLock(fn) {
+  await fs.mkdir(DIR.sync, { recursive: true, mode: 0o700 });
   const lock = path.join(DIR.sync, 'lock');
   for (let tries = 0; ; tries++) {
     try {
@@ -588,6 +619,10 @@ async function withSyncLock(fn) {
 }
 
 async function storeCopy(msg) {
+  // Only the stacks the owner named in trust-mac (a stolen sender key must not create or change any other stack).
+  if (msg.stack === 'global' || !(await allowedStacks()).includes(msg.stack)) {
+    throw new Refused('stack-not-allowed', `stack ${msg.stack} is not on the list this machine takes from the sender; the owner adds it: agent-broker-admin trust-mac '<key>' --from <address> --stacks <all allowed stacks>`);
+  }
   const known = await exists(listStacks, msg.stack);
   const stack = known ? await loadStack(msg.stack) : { accounts: {} };
   if (known && !stack.followsMac) throw new Refused('local-stack', 'this stack was made here; it does not follow the Mac');
@@ -626,6 +661,18 @@ async function receiveFromMac() {
 const TRUST_MARK = '# agent-broker:trust-mac';
 const SSH_KEY = /^ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI[A-Za-z0-9+/]{43}( [A-Za-z0-9@._+ -]{1,100})?$/;
 const authorizedKeys = () => path.join(DIR.ssh, 'authorized_keys');
+const allowedFile = () => path.join(DIR.sync, 'allowed-stacks.json');
+
+/** The stacks the sender may copy into (the trust-mac record). No file = none. */
+async function allowedStacks() {
+  try {
+    const list = JSON.parse(await fs.readFile(allowedFile(), 'utf8')).stacks;
+    return Array.isArray(list) ? list.filter((s) => typeof s === 'string') : [];
+  } catch (e) {
+    if (e.code === 'ENOENT') return [];
+    throw e;
+  }
+}
 
 async function readKeyLines() {
   const raw = await fs.readFile(authorizedKeys(), 'utf8').catch((e) => (e.code === 'ENOENT' ? '' : Promise.reject(e)));
@@ -650,11 +697,16 @@ async function hostKeys() {
 }
 
 async function trustMac(args) {
-  const { opts, positional } = parseArgs(args, { from: 'string' });
+  const { opts, positional } = parseArgs(args, { from: 'string', stacks: 'string' });
   const key = positional.join(' ');
   if (/[\r\n]/.test(key)) fail('give one key line (no line breaks)');
   if (!SSH_KEY.test(key)) fail("the key must be one plain ssh-ed25519 public key line: ssh-ed25519 AAAA... [comment] (no options, no other key type)");
   const from = opts.from ?? fail('--from <address> is required: the sending machine\'s address (IPv4 or IPv6)');
+  const stacks = [...new Set((opts.stacks ?? fail('--stacks a,b is required: the stacks the sending machine may copy into (names only; "global" cannot be one)')).split(',').map((s) => s.trim()))];
+  for (const s of stacks) {
+    if (!NAME.test(s)) fail(`--stacks: invalid stack name: ${s.slice(0, 60) || '(empty)'}`);
+    if (s === 'global') fail('--stacks: "global" can never be allowed (it is the default stack of every project with none)');
+  }
   if (!/^[0-9A-Fa-f:.]+$/.test(from) || !isIP(from)) fail(`--from must be a plain IPv4 or IPv6 address: ${from.slice(0, 60)}`);
   const command = `${path.join(ROOT, 'bin', 'agent-broker-admin.mjs')} receive-from-mac`;
   if (!/^[\w./ -]+$/.test(command)) fail('the installed admin path has characters that cannot go in an authorized_keys command');
@@ -663,9 +715,11 @@ async function trustMac(args) {
   const others = lines.filter((l) => !l.endsWith(TRUST_MARK));
   for (const l of others) if (!l.startsWith('#')) console.error(`warning: ${authorizedKeys()} has a key line agent-broker did not write (left alone; it may let someone in): ${l.slice(0, 50)}...`);
   await writeKeyLines([...others, ours]);
+  await fs.mkdir(DIR.sync, { recursive: true, mode: 0o700 });
+  await writePrivate(allowedFile(), `${JSON.stringify({ stacks }, null, 2)}\n`);
   const fingerprint = `SHA256:${createHash('sha256').update(Buffer.from(key.split(' ')[1], 'base64')).digest('base64').replace(/=+$/, '')}`;
-  await audit({ admin: 'trust-mac', from, fingerprint });
-  console.log(`trusted ${fingerprint} from ${from}; it may run only: ${command}`);
+  await audit({ admin: 'trust-mac', from, fingerprint, stacks });
+  console.log(`trusted ${fingerprint} from ${from} for stacks ${stacks.join(', ')}; it may run only: ${command}`);
   const { dir, out } = await hostKeys();
   if (!out.length) console.log(`no SSH host keys found in ${dir}: is sshd installed here? Pin the host key on the sending machine once it is.`);
   for (const k of out) console.log(`host key (pin it on the sending machine, never trust on first use): ${k}`);
@@ -680,6 +734,7 @@ async function untrustMac() {
     return 0;
   }
   await writeKeyLines(kept);
+  await fs.rm(allowedFile(), { force: true });
   await audit({ admin: 'untrust-mac' });
   console.log('removed the trust-mac key line');
   return 0;

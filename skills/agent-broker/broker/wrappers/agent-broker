@@ -44,6 +44,7 @@ run_group() {
   { [ -d "$dir" ] && [ ! -L "$dir" ]; } || die "RUNTIME_DIRECTORY is not a real folder"
   [ -O "$dir" ] || die "RUNTIME_DIRECTORY is not owned by the calling user"
   [ -n "$(find "$dir" -maxdepth 0 -perm 700)" ] || die "RUNTIME_DIRECTORY must be mode 0700: set RuntimeDirectoryMode=0700 in the unit"
+  case $dir in *-keys) ;; *) die "RUNTIME_DIRECTORY must end in -keys (RuntimeDirectory=<unit>-keys): the secret guard hides only those folders from agents" ;; esac
 
   tmp=$(umask 077; mktemp "$dir/.run.XXXXXX") && err=$(umask 077; mktemp "$dir/.run.XXXXXX") || die "cannot create a temporary file in RUNTIME_DIRECTORY"
   trap 'rm -f "$tmp" "$err"' EXIT

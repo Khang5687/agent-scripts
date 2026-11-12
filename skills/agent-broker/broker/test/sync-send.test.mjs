@@ -63,17 +63,38 @@ async function pair() {
   return { base, send, recv, calls, mode, stdinLog: () => fs.readFile(path.join(sdir, 'stdin.log'), 'utf8').catch(() => '') };
 }
 
+const TRUST_KEY = `ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI${'Abc1'.repeat(11).slice(0, 43)}`;
+
 /** A sender that is set up and shares stack `demo`. */
 async function ready(extra = {}) {
   const p = await pair();
   assert.equal(p.send.admin(['sync-setup', '--to', '100.64.0.7', '--host-key', HOST_KEY]).status, 0);
   assert.equal(p.send.admin(['apply', '--stack', 'demo', '--new-stack']).status, 0);
   assert.equal(p.send.admin(['share-stack', 'demo']).status, 0);
+  // The receiver names the stacks the sender may copy into (a sender key alone must not create any stack there).
+  assert.equal(p.recv.admin(['trust-mac', TRUST_KEY, '--from', '100.64.0.7', '--stacks', 'demo,second,plain']).status, 0);
   return { ...p, ...extra };
 }
 const ok = (r) => { assert.equal(r.status, 0, `${r.stdout}${r.stderr}`); return r; };
 const setKey = (p, key, value) => ok(p.send.admin(['set-stack', 'demo', key], `${value}\n`));
 const everything = (...rs) => rs.map((r) => `${r.stdout}\n${r.stderr}`).join('\n');
+
+test('a stack the receiver did not allow is refused for good (stack-not-allowed), keeps no value, and creates nothing there', async () => {
+  const p = await ready();
+  ok(p.recv.admin(['trust-mac', TRUST_KEY, '--from', '100.64.0.7', '--stacks', 'other']));
+  const r = setKey(p, 'APIFY_TOKEN', V1);
+  assert.match(r.stdout, /refused the copy \(stack-not-allowed\): stack demo is not on the list this machine takes from the sender/);
+  const e = await p.send.entry('demo', 'APIFY_TOKEN');
+  assert.equal(e.state, 'refused');
+  assert.equal(e.code, 'stack-not-allowed');
+  assert.equal(e.value, undefined);
+  assert.equal(await fs.readdir(path.join(p.recv.home, 'stacks')).then((l) => l.includes('demo.json')), false);
+  assert.match(p.send.broker(['health']).stdout, /copy refused by the other machine: demo APIFY_TOKEN \(stack-not-allowed\)/);
+  // The owner adds the stack there; the sender asks again.
+  ok(p.recv.admin(['trust-mac', TRUST_KEY, '--from', '100.64.0.7', '--stacks', 'other,demo']));
+  ok(p.send.admin(['sync-push', '--all']));
+  assert.equal(await p.recv.secrets('demo'), `APIFY_TOKEN=${V1}\n`);
+});
 
 test.after(() => Promise.all(bases.map((b) => fs.rm(b, { recursive: true, force: true }))));
 
@@ -206,6 +227,7 @@ test('offline: the change is saved, the command succeeds, one entry waits (the n
 
 test('sync-retry with nothing waiting or no target does nothing; a waiting copy without a target says so and calls nothing', async () => {
   const p = await pair();
+  ok(p.recv.admin(['trust-mac', TRUST_KEY, '--from', '100.64.0.7', '--stacks', 'demo']));
   assert.equal(ok(p.send.broker(['sync-retry'])).stdout, '');
   ok(p.send.admin(['apply', '--stack', 'demo', '--new-stack']));
   ok(p.send.admin(['share-stack', 'demo']));
