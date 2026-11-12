@@ -96,7 +96,7 @@ agent-broker compose exec -T db psql -U app < dump.sql                   # stdin
 - A compose stack folder is a project; its secrets live in the broker, its `.env` keeps only the non-secret settings.
 - Runs in the registered folder only (never a git worktree of it: same Compose project name = live containers).
   `--env-file`, `-p`, `--project-directory` are not offered; drop `--env-file .env` from old runbook commands. `-f`
-  takes a file inside the project (not `-`, not a remote reference), and so does `COMPOSE_FILE` in `.env`.
+  takes a file inside the project (not `-`, not a remote reference). Only `exec` gets your stdin.
 - Plain `docker compose` there fails on `${VAR:?set VAR}`: that is the cue to use the broker. `docker logs <container>`
   and `docker ps` need no secrets.
 - Output is scrubbed of stored values; `compose config` shows `[secret]`.
@@ -202,9 +202,11 @@ Each `agent-broker-admin` call asks your password.
   `no-new-privileges`, and a volume `device` that is not a bind (an `o` that is exactly `bind` or `rbind`) passing the
   checks; every host path the client reads or writes (secrets, configs, `env_file`, `label_file`, build context,
   absolute or climbing `dockerfile`, `ssh`, `type=local` cache) when it is in the broker's home. Compose files: `-f`
-  and each `COMPOSE_FILE` entry (from the stored values or the folder's `.env`, split on `COMPOSE_PATH_SEPARATOR`) must
-  be a file inside the project, never `-` (stdin) or a remote reference; `COMPOSE_ENV_FILES` is refused. Only `run` and
-  `exec` get the caller's stdin. What it does not stop: a compose file or `.env` rewritten between the check and the
+  must be a file inside the project, never `-` (stdin) or a remote reference; a plain `COMPOSE_FILE` line (stored
+  values or the folder's `.env`) gets the same rule, and `COMPOSE_ENV_FILES` is refused. Because Compose reads `.env`
+  in more forms than the broker does, the guarantee is this instead: only `exec` gets the caller's stdin, so a compose
+  file "from stdin" is empty for every command that starts containers, and compose files from git or a registry are
+  switched off. What it does not stop: a compose file or `.env` rewritten between the check and the
   real call (the real call reads the files again; running it on the checked JSON was not done because it cannot be
   proven here that Compose then keeps every container unchanged), a path swapped after the check, a socket under
   another name, a top-level `name:` or `COMPOSE_PROJECT_NAME` that points at another project's containers (the owner has

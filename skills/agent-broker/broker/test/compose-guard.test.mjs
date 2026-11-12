@@ -321,16 +321,22 @@ test('Y1: a compose file from stdin, a remote file or a hidden file list is refu
   assert.equal(plain.ran[0], 'RAN compose up -d'); // no explicit -f where there was none
 });
 
-test('Y1: stdin goes only to run and exec; up, build, restart, start and the rest run with it ignored', async () => {
-  for (const command of ['up', 'build', 'restart', 'start', 'ps', 'pull']) {
-    const r = await compose(svc({}), [command], { input: 'services: {web: {image: evil}}\n' });
-    assert.equal(r.status, 0, `${command}: ${r.stderr}`);
-    assert.deepEqual(r.stdinSeen, [''], `${command} must not see stdin`);
+test('Z1: stdin goes only to exec; run, up, build, restart, start and the rest run with it ignored', async () => {
+  for (const args of [['up'], ['build'], ['restart'], ['start'], ['ps'], ['pull'], ['run', '--rm', '-T', 'web', 'cat']]) {
+    const r = await compose(svc({}), args, { input: 'services: {web: {image: evil}}\n' });
+    assert.equal(r.status, 0, `${args[0]}: ${r.stderr}`);
+    assert.deepEqual(r.stdinSeen, [''], `${args[0]} must not see stdin`);
   }
-  for (const args of [['exec', '-T', 'db', 'psql'], ['run', '--rm', '-T', 'web', 'cat']]) {
-    const r = await compose(svc({}), args, { input: 'select 1;\n' });
-    assert.equal(r.status, 0, r.stderr);
-    assert.deepEqual(r.stdinSeen, ['select 1;'], `${args[0]} keeps stdin (the runbooks pipe SQL into exec -T)`);
+  const r = await compose(svc({}), ['exec', '-T', 'db', 'psql'], { input: 'select 1;\n' });
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(r.stdinSeen, ['select 1;'], 'exec keeps stdin (the runbooks pipe SQL into exec -T)');
+});
+
+test('Z2: a local cache entry is read the way buildx reads it (keys in any case, quoted CSV)', async () => {
+  for (const entry of [`TYPE=local,DEST=${home}/c`, `type=local,Dest=${home}/c`, `"type=local","dest=${home}/c"`]) {
+    const r = await compose(svc({ build: { context: '.', cache_to: [entry] } }), ['up', '-d']);
+    assert.equal(r.status, 2, entry);
+    assert.match(r.stderr, /cache_to/);
   }
 });
 

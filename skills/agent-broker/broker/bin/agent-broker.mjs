@@ -16,7 +16,7 @@ import {
   stackFromAgentsMd, syncProject,
 } from './lib.mjs';
 import { deliver, describeDelivery, healthNotes } from './sync.mjs';
-import { COMPOSE_COMMAND_NAMES, COMPOSE_COMMANDS, commandProblems, configProblems, fileEntryProblem, fileListProblems, needsCheck, takesStdin } from './compose-guard.mjs';
+import { COMPOSE_COMMAND_NAMES, COMPOSE_COMMANDS, COMPOSE_ENV, commandProblems, configProblems, fileEntryProblem, fileListProblems, needsCheck, takesStdin } from './compose-guard.mjs';
 
 const HELP = `agent-broker <service> <action> [options]      run inside the project's folder: the folder picks the project
 
@@ -446,7 +446,7 @@ async function compose(cwd, args) {
     }
   }
   const code = await run('docker', ['compose', ...opts, command, ...rest],
-    { cwd: P.root, env: secrets, scrub, sandbox: false, stdin: takesStdin(command) ? 'inherit' : 'ignore' });
+    { cwd: P.root, env: { ...secrets, ...COMPOSE_ENV }, scrub, sandbox: false, stdin: takesStdin(command) ? 'inherit' : 'ignore' });
   await audit({ service: 'compose', command, project: P.name, code });
   return code;
 }
@@ -461,7 +461,7 @@ async function composeProblems(P, opts, command, secrets) {
   const problems = [];
   const chunks = [];
   const code = await run('docker', ['compose', ...opts.filter((o) => o !== '--dry-run'), '--profile', '*', 'config', '--format', 'json'], {
-    cwd: P.root, env: secrets, scrub: makeScrubber(await allSecretValues()), outScrub: (s) => s, out: { write: (s) => chunks.push(s) }, sandbox: false,
+    cwd: P.root, env: { ...secrets, ...COMPOSE_ENV }, scrub: makeScrubber(await allSecretValues()), outScrub: (s) => s, out: { write: (s) => chunks.push(s) }, sandbox: false,
   });
   if (code !== 0) fail(`compose could not resolve this project's configuration (exit ${code}), so ${command} was not started`);
   let config;

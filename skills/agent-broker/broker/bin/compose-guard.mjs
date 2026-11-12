@@ -77,10 +77,11 @@ export async function configProblems(config, { home, cwd, otherValues = [] }) {
     for (const s of Array.isArray(ssh) ? ssh : Object.entries(ssh).map(([id, p]) => `${id}=${p}`)) await bad(`${at} build ssh`, typeof s === 'string' ? s.split('=').slice(1).join('=') : s?.path);
     for (const key of ['cache_from', 'cache_to']) {
       for (const entry of svc.build?.[key] ?? []) {
-        const parts = String(entry).split(',');
-        if (!parts.includes('type=local')) continue;
+        // buildx reads an entry as CSV and lowercases the keys: drop quotes and compare keys without case.
+        const parts = String(entry).replaceAll('"', '').split(',').map((p) => p.trim());
+        if (!parts.some((p) => /^type=local$/i.test(p))) continue;
         for (const part of parts) {
-          const m = /^(?:src|dest)=(.*)$/.exec(part);
+          const m = /^(?:src|dest)=(.*)$/i.exec(part);
           if (m) await bad(`${at} build ${key}`, m[1]);
         }
       }
@@ -139,8 +140,15 @@ export const COMPOSE_COMMANDS = {
 export const COMPOSE_COMMAND_NAMES = Object.keys(COMPOSE_COMMANDS);
 export const needsCheck = (command) => Object.hasOwn(COMPOSE_COMMANDS, command) && COMPOSE_COMMANDS[command].check === true;
 
-/** Commands that get the caller's stdin. Every other command runs with stdin ignored, so no file can arrive on it. */
-export const takesStdin = (command) => command === 'run' || command === 'exec';
+/**
+ * Only `exec` gets the caller's stdin (it starts no container and is not checked). Every command that can start one runs
+ * with stdin ignored, in the check and in the real call alike, so a compose file "from stdin" (`-`, however it got into
+ * the file list) is empty both times. This, not the `.env` reading below, is what keeps the two reads the same.
+ */
+export const takesStdin = (command) => command === 'exec';
+
+/** Set in the environment of the check and of the real call (an OS value wins over `.env`): no compose file fetched from git or a registry. */
+export const COMPOSE_ENV = { COMPOSE_EXPERIMENTAL_GIT_REMOTE: 'false', COMPOSE_EXPERIMENTAL_OCI_REMOTE: 'false' };
 
 /** Why one compose file entry (`-f` value, or one `COMPOSE_FILE` entry) is refused, or null: it must be a file inside the project. */
 export function fileEntryProblem(e) {
@@ -151,7 +159,7 @@ export function fileEntryProblem(e) {
   return null;
 }
 
-/** The value of KEY in the text of a `.env` file, the way Compose reads a plain line (`KEY=v`, `export KEY="v"`), or undefined. */
+/** The value of KEY in a `.env` file for a plain `KEY=v` or `export KEY="v"` line. Compose's own parser accepts more forms (`KEY: v`, inline comments, escapes): this is a courtesy check, not the guarantee. */
 function dotenvValue(text, key) {
   let found;
   for (const line of text.split(/\r?\n/)) {
@@ -162,10 +170,11 @@ function dotenvValue(text, key) {
 }
 
 /**
- * The compose file list the real call would load beyond `-f`: `COMPOSE_FILE` split on `COMPOSE_PATH_SEPARATOR` (default
- * `:`), read from the environment the broker passes (the project's stored values, which win) and then the folder's
- * `.env`. Each entry follows the `-f` rule. `COMPOSE_ENV_FILES` points Compose at other env files: refused. The check and
- * the real call read the same list, so no file the check did not see can be loaded.
+ * A clear message for the plain cases: `COMPOSE_FILE` split on `COMPOSE_PATH_SEPARATOR` (default `:`), from the project's
+ * stored values and then the folder's `.env`; each entry follows the `-f` rule; `COMPOSE_ENV_FILES` is refused. A `.env`
+ * line written in a form this reader misses is NOT caught here. What then still holds: stdin is ignored for every
+ * command that starts containers (takesStdin), remote files are off (COMPOSE_ENV), and whatever local files the list
+ * names are the same files in the check and in the real call.
  */
 export async function fileListProblems(env, cwd) {
   const dotenv = await fs.readFile(path.join(cwd, '.env'), 'utf8').catch(() => '');
