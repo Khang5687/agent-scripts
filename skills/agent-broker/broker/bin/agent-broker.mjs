@@ -10,7 +10,7 @@ import path from 'node:path';
 import { createNetlifySite, createReadOnlyUser, lookup, verifyPins } from './accounts.mjs';
 import {
   CA_FILE, DIR, KEY, LINUX, NAME, SERVICES, UsageError, allSecretValues, assertNoSecret, assertUnclaimed, audit, checkName,
-  checkRelative, effectiveStack, fail, gitRoot, listProjects, listStacks, loadGroup, loadGroupSecrets, loadProject,
+  checkRelative, effectiveStack, fail, gitRoot, listGroups, listProjects, listStacks, loadGroup, loadGroupSecrets, loadProject,
   loadSecrets, loadStack, loadStackSecrets, makeScrubber, mkdirs, parseArgs, projectSecrets, resolveProject, run,
   saveProject, saveSecrets,
   stackFromAgentsMd, syncProject,
@@ -25,6 +25,7 @@ const HELP = `agent-broker <service> <action> [options]      run inside the proj
                              with the keys its group grants; refused for any other caller
   agent-broker key <group> <KEY>   for a program's key line (OMP apiKey "!..."): prints that one value to the
                              program the group's program grant names; refused for anything else
+  agent-broker health        can the broker serve every key its groups promise? one line, no values; exit 0 = healthy
 
 New project (a folder not registered yet; the user names the stack; stacks come from the owner's wizard):
   agent-broker init --stack S --list                     the stack's sites and databases (free or used by a project)
@@ -834,6 +835,67 @@ async function keyValue(group, key) {
   }
 }
 
+/**
+ * agent-broker health: can the broker serve what its groups promise? Exactly one line on stdout, no value in it; exit 0
+ * healthy, 1 broken. Checks per group: the record parses and its grants are valid; every required key a grant names has
+ * a stored value (an optional one is only a note); a program grant's folder exists; the values file can be read.
+ * Broken line: `broker broken (<causes>), so <units / programs> cannot get keys`. The wrapper writes the status file
+ * (the broker user cannot write the status folder).
+ * NOT CHECKED HERE yet, each is its own later step: the age of the Mac copy of the account tokens, that the cloud-CLI
+ * sandbox starts, and a scan of the audit log for refused calls.
+ */
+async function health() {
+  const causes = [];
+  const stops = new Set();
+  const notes = [];
+  let groups = 0;
+  let grants = 0;
+  for (const name of await listGroups()) {
+    groups++;
+    let group;
+    let secrets;
+    let unreadable = null;
+    try {
+      group = await loadGroup(name);
+    } catch {
+      unreadable = `cannot read group ${name}`;
+    }
+    if (!unreadable) {
+      try { secrets = await loadGroupSecrets(name); } catch { unreadable = `cannot read the values of group ${name}`; }
+    }
+    if (unreadable) {
+      causes.push(unreadable);
+      // Name what the broken record would have served, as far as the file still tells.
+      const raw = await fs.readFile(path.join(DIR.groups, `${name}.json`), 'utf8').then(JSON.parse).catch(() => null);
+      const units = (Array.isArray(raw?.grants) ? raw.grants : []).map((g) => g?.unit).filter((u) => typeof u === 'string');
+      if (units.length) for (const u of units) stops.add(u); else stops.add(`everything in group ${name}`);
+      continue;
+    }
+    for (const g of group.grants) {
+      grants++;
+      const label = g.unit ?? (g.root ? 'root setup scripts' : `programs from ${g.exe}`);
+      const optional = new Set(g.optional ?? []);
+      const needed = g.unit ? [...Object.values(g.files ?? {}), ...(g.env ?? [])] : (g.keys ?? []);
+      for (const key of new Set(needed)) {
+        if (key in secrets) continue;
+        if (optional.has(key)) { notes.push(`${name}.${key}`); continue; }
+        causes.push(`group ${name} has no value for ${key}`);
+        stops.add(label);
+      }
+      if (g.omp && !(await fs.stat(g.exe).then((s) => s.isDirectory(), () => false))) {
+        causes.push(`program folder ${g.exe} is missing or not readable by the broker`);
+        stops.add(label);
+      }
+    }
+  }
+  const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
+  const line = causes.length
+    ? `broker broken (${causes.join('; ')}), so ${[...stops].join(', ')} cannot get keys`
+    : `ok: ${plural(groups, 'group')}, ${plural(grants, 'grant')}${notes.length ? `; optional without a value: ${notes.join(', ')}` : ''}`;
+  process.stdout.write(`${line.replace(/[\r\n]+/g, ' ')}\n`);
+  return causes.length ? 1 : 0;
+}
+
 async function main(argv) {
   const cwd = process.cwd(); // the caller's folder (sudo keeps it): it decides the project
   await mkdirs();
@@ -845,6 +907,7 @@ async function main(argv) {
   if (service === 'result') return result(action);
   if (service === 'run') return runGroup(action);
   if (service === 'key') return keyValue(action, args[0]);
+  if (service === 'health') return health();
   const after = [action, ...args].filter((a) => a !== undefined);
   if (service === 'whoami') return whoami(cwd, takeFlags(after));
   if (service === 'init') return init(cwd, after);

@@ -83,9 +83,27 @@ run_group() {
   exit 0
 }
 
+# health: asks the broker for its one-line verdict, prints it, and writes the control-room status file (the broker user
+# cannot write that folder). A broker call that fails before printing anything is itself the verdict.
+health_run() {
+  [ $# -eq 1 ] || { echo "usage: agent-broker health" >&2; exit 2; }
+  local line reason rc=0 err
+  err=$(mktemp) || { echo "agent-broker health: cannot create a temporary file" >&2; exit 1; }
+  trap 'rm -f "$err"' EXIT
+  line=$("${BROKER[@]}" health 2>"$err" </dev/null | head -n1; exit "${PIPESTATUS[0]}") || rc=$?
+  if [ -z "$line" ]; then
+    reason=$(head -n1 "$err" | sed 's/^agent-broker: //' | cut -c1-200)
+    line="broker broken (${reason:-the broker call failed (exit $rc)}), so no service or program can get keys"
+    [ $rc -ne 0 ] || rc=1
+  fi
+  echo "$line"
+  if [ $rc -eq 0 ]; then status agent-broker-health ok "$line"; else status agent-broker-health fail "$line"; fi
+  exit $rc
+}
 
 case "${1:-}" in
   run) run_group "$@" ;;
+  health) health_run "$@" ;;
   key) exec "${BROKER[@]}" "$@" ;; # a program's key line: stdout is the value only, the broker's exit code is the caller's
   init)
     "${BROKER[@]}" "$@" || exit $?

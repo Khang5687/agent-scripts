@@ -1,0 +1,10 @@
+[Unit]
+Description=Check that the agent broker can serve every key its groups promise
+
+[Service]
+Type=oneshot
+# The wrapper writes the control-room status file when a status writer is named. Example (set both in a drop-in):
+#Environment=AGENT_BROKER_STATUS_WRITER=%h/path/to/write_status.py
+#Environment=AGENT_BROKER_STATUS_DIR=/path/to/status-folder
+# Exit 0 = healthy, 1 = broken (the unit then shows as failed until the next healthy run).
+ExecStart=/usr/local/bin/agent-broker health

@@ -875,3 +875,89 @@ test('key wrapper: stdout is the value and nothing else, and the broker\'s exit 
   assert.equal(viaWrapper('KEY_Z').status, 2);
   await fs.rm(proc, { recursive: true, force: true });
 });
+
+// ---- health ------------------------------------------------------------------------------------------------------
+
+test('health: one line, exit 0 when every promised key can be served, exit 1 naming the cause and what it stops', async () => {
+  const hdev = await fs.mkdtemp(path.join(os.tmpdir(), 'agent-broker-health-'));
+  const henv = { ...process.env, AGENT_BROKER_DEV_ROOT: hdev, AGENT_BROKER_SKIP_VERIFY: '1' };
+  const hadmin = (args, input) => spawnSync(process.execPath, [path.join(BIN, 'agent-broker-admin.mjs'), ...args], { env: henv, input, encoding: 'utf8' });
+  const health = () => spawnSync(process.execPath, [path.join(BIN, 'agent-broker.mjs'), 'health'], { cwd: hdev, env: henv, encoding: 'utf8' });
+  const programDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agent-broker-program-'));
+  const HV = 'health-value-abc-123';
+  const seen = [];
+  const check = (r, status, pattern) => {
+    assert.equal(r.status, status, `${r.stdout}${r.stderr}`);
+    assert.equal(r.stderr, '');
+    assert.match(r.stdout, pattern);
+    assert.equal(r.stdout.trim().split('\n').length, 1); // exactly one line
+    assert.ok(!r.stdout.includes(HV));
+    seen.push(r.stdout);
+  };
+
+  check(health(), 0, /^ok: 0 groups, 0 grants\n$/); // no groups is healthy
+
+  ok(hadmin(['apply', '--group', 'hg', '--new-group', '--grant-file', 'demo.service:f=HK_A', '--grant-file', 'demo.service:g=HK_B', '--optional', 'HK_B',
+    '--grant-omp', 'HK_A', '--omp-exe', `${programDir}/`], `group:HK_A=${HV}\n`));
+  check(health(), 0, /^ok: 1 group, 2 grants; optional without a value: hg\.HK_B\n$/); // optional missing is a note
+
+  // A group record that does not parse, and one whose grant is invalid: findings, not a crash.
+  const groupsDir = path.join(hdev, 'home/groups');
+  await fs.writeFile(path.join(groupsDir, 'bad.json'), '{ "grants": [ {"unit": "broken.service"');
+  await fs.writeFile(path.join(groupsDir, 'invalid.json'), JSON.stringify({ grants: [{ unit: 'inv.service', files: { '../x': 'HK_A' } }] }));
+  const broken = health();
+  check(broken, 1, /^broker broken \(cannot read group bad; cannot read group invalid\), so everything in group bad, inv\.service cannot get keys\n$/);
+  await fs.rm(path.join(groupsDir, 'bad.json'));
+  await fs.rm(path.join(groupsDir, 'invalid.json'));
+
+  // A required key without a value names the key and the unit (the same words `run` and `key` use).
+  ok(hadmin(['apply', '--group', 'req', '--new-group', '--grant-file', 'req.service:f=REQ_KEY', '--grant-env', 'req.service:REQ_ENV'], 'group:REQ_ENV=env-value-xyz-9\n'));
+  check(health(), 1, /^broker broken \(group req has no value for REQ_KEY\), so req\.service cannot get keys\n$/);
+  ok(hadmin(['set-group', 'req', 'REQ_KEY'], 'later-value-777\n'));
+  check(health(), 0, /^ok: 2 groups, 3 grants; optional without a value: hg\.HK_B\n$/);
+  ok(hadmin(['apply', '--group', 'req', '--grant-root', 'REQ_ROOT']));
+  check(health(), 1, /\(group req has no value for REQ_ROOT\), so root setup scripts cannot get keys/);
+  ok(hadmin(['apply', '--group', 'req', '--remove-grant', 'root']));
+
+  // A program grant whose folder is gone.
+  await fs.rm(programDir, { recursive: true });
+  check(health(), 1, new RegExp(`^broker broken \\(program folder ${programDir.replaceAll('/', '\\/')}\\/ is missing or not readable by the broker\\), so programs from ${programDir.replaceAll('/', '\\/')}\\/ cannot get keys\\n$`));
+  for (const v of [HV, 'env-value-xyz-9', 'later-value-777']) assert.ok(!seen.join('').includes(v));
+
+  // Wrapper: prints the broker's line, writes ok / fail status files, and answers when the broker call itself fails.
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), 'agent-broker-hwrap-'));
+  const statusLog = path.join(base, 'status.log');
+  const fakeWriter = path.join(base, 'writer.sh');
+  await fs.writeFile(fakeWriter, `#!/bin/bash\nprintf '%s\\n' "$*" >> '${statusLog}'\n`, { mode: 0o700 });
+  const stand = async (body) => { const f = path.join(base, `broker-${Math.random().toString(36).slice(2)}.sh`); await fs.writeFile(f, `#!/bin/bash\n${body}\n`, { mode: 0o700 }); return f; };
+  const wrapper = path.resolve(import.meta.dirname, '../wrappers/agent-broker');
+  const viaWrapper = (broker) => spawnSync('bash', [wrapper, 'health'], {
+    cwd: hdev, encoding: 'utf8',
+    env: { ...henv, AGENT_BROKER_DEV_BROKER: broker, AGENT_BROKER_STATUS_WRITER: fakeWriter, AGENT_BROKER_STATUS_DIR: path.join(base, 'status') },
+  });
+  const real = await stand(`exec '${process.execPath}' '${path.join(BIN, 'agent-broker.mjs')}' "$@"`);
+  const bad = viaWrapper(real); // the folder is gone: broken
+  assert.equal(bad.status, 1);
+  assert.match(bad.stdout, /^broker broken \(program folder .* is missing/);
+  assert.match(await fs.readFile(statusLog, 'utf8'), /--job agent-broker-health --result fail --category host --service agent-broker --summary broker broken \(program folder .*--dir /);
+
+  await fs.writeFile(statusLog, '');
+  ok(hadmin(['apply', '--group', 'hg', '--remove-grant', 'omp']));
+  const good = viaWrapper(real);
+  assert.equal(good.status, 0, good.stderr);
+  assert.equal(good.stdout, 'ok: 2 groups, 2 grants; optional without a value: hg.HK_B\n');
+  assert.match(await fs.readFile(statusLog, 'utf8'), /--job agent-broker-health --result ok .*--summary ok: 2 groups, 2 grants/);
+
+  await fs.writeFile(statusLog, '');
+  const sudoGone = viaWrapper(await stand('echo "sudo: a password is required" >&2; exit 1'));
+  assert.equal(sudoGone.status, 1);
+  assert.equal(sudoGone.stdout, 'broker broken (sudo: a password is required), so no service or program can get keys\n');
+  assert.match(await fs.readFile(statusLog, 'utf8'), /--result fail .*--summary broker broken \(sudo: a password is required\), so no service or program can get keys/);
+
+  await fs.writeFile(statusLog, '');
+  const silent = viaWrapper(await stand('exit 7'));
+  assert.equal(silent.status, 7);
+  assert.equal(silent.stdout, 'broker broken (the broker call failed (exit 7)), so no service or program can get keys\n');
+  assert.match(await fs.readFile(statusLog, 'utf8'), /--result fail .*exit 7/);
+  for (const d of [hdev, programDir, base]) await fs.rm(d, { recursive: true, force: true });
+});
