@@ -36,6 +36,9 @@ On a Mac usually run by the wizard: ~/git/agent-scripts/skills/agent-broker/scri
      --ensure-group                 like --new-group, but fine when the group already exists
   lookup <stack>                  who the stack's tokens belong to; their sites and databases
   set <project> <KEY> | set-stack <stack> <KEY> | set-group <group> <KEY>     store one value (typed hidden)
+  get <group> <KEY>               prints one raw value and a newline; only for root-run setup scripts (root through sudo, no
+                                  password) and only for a key in the group's root grant keys. A root caller's set-group
+                                  stores only keys in that grant's write list
   import <project> <env-file> <KEY>...              move keys out of a .env file
   import-group <group>            KEY=VALUE lines on stdin, taken literally (used by: agent-broker-admin import-files)
   omp-move --exe DIR [--file F] [--group G]   move literal provider keys out of OMP's models.yml into group G (default omp);
@@ -325,6 +328,45 @@ async function list() {
   return 0;
 }
 
+// The root grant (a group's `root: true` grant): scripts the owner runs as root read the keys in its `keys` and store the keys in
+// its `write` with no password prompt (root starts them). It is an interface with a guard for scripts, not a wall: root can read the files anyway.
+// `SUDO_UID` is set by sudo itself to the uid of whoever ran sudo; exactly "0" means root. Any other caller keeps the owner's password-backed path.
+const rootCaller = () => process.env.SUDO_UID === '0';
+
+/** `get <group> <KEY>`: exit 0 value, 2 refused, 3 granted but no stored value (as `agent-broker key`). Audit: group, key name, result. */
+async function getValue(group, key) {
+  let result = 'error';
+  try {
+    checkName(group ?? '', 'group');
+    if (!KEY.test(key ?? '')) fail(`invalid key name: ${String(key ?? '(missing)').slice(0, 64)}`);
+    if (!rootCaller()) { result = 'not-root'; fail('get is only for setup scripts run by root through sudo'); }
+    const grant = (await loadGroup(group)).grants.find((g) => g.root);
+    if (!grant) { result = 'no-grant'; fail(`group ${group} has no root grant`); }
+    if (!(grant.keys ?? []).includes(key)) { result = 'not-granted'; fail(`${key} is not in the root grant's keys of group ${group}`); }
+    const value = (await loadGroupSecrets(group))[key];
+    if (value === undefined) {
+      result = 'no-value';
+      console.error(`agent-broker-admin: group ${group} has no value for ${key}`);
+      return 3;
+    }
+    result = 'ok';
+    process.stdout.write(`${value}\n`);
+    return 0;
+  } finally {
+    await audit({ admin: 'get', group: String(group).slice(0, 64), key: String(key).slice(0, 64), result });
+  }
+}
+
+/** A root caller may store only the keys in the root grant's `write` list. */
+async function assertRootMayWrite(group, keys) {
+  const write = (await loadGroup(group)).grants.find((g) => g.root)?.write ?? [];
+  for (const key of keys) {
+    if (write.includes(key)) continue;
+    await audit({ admin: 'set-group', group, key, result: 'root-not-in-write-list' });
+    fail(`${key} is not in the root grant's write list of group ${group}`);
+  }
+}
+
 const KINDS = {
   project: { load: loadProject, loadSecrets, saveSecrets },
   stack: { load: loadStack, loadSecrets: loadStackSecrets, saveSecrets: saveStackSecrets },
@@ -336,6 +378,7 @@ async function setValues(kind, name, entries) {
   checkName(name, kind);
   if (kind === 'stack') await assertLocalStack(name);
   await k.load(name);
+  if (kind === 'group' && rootCaller()) await assertRootMayWrite(name, entries.map(([key]) => key));
   const secrets = await k.loadSecrets(name);
   for (const [key, v] of entries) {
     if (!KEY.test(key)) fail(`invalid key name: ${key}`);
@@ -701,6 +744,7 @@ async function main([cmd, ...args]) {
       return setValues('project', args[0], entries);
     }
     case 'unset': return unset('project', args[0], args[1]);
+    case 'get': return getValue(args[0], args[1]);
     case 'unset-stack': return unset('stack', args[0], args[1]);
     case 'remove-project': return remove('project', args[0]);
     case 'set-group': return setValues('group', args[0], [[args[1], (await readStdin()).replace(/\r?\n$/, '')]]);

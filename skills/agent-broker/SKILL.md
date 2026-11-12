@@ -41,7 +41,8 @@ agent-broker <service> <action> [options]
   argument, log or reply.
 - **Errors** "no ... token" or a missing action: stop and ask the owner to run the wizard. `--project NAME` exists
   only for a folder that holds two projects (the error names them).
-- **`agent-broker-admin`** is the owner's: it makes a Touch ID prompt on their screen. Run it only when asked.
+- **`agent-broker-admin`** is the owner's: it makes a Touch ID prompt on their screen (Linux: a password prompt). Run it
+  only when asked.
 
 ## New project
 
@@ -78,49 +79,109 @@ the sudo rule `/etc/sudoers.d/agent-broker` (password every time), and the CLI g
 in `PATH` via one line in `~/.zshenv` and `~/.zshrc`). Owner bypass for a real CLI: its full path (`which -a netlify`).
 Changing the broker: edit `broker/`, `cd broker && npm test`, then wizard → 7.
 
-## Linux (homelab): Docker Compose
+## Linux (homelab)
 
-On Linux the broker runs **only** `docker compose` (the cloud CLIs need the macOS sandbox; `netlify` etc. are refused).
-A compose stack folder is a project; its secrets live in the broker, its `.env` keeps only non-secret settings.
+The cloud actions above (`netlify`, `vercel`, `supabase`, `apify`), `init`, `whoami` and `compose` all run on Linux. The
+cloud CLIs run in a bwrap sandbox that cannot read the broker's folders; without the owner's AppArmor file (Owner
+section) a cloud action stops with one line that names the fix.
 
 ```sh
+agent-broker health      # one line, exit 0 = the broker can serve every key its groups promise; waiting token copies are notes
+agent-broker stacks      # marks: follows_mac (changed on the Mac only), shared (copied to another machine)
 agent-broker compose ps | up -d | logs --tail 100 app | pull | down     # instead of docker compose, in the stack folder
 agent-broker compose --profile mcp up -d                                 # -f F, --profile, --dry-run before the command
 agent-broker compose exec -T db psql -U app < dump.sql                   # stdin passes through; use -T
 ```
 
+- A compose stack folder is a project; its secrets live in the broker, its `.env` keeps only the non-secret settings.
 - Runs in the registered folder only (never a git worktree of it: same Compose project name = live containers).
   `--env-file`, `-p`, `--project-directory` are not offered; drop `--env-file .env` from old runbook commands.
 - Plain `docker compose` there fails on `${VAR:?set VAR}`: that is the cue to use the broker. `docker logs <container>`
   and `docker ps` need no secrets.
 - Output is scrubbed of stored values; `compose config` shows `[secret]`.
 
-Owner setup (once per host, in your own terminal; sudo asks your password):
+### Keys for services and programs
 
-```sh
-sudo ~/git/agent-scripts/skills/agent-broker/broker/install.sh     # _deployer (owner's group + docker), /opt/agent-broker
-agent-broker-admin apply --stack homelab --new-stack                 # a stack with no cloud tokens
-cd <repo>/stacks/<name> && agent-broker init --stack homelab --here --no-agents-md   # agents may do this step
-agent-broker-admin import <name> .env KEY1 KEY2                      # moves the secret lines out of .env
-chmod 640 .env                                                      # _deployer reads the non-secret rest
-agent-broker-admin set <name> KEY                                    # one value, typed hidden
-```
+A service or program gets its keys from its **group**, through the owner's grant, by one of three paths. Each path
+belongs to its own caller (the unit, OMP, root); an agent has no use for them and the secret guard refuses them:
 
-`import` reads values the way Compose does (quotes, `$$`, ` # comment`); a value with a `$` Compose would expand is
-refused: use `set`. Update the broker: `git pull`, rerun `install.sh`.
+- a systemd user unit: its own pre-start step, `ExecStartPre=+/usr/local/bin/agent-broker run <group>`, writes the unit's
+  keys into its `RuntimeDirectory=` (tmpfs, 0700);
+- OMP: a `models.yml` key line, `apiKey: "!/usr/local/bin/agent-broker key <group> <KEY>"`;
+- the owner's root-run setup scripts: `agent-broker-admin get <group> <KEY>`.
+
+A service that lacks a key: ask the owner for a grant (`agent-broker-admin apply --group ...`); never read or copy a key.
+
+- **Group**: the secrets of one thing that owns secrets (a service such as `assistant`, a program such as `omp`). Values live in the broker, never in a file.
+- **Grant**: who may get which key. Three kinds: `unit` (one systemd user unit: key files, or env, in its runtime
+  folder; a key can be optional), `root` (setup scripts run as root: read the `keys`, store the `write` keys), `omp`
+  (OMP processes, found by cgroup and binary folder). Only the owner changes groups and grants;
+  `agent-broker-admin list` shows names and grants, never values.
+
+### Install scripts and secrets
+
+An install script writes no secret to a file. For a key the owner has to supply, it prints the line
+`agent-broker-admin set-group <group> <KEY>` (hidden input) for the owner to run. For a value the script generates, it
+pipes the value into the root write: `printf '%s\n' "$value" | agent-broker-admin set-group <group> <KEY>`. A script run
+as root reads a key back with `agent-broker-admin get <group> <KEY>`. Both need a root grant on the group: `get` serves
+its `keys`, `set-group` stores its `write` keys (root may store no other key). The script also names the grant the
+owner adds: `agent-broker-admin apply --group <group> --grant-root <READ_KEY> --grant-root-write <WRITE_KEY>`.
+
+## Owner: Linux commands (your own terminal, in order)
+
+Each `agent-broker-admin` call asks your password.
+
+1. Install or update (rerun after `git pull`):
+   `sudo ~/git/agent-scripts/skills/agent-broker/broker/install.sh`. It creates `_deployer` (your group + docker),
+   `/opt/agent-broker` (own Node, the cloud CLIs), the commands, the sudo rule and the CLI guard. It sets `_deployer`'s
+   shell to `/bin/sh` so the other machine's one SSH key can deliver tokens; the account has no password.
+2. AppArmor, once, so bwrap may run:
+   `sudo install -m 644 /opt/agent-broker/apparmor/bwrap /etc/apparmor.d/bwrap && sudo apparmor_parser -r /etc/apparmor.d/bwrap`.
+   Side effect: every user of the machine, agents included, may then use bwrap. Undo: `sudo apparmor_parser -R /etc/apparmor.d/bwrap && sudo rm /etc/apparmor.d/bwrap`.
+3. A compose stack's secrets:
+   `agent-broker-admin apply --stack homelab --new-stack` (once, a stack with no cloud tokens); in the stack folder
+   `agent-broker init --stack homelab --here --no-agents-md`; then `agent-broker-admin import <name> .env KEY1 KEY2`
+   (moves the secret lines out; Compose quoting is read; a value with a `$` Compose would expand is refused: use
+   `agent-broker-admin set <name> KEY`), and `chmod 640 .env`.
+4. Key files into a group: `agent-broker-admin import-files <group> KEY=<file> ...` (one password; the files stay, delete
+   them once the service works). Add the grant with `apply --group <group> --grant-file <unit>:<file>=KEY` (or
+   `--grant-env`, `--grant-root`, `--grant-root-write`, `--grant-omp`).
+5. OMP's literal provider keys: `agent-broker-admin omp-move --exe <OMP binary folder>`. It backs up `models.yml` to
+   `models.yml.pre-broker`, stores the keys in group `omp`, and rewrites each line to a key line.
+6. Health check every 15 minutes: copy `broker/systemd/agent-broker-health.service` and `.timer` to
+   `~/.config/systemd/user/`, then `systemctl --user daemon-reload && systemctl --user enable --now agent-broker-health.timer`.
+   The control-room status writer is set in the service file: `AGENT_BROKER_STATUS_WRITER` and
+   `AGENT_BROKER_STATUS_DIR` (commented lines there; put them in a drop-in with `systemctl --user edit agent-broker-health.service`).
+7. Copy cloud tokens from a sending machine (the Mac) to a receiving one (this machine). Host key first, from the
+   receiving machine, so nothing is trusted on first use:
+   1. Receiver: `cat /etc/ssh/ssh_host_ed25519_key.pub`.
+   2. Sender: `agent-broker-admin sync-setup --to <receiver address> --host-key '<that line>'` (`--user`, `--port`
+      optional); it opens no connection and prints the sender's public key line. On a Mac, rerun the install first
+      (wizard menu 7): it adds the job that retries waiting copies every 10 minutes.
+   3. Receiver: `agent-broker-admin trust-mac '<that public key line>' --from <sender address>`.
+   4. Sender: `agent-broker-admin share-stack <stack>`; from then on each `set-stack`/`unset-stack` copies at once, and
+      `agent-broker-admin sync-push --all` resends everything. The receiver holds the stack as `followsMac`: changes
+      there are refused. `unshare-stack` stops future copies; the receiver keeps what it has until
+      `agent-broker-admin remove-stack <stack> --stop-following` runs on it.
 
 ## Known gaps
 
 - **Folder rule = accident prevention**, not a wall: an agent can `cd` into another project's folder.
-- **Touch ID for sudo** is on: an unexpected sudo prompt is an agent asking; deny it.
+- **Touch ID for sudo** is on (Mac): an unexpected sudo prompt is an agent asking; deny it.
 - **GitHub secrets** (`apify-analytics`, `FitUp`): a pushed script could print a secret in an Actions log. Fix: a
   GitHub bot account for agents (write, no admin), `main` protected with owner approval, secrets in an environment
   limited to `main`.
 - **Apify actor runs** get a run token; actor code can print it.
 - **Netlify** tokens open the whole account; edge-function bundling during a deploy may run project code with the
-  token present (no project uses edge functions yet). CLIs run in a macOS sandbox that cannot read the broker's
-  token files, so a path in `netlify.toml` (or any project config) cannot point a deploy at them.
+  token present (no project uses edge functions yet). CLIs run in a sandbox (macOS sandbox-exec, Linux bwrap) that
+  cannot read the broker's token files, so a path in `netlify.toml` (or any project config) cannot point a deploy at them.
 - **Tokens agents saw before the broker** (2026-10) stay valid until rotated (wizard → 2).
+- **Linux, guard not wall**: the secret guard stops an agent that runs `run`, `key` or `get`; root can read the broker's
+  files anyway, and the `get` / root-write checks are an interface for scripts. The program check for `key` reads a
+  process's command line, so a process started with an OMP binary's path imitates OMP. A unit name can be imitated by
+  the user's own systemd (an own unit with the same name gets that unit's keys).
+- **Linux, unproven**: the env file for `env` grants (written by the pre-start step, read by `EnvironmentFile=`);
+  that the bwrap sandbox hides the broker's folders in a live run (waits for the AppArmor file).
 - **Linux: `docker` / `lxd` group = root.** An agent user in those groups can read any secret back (`docker inspect`
   shows a container's environment). The Linux broker stops accidental `.env` reads, not a determined agent; a real wall
   means taking the agent user out of both groups.
