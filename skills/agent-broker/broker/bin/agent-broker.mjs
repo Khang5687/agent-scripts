@@ -16,7 +16,7 @@ import {
   stackFromAgentsMd, syncProject,
 } from './lib.mjs';
 import { deliver, describeDelivery, healthNotes } from './sync.mjs';
-import { configProblems, cpProblems, needsCheck, runVolumeProblems } from './compose-guard.mjs';
+import { COMPOSE_COMMAND_NAMES, COMPOSE_COMMANDS, commandProblems, configProblems, needsCheck } from './compose-guard.mjs';
 
 const HELP = `agent-broker <service> <action> [options]      run inside the project's folder: the folder picks the project
 
@@ -60,7 +60,7 @@ apify    push [--dir D] [--force] [--version V] [--build-tag T]
          call <actor> [--input-file F | --input JSON] [--build B] [--memory MB] [--timeout S]
 compose  [-f F] [--profile P] [--dry-run] <command> [args]
                                                         Linux: \`docker compose\` in the project's own folder with
-                                                        its stored values (e.g. up -d | ps | logs app | exec -T db ...)
+                                                        its stored values. Commands: ${COMPOSE_COMMAND_NAMES.join(', ')}
 
 --project NAME only chooses between projects that share one folder (a repo root holding two projects).
 Commands that print keys, passwords or environment values are not offered.`;
@@ -422,17 +422,19 @@ async function compose(cwd, args) {
   }
   if (i >= args.length) fail('give a compose command: agent-broker compose ps | up -d | logs <service> | ...');
   const [command, ...rest] = args.slice(i);
+  const refused = await commandProblems(command, rest, { home: HOME, cwd: P.root });
+  if (refused.length) {
+    await audit({ service: 'compose', command: COMPOSE_COMMANDS[command] ? command : '(not offered)', project: P.name, refused: refused[0] });
+    fail(`compose ${command} refused, nothing was started: ${refused.slice(0, 5).join('; ')}`);
+  }
   const secrets = await loadSecrets(P.name);
   const scrub = makeScrubber(await allSecretValues());
   if (needsCheck(command)) {
-    const problems = await composeProblems(P, opts, command, rest, secrets);
+    const problems = await composeProblems(P, opts, command, secrets);
     if (problems.length) {
       await audit({ service: 'compose', command, project: P.name, refused: problems[0] });
       fail(`compose ${command} refused, nothing was started: ${problems.slice(0, 5).join('; ')}. The broker does not give a container its own folders or the Docker socket.`);
     }
-  } else if (command === 'cp') {
-    const problems = cpProblems(rest, P.root);
-    if (problems.length) fail(`compose cp refused: ${problems.join('; ')}`);
   }
   const code = await run('docker', ['compose', ...opts, command, ...rest],
     { cwd: P.root, env: secrets, scrub, sandbox: false, stdin: 'inherit' });
@@ -446,8 +448,8 @@ async function compose(cwd, args) {
  * it holds this project's own values, so it is never printed. A stored value that is not this project's, found in it,
  * also refuses (an env_file of broker files has no path left in the resolved output).
  */
-async function composeProblems(P, opts, command, rest, secrets) {
-  const problems = command === 'run' ? await runVolumeProblems(rest, { home: HOME, cwd: P.root }) : [];
+async function composeProblems(P, opts, command, secrets) {
+  const problems = [];
   const chunks = [];
   const code = await run('docker', ['compose', ...opts.filter((o) => o !== '--dry-run'), '--profile', '*', 'config', '--format', 'json'], {
     cwd: P.root, env: secrets, scrub: makeScrubber(await allSecretValues()), outScrub: (s) => s, out: { write: (s) => chunks.push(s) }, sandbox: false,

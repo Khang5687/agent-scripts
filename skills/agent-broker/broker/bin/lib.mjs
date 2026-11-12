@@ -613,9 +613,10 @@ export async function syncProject(src, dest, secretValues) {
           const fst = await fh.stat();
           if (!fst.isFile()) { skipped.push(r); continue; }
           // A folder swapped for a link after the lstat above would lead here: the opened file must really live under the project.
-          // (Linux: /proc/self/fd names the opened file; no /proc, no check.)
-          const real = await fs.realpath(`/proc/self/fd/${fh.fd}`).catch(() => null);
-          if (real && real !== root && !real.startsWith(root + path.sep)) { seen.delete(r); skipped.push(r); continue; }
+          // Linux: /proc/self/fd names the opened file, and a file whose name cannot be read is left out (fail closed).
+          // Other systems have no /proc: no check there (the sync key is not in the scrubber's list either).
+          const real = await fs.realpath(`${(DEV && process.env.AGENT_BROKER_DEV_FD_DIR) || '/proc/self/fd'}/${fh.fd}`).catch(() => null);
+          if (LINUX ? !real || (real !== root && !real.startsWith(root + path.sep)) : real && real !== root && !real.startsWith(root + path.sep)) { seen.delete(r); skipped.push(r); continue; }
           const body = await fh.readFile();
           assertNoSecret(body, secretValues, `project file ${r}`);
           await fs.writeFile(d, body, { mode: fst.mode & 0o755 });

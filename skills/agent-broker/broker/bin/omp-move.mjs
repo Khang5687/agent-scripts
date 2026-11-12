@@ -179,6 +179,7 @@ async function main(argv) {
     else opt[name] = value;
   }
   if (!opt.exe) fail('--exe DIR is required: the folder OMP runs from (the broker only hands keys to a program started from there)');
+  if (!opt.names.length) fail('--name is required: the bare program name OMP runs under (check a running OMP: `tr \\0 " " < /proc/<pid>/cmdline`). Without it a key line that runs `omp ...` is refused.');
   if (!path.isAbsolute(opt.exe) || opt.exe.split('/').includes('..')) fail('--exe must be an absolute folder without ".."');
   if (!GROUP.test(opt.group)) fail(`invalid group name: ${opt.group}`);
   for (const n of opt.names) if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(n)) fail(`--name must be a bare program name (no "/"): ${n}`);

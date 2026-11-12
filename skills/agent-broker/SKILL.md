@@ -99,6 +99,9 @@ agent-broker compose exec -T db psql -U app < dump.sql                   # stdin
 - Plain `docker compose` there fails on `${VAR:?set VAR}`: that is the cue to use the broker. `docker logs <container>`
   and `docker ps` need no secrets.
 - Output is scrubbed of stored values; `compose config` shows `[secret]`.
+- Offered commands, one table in `bin/compose-guard.mjs` (a test keeps this line equal to it):
+  `up, down, ps, logs, exec, run, pull, restart, stop, start, rm, config, build, images, top, port, version`. Each takes
+  only the flags the table names; the rest are refused by name. `down -v` and `rm -v` (volumes) are the owner's to run.
 
 ### Keys for services and programs
 
@@ -106,8 +109,8 @@ A service or program gets its keys from its **group**, through the owner's grant
 belongs to its own caller (the unit, OMP, root); an agent has no use for them and the secret guard refuses them:
 
 - a systemd user unit: its own pre-start step, `ExecStartPre=+/usr/local/bin/agent-broker run <group>`, writes the unit's
-  keys into its `RuntimeDirectory=` (tmpfs, 0700). The folder must be named `<unit>-keys`: the secret guard hides only
-  `-keys` folders, and `run` refuses any other name;
+  keys into its `RuntimeDirectory=` (tmpfs, 0700). The folder must be exactly `<run root>/<unit>-keys` (one folder, no
+  sub-folder): the secret guard hides only those, and `run` refuses any other name;
 - OMP: a `models.yml` key line, `apiKey: "!/usr/local/bin/agent-broker key <group> <KEY>"`;
 - the owner's root-run setup scripts: `agent-broker-admin get <group> <KEY>`.
 
@@ -140,8 +143,8 @@ Each `agent-broker-admin` call asks your password.
    `sudo install -m 644 /opt/agent-broker/apparmor/bwrap /etc/apparmor.d/bwrap && sudo apparmor_parser -r /etc/apparmor.d/bwrap`.
    Side effect: every user of the machine, agents included, may then use bwrap. Undo: `sudo apparmor_parser -R /etc/apparmor.d/bwrap && sudo rm /etc/apparmor.d/bwrap`.
 3. A compose stack's secrets:
-   `agent-broker-admin apply --stack homelab --new-stack` (once, a stack with no cloud tokens); in the stack folder
-   `agent-broker init --stack homelab --here --no-agents-md`; then `agent-broker-admin import <name> .env KEY1 KEY2`
+   `agent-broker-admin apply --stack demo --new-stack` (once, a stack with no cloud tokens); in the stack folder
+   `agent-broker init --stack demo --here --no-agents-md`; then `agent-broker-admin import <name> .env KEY1 KEY2`
    (moves the secret lines out; Compose quoting is read; a value with a `$` Compose would expand is refused: use
    `agent-broker-admin set <name> KEY`), and `chmod 640 .env`.
 4. Key files into a group: `agent-broker-admin import-files <group> KEY=<file> ...` (one password; the files stay, delete
@@ -149,8 +152,8 @@ Each `agent-broker-admin` call asks your password.
    `--grant-env`, `--grant-root`, `--grant-root-write`, `--grant-omp`).
 5. OMP's literal provider keys. First prove one key line on a test key: add a throwaway group and a `models.yml` line
    that calls `agent-broker key <group> <KEY>`, and make one real OMP request with it. Then
-   `agent-broker-admin omp-move --exe <OMP binary folder> [--name omp]` (`--name` when some OMP process starts under its
-   bare name; look at the processes' command lines first). It backs up `models.yml` to `models.yml.pre-broker`, stores the keys in
+   `agent-broker-admin omp-move --exe <OMP binary folder> --name omp` (`--name` is required: the bare name OMP processes
+   start under; look at their command lines first, one `--name` per name). It backs up `models.yml` to `models.yml.pre-broker`, stores the keys in
    group `omp`, and rewrites each line to a key line. Shred the backup once OMP works.
 6. Health check every 15 minutes: copy `broker/systemd/agent-broker-health.service` and `.timer` to
    `~/.config/systemd/user/`, then `systemctl --user daemon-reload && systemctl --user enable --now agent-broker-health.timer`.
@@ -189,9 +192,14 @@ Each `agent-broker-admin` call asks your password.
 - **Linux, unproven**: the env file for `env` grants (written by the pre-start step, read by `EnvironmentFile=`; a file
   grant has no quoting question, so prefer file grants); that the bwrap sandbox hides the broker's folders in a live run
   (waits for the AppArmor file); that the cloud CLIs work with an empty home folder inside the sandbox.
-- **Linux: the agent user is in the `docker` group (owner's choice: a guard, not a wall).** That group is root. The
-  secret guard and `agent-broker compose` refuse the common routes (a container that mounts the broker's home, the
-  Docker socket or `/`; `privileged`, `pid: host`, `devices`; compose files that point a secret, config or build at
-  the broker's home). They do not stop a determined agent: `docker exec` into a running container, a socket under
-  another name, a path swapped after the check, or `docker`/`lxc` run by the agent itself. A real wall means taking the
-  agent user out of `docker` and `lxd`.
+- **Linux: `agent-broker compose` and the `docker` group are a guard on any host, not a wall.** The Docker daemon is root:
+  whoever can start containers from a file an agent wrote can reach the host. Taking the agent user out of `docker` does
+  not change that while `compose` is offered, because the broker's own Docker calls run as the broker user. What the
+  broker refuses: any command or flag not in the table (below); `run -v` and mounts that reach the broker's home, the
+  Docker socket or `/`; `privileged`, `pid`/`network_mode`/`userns_mode: host`, `devices`, `cap_add`, `security_opt`
+  other than `no-new-privileges`, and a volume `device` that is not a checked bind; secrets, configs and build contexts
+  in the broker's home. What it does not stop: a compose file rewritten between the check and the real call (the real
+  call reads the files again; running it on the checked JSON was not done because it cannot be proven here that Compose
+  then keeps every container unchanged), a path swapped after the check, a socket under another name, `docker exec`
+  into a running container, and `docker`/`lxc` run by the agent itself. The secret guard has its own rules for those
+  direct calls (a guard as well).

@@ -481,6 +481,13 @@ async function remove(kind, name, stopFollowing = false) {
     if (record.followsMac && !stopFollowing) fail('this stack follows the Mac; change it there (to drop it on this machine only: remove-stack NAME --stop-following)');
     for (const p of await listProjects()) if ((await loadProject(p)).stack === name) fail(`project ${p} still uses stack ${name}: move it first`);
     for (const f of [path.join(DIR.stacks, `${name}.json`), path.join(DIR.stackSecrets, `${name}.env`)]) await fs.rm(f, { force: true });
+    // The numbers of the copies received for this stack: dropped with the stack, except for --stop-following (which keeps them so an old copy cannot come back).
+    if (!stopFollowing) {
+      await withSyncLock(async () => {
+        const { [name]: gone, ...rest } = await loadSyncState();
+        if (gone) await saveSyncState(rest);
+      });
+    }
     if (record.shared) note = `; it was shared: ${await sync.dropEntries(name)} waiting copies dropped, and the other machine keeps what it has until the owner drops it there`;
   } else {
     checkName(name);

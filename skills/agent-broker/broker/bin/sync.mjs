@@ -187,10 +187,11 @@ export async function queue(name, keys) {
     const sent = await readJson(SENT, {});
     for (const key of keys) {
       if (!ACCOUNT_KEYS.includes(key)) continue;
-      // A number that only goes up. The clock seeds it, so a lost sent.json can never send numbers the receiving side already holds.
-      const seq = Math.max((sent[name]?.[key] ?? 0) + 1, Math.floor(Date.now() / 1000));
-      sent[name] = { ...sent[name], [key]: seq };
       const old = await readJson(entryFile(name, key), null).catch(() => null);
+      // A number that only goes up. The clock seeds it, so a lost sent.json can never send numbers the receiving side already holds;
+      // a held-newer answer names the number the other machine holds: step past it.
+      const seq = Math.max((sent[name]?.[key] ?? 0) + 1, Math.floor(Date.now() / 1000), Number.isSafeInteger(old?.held) ? old.held + 1 : 0);
+      sent[name] = { ...sent[name], [key]: seq };
       const now = new Date().toISOString();
       await writeJson(entryFile(name, key), {
         v: 1, stack: name, key, value: secrets[key] ?? null, seq, accounts: stack.accounts ?? {},
@@ -263,7 +264,12 @@ function classify(r, entry) {
   switch (r.status) {
     case 0:
       return /^(stored|deleted) /.test(r.stdout) ? { outcome: 'sent' } : { outcome: 'retry', reason: 'the other machine gave an unexpected answer' };
-    case 3: return { outcome: 'stale' };
+    case 3: {
+      // The receiver's own words: "seq N is not higher than H ...": H is the number it holds. The same number means this very copy
+      // already arrived (an answer got lost): done. A higher one means this sender's numbers are behind: keep it visible.
+      const held = Number(/is not higher than (\d{1,16})\b/.exec(r.stderr)?.[1]);
+      return held === entry.seq ? { outcome: 'stale' } : { outcome: 'held-newer', held: Number.isSafeInteger(held) ? held : null };
+    }
     case 2: {
       const m = /refused \(([a-z-]{1,30})\): ([^\n]*)/.exec(r.stderr);
       return { outcome: 'refused', code: m?.[1] ?? 'refused', reason: clean(m?.[2] ?? err ?? 'refused', entry.value) };
@@ -282,6 +288,10 @@ async function settle(entry, c) {
     const now = await readJson(file, null).catch(() => null);
     if (!now || now.seq !== entry.seq) return;
     if (c.outcome === 'sent' || c.outcome === 'stale') await fs.rm(file, { force: true });
+    else if (c.outcome === 'held-newer') {
+      const { value, accounts, ...rest } = now; // kept as a visible state; the value is not kept
+      await writeJson(file, { ...rest, state: 'held-newer', held: c.held, noted_at: new Date().toISOString() });
+    }
     else if (c.outcome === 'refused') {
       const { value, accounts, ...rest } = now; // a refused copy keeps no value
       await writeJson(file, { ...rest, state: 'refused', code: c.code, reason: c.reason, refused_at: new Date().toISOString() });
@@ -323,6 +333,7 @@ export function describeDelivery(r) {
   const sent = n('sent').length + n('stale').length;
   if (sent) lines.push(`delivered ${sent} cop${sent === 1 ? 'y' : 'ies'}`);
   for (const x of n('refused')) lines.push(`REFUSED by the other machine: ${x.stack} ${x.key} (${x.code}): ${x.reason}. It is kept as refused and not retried; fix the cause, then run: agent-broker-admin sync-push --all`);
+  for (const x of n('held-newer')) lines.push(`the other machine holds a newer number for ${x.stack} ${x.key}: check it there, then run: agent-broker-admin sync-push --all`);
   const retry = n('retry');
   if (retry.length || r.reason) lines.push(`${retry.length ? `${retry.length} waiting` : 'waiting copies stay queued'}${r.reason ? ` (${r.reason})` : retry[0]?.reason ? ` (${retry[0].reason})` : ''}`);
   return lines;
@@ -340,6 +351,8 @@ export async function copyAfterChange(name, keys) {
     const mine = new Map(r.results.filter((x) => keys.includes(x.key) && x.stack === name).map((x) => [x.key, x]));
     const refused = keys.map((k) => mine.get(k)).find((x) => x?.outcome === 'refused');
     if (refused) return `saved here; the other machine refused the copy (${refused.code}): ${refused.reason}. It is kept as refused; see: agent-broker health`;
+    const behind = keys.map((k) => mine.get(k)).find((x) => x?.outcome === 'held-newer');
+    if (behind) return `saved here; the other machine holds a newer number for ${behind.key} than this copy has: check it there, then run: agent-broker-admin sync-push --all (see: agent-broker health)`;
     const open = keys.filter((k) => !['sent', 'stale'].includes(mine.get(k)?.outcome));
     if (!open.length) return keys.every((k) => mine.get(k)?.outcome === 'stale') ? 'the other machine already holds this or a newer copy' : 'copied to the other machine';
     return `saved here; the copy is waiting (${mine.get(open[0])?.reason ?? r.reason ?? 'not delivered yet'}); it is retried every 10 minutes and by: agent-broker-admin sync-push`;
@@ -359,5 +372,6 @@ export async function healthNotes() {
   const notes = [];
   if (waiting.length) notes.push(`${waiting.length} token cop${waiting.length === 1 ? 'y' : 'ies'} waiting for the other machine, oldest since ${waiting.map((e) => e.since).sort()[0]}`);
   for (const e of refused) notes.push(`copy refused by the other machine: ${e.stack} ${e.key} (${clean(e.code)})`);
+  for (const e of all.filter((x) => x.state === 'held-newer')) notes.push(`the other machine holds a newer number for ${e.stack} ${e.key}${e.held ? ` (${e.held}, ours ${e.seq})` : ''}: check it, then run: agent-broker-admin sync-push --all`);
   return notes;
 }

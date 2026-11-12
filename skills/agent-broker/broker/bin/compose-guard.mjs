@@ -9,10 +9,6 @@ import path from 'node:path';
 
 const SOCKET = /(^|\/)(docker|podman|containerd|crio)\.sock$/;
 
-// Commands that only read or stop what already exists: no new mount, no new container.
-const NO_CHECK = new Set(['ps', 'logs', 'config', 'images', 'ls', 'top', 'port', 'events', 'version', 'stop', 'down', 'kill', 'rm', 'pause', 'unpause', 'pull', 'push', 'wait', 'exec', 'cp', 'help']);
-export const needsCheck = (command) => !NO_CHECK.has(command);
-
 /** realpath of the longest part that exists, plus the rest (a missing bind source is created by Docker, as root). */
 async function realOf(p) {
   const rest = [];
@@ -57,6 +53,10 @@ export async function configProblems(config, { home, cwd, otherValues = [] }) {
     for (const v of svc.volumes ?? []) await bad(at, volumeSource(v));
     if (svc.privileged === true) out.push(`${at}: privileged: true`);
     if (svc.pid === 'host') out.push(`${at}: pid: host`);
+    if (svc.network_mode === 'host') out.push(`${at}: network_mode: host`);
+    if (svc.userns_mode === 'host') out.push(`${at}: userns_mode: host`);
+    if ((svc.cap_add ?? []).length) out.push(`${at}: cap_add ${svc.cap_add.join(',')}`);
+    for (const s of svc.security_opt ?? []) if (!/^no-new-privileges([:=]true)?$/.test(String(s))) out.push(`${at}: security_opt ${s} (only no-new-privileges is offered)`);
     for (const d of svc.devices ?? []) out.push(`${at}: host device ${typeof d === 'string' ? d.split(':')[0] : d?.source ?? '?'}`);
     const ctx = svc.build?.context ?? (typeof svc.build === 'string' ? svc.build : null);
     if (ctx && path.isAbsolute(ctx)) await bad(`${at} build context`, ctx);
@@ -65,6 +65,7 @@ export async function configProblems(config, { home, cwd, otherValues = [] }) {
   for (const [name, vol] of Object.entries(config?.volumes ?? {})) {
     const o = vol?.driver_opts ?? {};
     if (typeof o.device === 'string' && /bind/.test(String(o.o ?? ''))) await bad(`volume "${name}"`, o.device);
+    else if (o.device !== undefined) out.push(`volume "${name}": driver_opts device ${o.device} (only a bind that passes the folder checks is offered)`);
   }
   for (const kind of ['secrets', 'configs']) {
     for (const [name, item] of Object.entries(config?.[kind] ?? {})) await bad(`${kind.slice(0, -1)} "${name}"`, item?.file);
@@ -76,28 +77,91 @@ export async function configProblems(config, { home, cwd, otherValues = [] }) {
   return [...new Set(out)];
 }
 
-/** `compose run -v SRC:DST` / `--volume`: a source that reaches the broker home or the Docker socket. */
-export async function runVolumeProblems(args, { home, cwd }) {
+/**
+ * `agent-broker compose` is an ALLOW list: a command and a flag run only when this table names them. Compose has more
+ * client-side options that read or write host files as the broker user (`run --env-from-file`, `cp`, `export -o`,
+ * `build --ssh`) than anyone can list, so what is not named is refused. Flags are read the way pflag reads them:
+ * `--flag=value`, `--flag value`, `-f value`, `-f=value`, `-fvalue`, and bundled short flags (`-Tv x` is `-T -v x`).
+ * `check`: the command can start or change containers, so the resolved config is checked first.
+ * `stop`: run and exec end their flags at the first word (the rest is the container's own command).
+ * `no`: a flag that is refused with its own reason.
+ * Never named, on purpose: --env-from-file, --env-file, --privileged, --cap-add, --ssh, --builder, -o/--output, -p,
+ * --project-directory (the folder decides the project), and anything that writes a host file (cp, export, -o).
+ */
+const list = (...names) => Object.fromEntries(names.map((n) => [n, 'bool']));
+const take = (...names) => Object.fromEntries(names.map((n) => [n, 'value']));
+const VOLUMES = 'removes volumes, which can hold live data: run it yourself, not through the broker';
+export const COMPOSE_COMMANDS = {
+  up: { check: true, flags: { ...list('-d', '--detach', '--build', '--no-build', '--remove-orphans', '--no-deps', '--force-recreate', '--no-recreate', '--wait', '--quiet-pull', '--no-start', '--no-color', '--no-log-prefix', '--abort-on-container-exit', '--attach-dependencies', '--timestamps'), ...take('--pull', '-t', '--timeout', '--wait-timeout', '--scale', '--attach', '--no-attach', '--exit-code-from') }, no: { '-V': 'renews anonymous volumes (live data)', '--renew-anon-volumes': 'renews anonymous volumes (live data)' } },
+  down: { flags: { ...list('--remove-orphans'), ...take('-t', '--timeout') }, no: { '-v': VOLUMES, '--volumes': VOLUMES, '--rmi': 'removes images: run it yourself' } },
+  ps: { flags: { ...list('-a', '--all', '-q', '--quiet', '--services', '--no-trunc'), ...take('--format', '--filter', '--status') } },
+  logs: { flags: { ...list('-f', '--follow', '-t', '--timestamps', '--no-color', '--no-log-prefix'), ...take('--tail', '-n', '--since', '--until', '--index') } },
+  exec: { stop: true, flags: { ...list('-d', '--detach', '-T', '--no-TTY'), ...take('-e', '--env', '-w', '--workdir', '-u', '--user', '--index') } },
+  run: { check: true, stop: true, flags: { ...list('-d', '--detach', '--rm', '-T', '--no-TTY', '--no-deps', '--service-ports', '--build', '--quiet-pull', '--remove-orphans'), ...take('-e', '--env', '-w', '--workdir', '-u', '--user', '--name', '--pull', '--entrypoint', '-v', '--volume') } },
+  pull: { flags: { ...list('-q', '--quiet', '--include-deps', '--ignore-pull-failures', '--ignore-buildable') } },
+  restart: { check: true, flags: { ...list('--no-deps'), ...take('-t', '--timeout') } },
+  stop: { flags: take('-t', '--timeout') },
+  start: { check: true, flags: {} },
+  rm: { flags: list('-f', '--force', '-s', '--stop'), no: { '-v': VOLUMES, '--volumes': VOLUMES } },
+  config: { flags: { ...list('-q', '--quiet', '--services', '--volumes', '--profiles', '--images', '--no-interpolate'), ...take('--format') } },
+  build: { check: true, flags: { ...list('--no-cache', '--pull', '-q', '--quiet', '--with-dependencies'), ...take('--build-arg') } },
+  images: { flags: { ...list('-q', '--quiet'), ...take('--format') } },
+  top: { flags: {} },
+  port: { flags: take('--protocol', '--index') },
+  version: { flags: { ...list('--short'), ...take('-f', '--format') } },
+};
+export const COMPOSE_COMMAND_NAMES = Object.keys(COMPOSE_COMMANDS);
+export const needsCheck = (command) => COMPOSE_COMMANDS[command]?.check === true;
+
+/**
+ * Why this command and these flags must not run, or []. Positional words (service names, the container's own command)
+ * are not checked here. `-v SRC:DST` of `run` goes through hostPathProblem like a mount in the compose file.
+ */
+export async function commandProblems(command, args, { home, cwd }) {
+  const spec = COMPOSE_COMMANDS[command];
+  if (!spec) return [`compose ${command} is not offered (allowed: ${COMPOSE_COMMAND_NAMES.join(', ')})`];
   const out = [];
+  const volumes = [];
+  const flag = (name, value) => {
+    if (spec.no?.[name]) out.push(`${command} ${name} ${spec.no[name]}`);
+    else if (!spec.flags[name]) out.push(`${command} ${name} is not offered`);
+    else if (spec.flags[name] === 'value' && value === undefined) out.push(`${command} ${name} needs a value`);
+    else if (value !== undefined && (name === '-v' || name === '--volume')) volumes.push(value);
+    return spec.flags[name];
+  };
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === '--') break;
-    const spec = a === '-v' || a === '--volume' ? args[++i] : a.startsWith('--volume=') ? a.slice(9) : /^-v./.test(a) ? a.slice(2) : null;
-    if (spec === null) continue;
-    const src = spec.split(':')[0];
+    if (!a.startsWith('-') || a === '-') {
+      if (spec.stop) break;
+      continue;
+    }
+    if (a.startsWith('--')) {
+      const eq = a.indexOf('=');
+      const name = eq < 0 ? a : a.slice(0, eq);
+      const kind = spec.flags[name];
+      if (kind === 'value' && eq < 0) flag(name, args[++i]);
+      else if (kind === 'bool' && eq >= 0 && !/^(true|false)$/.test(a.slice(eq + 1))) out.push(`${command} ${name} takes no value`);
+      else flag(name, eq < 0 ? undefined : a.slice(eq + 1));
+      continue;
+    }
+    for (let j = 1; j < a.length; j++) {
+      const name = `-${a[j]}`;
+      const kind = spec.flags[name];
+      if (kind !== 'value') {
+        flag(name, kind ? undefined : '');
+        if (!kind) break;
+        continue;
+      }
+      const glued = a.slice(j + 1);
+      flag(name, glued === '' ? args[++i] : glued.replace(/^=/, ''));
+      break;
+    }
+  }
+  for (const v of volumes) {
+    const src = v.split(':')[0];
     const why = src.startsWith('~') ? 'a home-relative path (not checked)' : /^[/.]/.test(src) ? await hostPathProblem(src, home, cwd) : null;
-    if (why) out.push(`-v ${src} is ${why}`);
+    if (why) out.push(`run -v ${src} is ${why}`);
   }
-  return out;
-}
-
-/** `compose cp`: a host path (an argument with no `service:` part) must stay inside the project folder. */
-export function cpProblems(args, root) {
-  const out = [];
-  for (const a of args) {
-    if (a.startsWith('-') || a.includes(':')) continue;
-    const p = path.resolve(root, a);
-    if (p !== root && !p.startsWith(`${root}/`)) out.push(`cp ${a}: a host path must be inside the project folder`);
-  }
-  return out;
+  return [...new Set(out)];
 }

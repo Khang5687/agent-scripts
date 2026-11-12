@@ -425,8 +425,8 @@ test('agents-md --stack outputs a project-agnostic snippet; unregistered repo wi
 
 test('compose: docker compose in the registered folder with its stored values; output scrubbed; stdin passed on', async () => {
   const PW = 'compose-db-password-0123';
-  const stack = await folder('homelab', 'stacks', 'firefly');
-  ok(admin(['apply', '--stack', 'homelab', '--new-stack', '--project', 'firefly', '--new-project', '--path', stack], `project:POSTGRES_PASSWORD=${PW}\n`));
+  const stack = await folder('demo', 'stacks', 'app-one');
+  ok(admin(['apply', '--stack', 'demo', '--new-stack', '--project', 'app-one', '--new-project', '--path', stack], `project:POSTGRES_PASSWORD=${PW}\n`));
   const bin = await folder('fake-docker-bin');
   const log = path.join(dev, 'fake-docker.log');
   await fs.writeFile(path.join(bin, 'docker'), `#!/bin/sh\npwd > "${log}"\nprintf "%s\\n" "$@" >> "${log}"\necho "password=$POSTGRES_PASSWORD"\ncat\n`, { mode: 0o755 });
@@ -434,7 +434,7 @@ test('compose: docker compose in the registered folder with its stored values; o
     { cwd, input, env: { ...env, PATH: `${bin}:${process.env.PATH}` }, encoding: 'utf8' });
 
   // From a subfolder too: Compose always runs in the registered folder, so the Compose project name never changes.
-  const r = ok(compose(['--profile', 'mcp', '-f', 'compose.yaml', 'exec', '-T', 'db', 'psql'], await folder('homelab', 'stacks', 'firefly', 'sub'), 'select 1;\n'));
+  const r = ok(compose(['--profile', 'mcp', '-f', 'compose.yaml', 'exec', '-T', 'db', 'psql'], await folder('demo', 'stacks', 'app-one', 'sub'), 'select 1;\n'));
   assert.equal(r.stdout, 'password=[secret]\nselect 1;\n');
   assert.deepEqual((await fs.readFile(log, 'utf8')).trim().split('\n'), [stack, 'compose', '--profile', 'mcp', '-f', 'compose.yaml', 'exec', '-T', 'db', 'psql']);
 
@@ -443,26 +443,26 @@ test('compose: docker compose in the registered folder with its stored values; o
   for (const [args, msg] of [
     [['-p', 'other', 'up'], /-p is not offered/],
     [['--project-directory=/', 'up'], /--project-directory is not offered/],
-    [['-f', '../immich/compose.yaml', 'up'], /must be a path inside the project/],
+    [['-f', '../app-two/compose.yaml', 'up'], /must be a path inside the project/],
     [['--profile', 'mcp'], /give a compose command/],
   ]) assert.match(compose(args, stack).stderr, msg);
 
   // A git worktree has the same folder name, so the same Compose project: it would replace the live containers.
   const repo = path.dirname(path.dirname(stack));
   await fs.mkdir(path.join(repo, '.git', 'worktrees', 'ticket'), { recursive: true });
-  const wt = await folder('homelab-ticket');
+  const wt = await folder('demo-ticket');
   await fs.writeFile(path.join(wt, '.git'), `gitdir: ${path.join(repo, '.git', 'worktrees', 'ticket')}\n`);
-  assert.match(compose(['up', '-d'], await folder('homelab-ticket', 'stacks', 'firefly')).stderr, /not in a worktree of it/);
+  assert.match(compose(['up', '-d'], await folder('demo-ticket', 'stacks', 'app-one')).stderr, /not in a worktree of it/);
   assert.match(compose(['ps'], await folder('unregistered')).stderr, /is not inside a registered project/);
 });
 
 test('admin import stores .env values as Compose reads them; a $ Compose would expand is refused', async () => {
-  const app = await folder('homelab', 'stacks', 'immich');
-  ok(admin(['apply', '--stack', 'homelab', '--project', 'immich', '--new-project', '--path', app]));
-  ok(admin(['import', 'immich'], 'A="dq \\"x\\" y"\nB=\'sq $HOME\'\nC=plain-value # note\nD=cost$$1\n'));
-  assert.deepEqual(await lib.loadSecrets('immich'), { A: 'dq "x" y', B: 'sq $HOME', C: 'plain-value', D: 'cost$1' });
-  assert.match(admin(['import', 'immich'], 'E=pa$word\n').stderr, /E: the value has a \$ that Compose expands/);
-  assert.equal((await lib.loadSecrets('immich')).E, undefined);
+  const app = await folder('demo', 'stacks', 'app-two');
+  ok(admin(['apply', '--stack', 'demo', '--project', 'app-two', '--new-project', '--path', app]));
+  ok(admin(['import', 'app-two'], 'A="dq \\"x\\" y"\nB=\'sq $HOME\'\nC=plain-value # note\nD=cost$$1\n'));
+  assert.deepEqual(await lib.loadSecrets('app-two'), { A: 'dq "x" y', B: 'sq $HOME', C: 'plain-value', D: 'cost$1' });
+  assert.match(admin(['import', 'app-two'], 'E=pa$word\n').stderr, /E: the value has a \$ that Compose expands/);
+  assert.equal((await lib.loadSecrets('app-two')).E, undefined);
 });
 
 // ---- Groups ------------------------------------------------------------------------------------------------------
@@ -716,6 +716,7 @@ test('run wrapper: writes files 0600 and an env file into the 0700 runtime folde
     ['a link', link, /not a real folder/],
     ['mode 0755', loose, /mode 0700: set RuntimeDirectoryMode=0700/],
     ['a folder not named *-keys', await folderWith('plainkeys', 0o700), /must end in -keys/],
+    ['a nested folder app/x-keys (the guard hides only <run root>/<one part>-keys)', await (async () => { await fs.mkdir(path.join(root, 'app'), { mode: 0o700 }); return folderWith('app/x-keys', 0o700); })(), /exactly .*<unit>-keys: one folder, no sub-folder/],
   ];
   for (const [what, d, pattern] of cases) {
     await fs.writeFile(statusLog, '');
@@ -1067,7 +1068,7 @@ test('omp-move: literal keys move into the group, lines are rewritten, the rest 
   const failAdmin = path.join(dir, 'fail.sh');
   await fs.writeFile(failAdmin, `#!/bin/bash\ncat >/dev/null\necho "admin said no" >&2\nexit 9\n`, { mode: 0o700 });
   const wrapper = path.resolve(import.meta.dirname, '../wrappers/agent-broker-admin');
-  const move = (file, args = [], adminCmd = fakeAdmin) => spawnSync('bash', [wrapper, 'omp-move', '--file', file, '--group', 'omptest', '--exe', exe, ...args], {
+  const move = (file, args = [], adminCmd = fakeAdmin) => spawnSync('bash', [wrapper, 'omp-move', '--file', file, '--group', 'omptest', '--exe', exe, '--name', 'omp', ...args], {
     env: { ...env, AGENT_BROKER_DEV_ADMIN: adminCmd, AGENT_BROKER_DEV_NODE: process.execPath }, encoding: 'utf8',
   });
   const exists = (p) => fs.stat(p).then(() => true, () => false);
@@ -1086,6 +1087,11 @@ test('omp-move: literal keys move into the group, lines are rewritten, the rest 
   const original = modelsText();
   await fs.writeFile(file, original, { mode: 0o640 });
   await fs.chmod(file, 0o640);
+  const noName = spawnSync('bash', [wrapper, 'omp-move', '--file', file, '--group', 'omptest', '--exe', exe], { env: { ...env, AGENT_BROKER_DEV_ADMIN: fakeAdmin, AGENT_BROKER_DEV_NODE: process.execPath }, encoding: 'utf8' });
+  assert.notEqual(noName.status, 0);
+  assert.match(everything(noName), /--name is required/);
+  assert.equal(await fs.readFile(file, 'utf8'), original); // nothing changed, no backup made
+  assert.equal(await exists(`${file}.pre-broker`), false);
   const r = move(file);
   assert.equal(r.status, 0, everything(r));
   await noValues(r);
@@ -1108,7 +1114,7 @@ test('omp-move: literal keys move into the group, lines are rewritten, the rest 
   assert.match(r.stdout, /shred -u '.*models\.yml\.pre-broker'/);
   // One admin call; values on stdin only.
   const calls = (await fs.readFile(argsLog, 'utf8')).trim().split('\n');
-  assert.deepEqual(calls, [`apply --group omptest --ensure-group --omp-exe ${exe} --add-grant-omp ALPHA_AI_API_KEY --add-grant-omp BETA_API_KEY --add-grant-omp GAMMA_X_API_KEY`]);
+  assert.deepEqual(calls, [`apply --group omptest --ensure-group --omp-exe ${exe} --omp-name omp --add-grant-omp ALPHA_AI_API_KEY --add-grant-omp BETA_API_KEY --add-grant-omp GAMMA_X_API_KEY`]);
   assert.equal(await fs.readFile(stdinLog, 'utf8'), `group:ALPHA_AI_API_KEY=${OM.alpha}\ngroup:BETA_API_KEY=${OM.beta}\ngroup:GAMMA_X_API_KEY=${OM.gamma}\n`);
   const stored = await fs.readFile(path.join(dev, 'home/group-secrets/omptest.env'), 'utf8');
   for (const v of [OM.alpha, OM.beta, OM.gamma, OM.old]) assert.ok(stored.includes(v));
@@ -1433,6 +1439,12 @@ test('a stack that follows the Mac cannot be changed here; list and stacks show 
   ok(admin(['remove-stack', 'macshared', '--stop-following']));
   assert.equal(await readText(stackFile('macshared')), null);
   assert.equal(send({ value: SYNC_VALUE, seq: 3 }).status, 3); // the old copy still cannot come back
+  // --stop-following keeps the seq memory (above). A plain remove-stack of a stack made here clears it.
+  ok(admin(['apply', '--stack', 'macshared', '--new-stack']));
+  ok(admin(['remove-stack', 'macshared']));
+  assert.equal(send({ value: SYNC_VALUE, seq: 1 }).status, 0);
+  ok(admin(['remove-stack', 'macshared', '--stop-following']));
+  assert.equal(send({ value: SYNC_VALUE, seq: 1 }).status, 3); // the memory of seq 1 stays this time
   assert.equal(send({ value: SYNC_VALUE, seq: 4 }).status, 0); // a newer one recreates the stack
   assert.equal(JSON.parse(await fs.readFile(stackFile('macshared'), 'utf8')).followsMac, true);
 });
@@ -1547,4 +1559,24 @@ test('get logs only names that passed the checks: a value in the KEY slot never 
   const log = await fs.readFile(path.join(dev, 'home', 'log', 'broker.log'), 'utf8');
   assert.ok(!log.includes(mistaken));
   assert.match(log, /"admin":"get","group":"nogroup","key":"\(invalid\)"/);
+});
+
+test('project copy on Linux leaves a file out when the opened file\'s real path cannot be read (fail closed)', async (t) => {
+  if (!lib.LINUX) return t.skip('Linux only: other systems have no /proc');
+  const src = await fs.mkdtemp(path.join(os.tmpdir(), 'agent-broker-src-'));
+  await fs.writeFile(path.join(src, 'a.txt'), 'plain');
+  const dest = path.join(dev, 'work-failclosed');
+  process.env.AGENT_BROKER_DEV_FD_DIR = path.join(dev, 'no-such-fd-folder');
+  try {
+    const r = await lib.syncProject(src, dest, [TOKEN]);
+    assert.deepEqual(r.skipped, ['a.txt']);
+    assert.equal(r.changed, 0);
+    assert.equal(await fs.lstat(path.join(dest, 'a.txt')).catch(() => null), null);
+  } finally {
+    delete process.env.AGENT_BROKER_DEV_FD_DIR;
+  }
+  const again = await lib.syncProject(src, dest, [TOKEN]);
+  assert.equal(again.changed, 1);
+  assert.equal(await fs.readFile(path.join(dest, 'a.txt'), 'utf8'), 'plain');
+  await fs.rm(src, { recursive: true, force: true });
 });

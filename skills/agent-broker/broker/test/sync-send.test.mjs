@@ -241,11 +241,20 @@ test('sync-retry with nothing waiting or no target does nothing; a waiting copy 
   assert.equal(await p.recv.secrets('demo'), `APIFY_TOKEN=${V1}\n`);
 });
 
-test('a stale answer (3) clears the entry; busy (4), an internal error (1), a login failure (255) and an unexpected answer keep it', async () => {
+test('a stale answer (3) for this very number clears the entry; busy (4), an internal error (1), a login failure (255) and an unexpected answer keep it', async () => {
   const p = await ready();
-  await p.mode('3|agent-broker-admin: refused (stale-seq): seq 5 is not higher than 9 for APIFY_TOKEN in stack demo');
-  assert.match(setKey(p, 'APIFY_TOKEN', V1).stdout, /already holds this or a newer copy/);
+  // An answer got lost: the copy arrived, the sender still holds it and sends the same number again.
+  await p.mode(DOWN);
+  setKey(p, 'APIFY_TOKEN', V1);
+  const entryFile = path.join(p.send.home, 'sync-outbox', 'demo.APIFY_TOKEN.json');
+  const copy = await fs.readFile(entryFile, 'utf8');
+  await p.mode('pipe');
+  ok(p.send.admin(['sync-push']));
+  assert.equal(await p.recv.secrets('demo'), `APIFY_TOKEN=${V1}\n`);
+  await fs.writeFile(entryFile, copy);
+  assert.match(ok(p.send.admin(['sync-push'])).stdout, /delivered 1 copy/);
   assert.deepEqual(await p.send.outbox(), []);
+  assert.equal(p.send.broker(['health']).stdout.includes('holds a newer number'), false);
 
   for (const [mode, reason] of [
     ['4|agent-broker-admin: refused (busy): another copy is being stored; try again', /busy/],
@@ -439,4 +448,33 @@ test('the LaunchDaemon file is well-formed XML and runs sync-retry as the broker
   assert.match(text, /<string>\/opt\/agent-broker\/bin\/agent-broker\.mjs<\/string>\s*<string>sync-retry<\/string>/);
   assert.match(text, /<key>StartInterval<\/key>\s*<integer>600<\/integer>/);
   assert.match(text, /<key>RunAtLoad<\/key>\s*<true\/>/);
+});
+
+test('X4: a stale answer for a number the other machine holds NEWER is kept and shown by health, not dropped; sync-push --all steps past it', async () => {
+  const p = await ready();
+  const held = Math.floor(Date.now() / 1000) + 80000; // what a stolen sender key could have planted
+  await fs.mkdir(path.join(p.recv.home, 'sync'), { recursive: true });
+  await fs.writeFile(path.join(p.recv.home, 'sync', 'seq.json'), JSON.stringify({ demo: { APIFY_TOKEN: { seq: held, at: new Date().toISOString() } } }));
+  const r = setKey(p, 'APIFY_TOKEN', V1);
+  assert.match(r.stdout, /the other machine holds a newer number for APIFY_TOKEN/);
+  assert.doesNotMatch(r.stdout, /already holds this or a newer copy/);
+  const raw = await fs.readFile(path.join(p.send.home, 'sync-outbox', 'demo.APIFY_TOKEN.json'), 'utf8');
+  const e = JSON.parse(raw);
+  assert.equal(e.state, 'held-newer');
+  assert.equal(e.held, held);
+  assert.ok(!raw.includes(V1), 'the entry keeps no value');
+  assert.equal(await p.recv.secrets('demo'), '');
+  const h = p.send.broker(['health']);
+  assert.equal(h.status, 0);
+  assert.match(h.stdout, /the other machine holds a newer number for demo APIFY_TOKEN \(\d+, ours \d+\): check it, then run: agent-broker-admin sync-push --all/);
+  // Not retried by itself.
+  const n = (await p.calls()).length;
+  assert.equal(ok(p.send.admin(['sync-push'])).stdout, 'nothing waiting\n');
+  assert.equal((await p.calls()).length, n);
+  // --all asks again with a number past the one the other machine holds.
+  assert.match(ok(p.send.admin(['sync-push', '--all'])).stdout, /delivered 1 copy/);
+  assert.equal(await p.recv.secrets('demo'), `APIFY_TOKEN=${V1}\n`);
+  assert.deepEqual(await p.send.outbox(), []);
+  assert.ok((await p.send.sent()).demo.APIFY_TOKEN > held);
+  assert.equal(p.send.broker(['health']).stdout.includes('holds a newer number'), false);
 });
