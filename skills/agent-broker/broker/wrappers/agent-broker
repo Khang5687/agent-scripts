@@ -86,6 +86,7 @@ run_group() {
 
 case "${1:-}" in
   run) run_group "$@" ;;
+  key) exec "${BROKER[@]}" "$@" ;; # a program's key line: stdout is the value only, the broker's exit code is the caller's
   init)
     "${BROKER[@]}" "$@" || exit $?
     for a in "$@"; do case "$a" in --list | --no-agents-md) exit 0 ;; esac; done

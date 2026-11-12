@@ -725,3 +725,153 @@ test('run wrapper: writes files 0600 and an env file into the 0700 runtime folde
   await fs.rm(base, { recursive: true, force: true });
   await fs.rm(outside, { recursive: true, force: true });
 });
+
+// ---- key <group> <KEY> -------------------------------------------------------------------------------------------
+
+const KEY_VALUE = 'key-value-abc123-xyz';
+const PROGRAM = '/opt/demo-omp/demo-omp';
+const MARKER = 'cmdline-marker-arg-should-not-be-logged';
+
+/** A fake /proc with the broker as pid 900; `chain` = [[name, argv...]] from the broker's parent upward (pid 899, 898, ...). */
+async function fakeProc(chain, { loopBack = false } = {}) {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'agent-broker-proc-'));
+  const put = async (pid, ppid, name, argv) => {
+    await fs.mkdir(path.join(root, String(pid)));
+    await fs.writeFile(path.join(root, String(pid), 'stat'), `${pid} (${name}) S ${ppid} ${pid} ${pid} 0 -1 4194560 100 0 0 0 1 1 0 0 20 0 1 0 12345 1000000 100 18446744073709551615\n`);
+    await fs.writeFile(path.join(root, String(pid), 'cmdline'), argv.length ? `${argv.join('\0')}\0` : '');
+  };
+  await put(900, 899, 'node', ['node', 'agent-broker.mjs', 'key']);
+  for (const [i, [name, ...argv]] of chain.entries()) {
+    const pid = 899 - i;
+    await put(pid, i === chain.length - 1 ? (loopBack ? 899 : 1) : pid - 1, name, argv);
+  }
+  return root;
+}
+
+async function brokerKey(proc, group, key, { unit = 'paseo.service', cgroup } = {}) {
+  const file = path.join(dev, `cgroup-${Math.random().toString(36).slice(2)}`);
+  await fs.writeFile(file, cgroup ?? cgroupOf(unit));
+  const r = spawnSync(process.execPath, [path.join(BIN, 'agent-broker.mjs'), 'key', group, key], {
+    cwd: dev, encoding: 'utf8', timeout: 20000,
+    env: { ...env, SUDO_UID: '1000', AGENT_BROKER_DEV_CGROUP_FILE: file, AGENT_BROKER_DEV_PROC: proc, AGENT_BROKER_DEV_PID: '900' },
+  });
+  await fs.rm(file);
+  return r;
+}
+
+test('key: the value goes only to a caller in the granted cgroup with the granted program above it', async () => {
+  ok(admin(['apply', '--group', 'keyed', '--new-group', '--grant-omp', 'KEY_A', '--grant-omp', 'KEY_B', '--omp-exe', '/opt/demo-omp/'], `group:KEY_A=${KEY_VALUE}\ngroup:KEY_C=ungranted-value-000\n`));
+  const dirs = [];
+  const proc = async (...a) => { const d = await fakeProc(...a); dirs.push(d); return d; };
+  const sudo = ['sudo', '/usr/bin/sudo', '-n', '-u', 'broker-user', '/opt/agent-broker/bin/agent-broker.mjs', 'key', 'keyed', 'KEY_A'];
+  const good = await proc([sudo, ['bash', '/bin/bash', '-c', 'x'], ['demo-omp', PROGRAM, MARKER], ['systemd', '/usr/lib/systemd/systemd', '--user']]);
+
+  const r = await brokerKey(good, 'keyed', 'KEY_A');
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout, `${KEY_VALUE}\n`);
+  assert.equal(r.stderr, '');
+
+  // The audit line has the pid chain (pid + program name), the key name and the result: no value, no command line.
+  const log = (await fs.readFile(path.join(dev, 'home/log/broker.log'), 'utf8')).trim().split('\n').at(-1);
+  assert.match(log, /"key":"keyed","name":"KEY_A","result":"ok","chain":\[\{"pid":899,"name":"sudo"\},\{"pid":898,"name":"bash"\},\{"pid":897,"name":"demo-omp"\}/);
+  for (const leaked of [KEY_VALUE, MARKER, '/bin/bash -c']) assert.ok(!log.includes(leaked), `audit holds ${leaked}`);
+
+  // The program only counts through argv[0] under the granted folder.
+  const refusedCases = [
+    ['no granted program in the chain', [sudo, ['bash', '/bin/bash'], ['systemd', '/usr/lib/systemd/systemd']]],
+    ['a look-alike folder', [sudo, ['x', '/opt/demo-omp-evil/x']]],
+    ['a relative path', [sudo, ['x', 'demo-omp/x']]],
+    ['the folder itself without a file', [sudo, ['x', '/opt/demo-omp']]],
+    ['a .. part', [sudo, ['x', '/opt/demo-omp/../evil/x']]],
+    ['the program named only in a later argument', [sudo, ['bash', '/bin/bash', PROGRAM]]],
+    ['an empty command line', [sudo, ['kthread']]],
+  ];
+  for (const [what, chain] of refusedCases) {
+    const bad = await brokerKey(await proc(chain), 'keyed', 'KEY_A');
+    assert.equal(bad.status, 2, what);
+    assert.equal(bad.stdout, '', what);
+    assert.match(bad.stderr, /no process above the caller was started from \/opt\/demo-omp\//, what);
+  }
+
+  // Key checks: not granted, granted without a stored value (exit 3), and a stored value that is not granted stays private.
+  const notGranted = await brokerKey(good, 'keyed', 'KEY_C');
+  assert.equal(notGranted.status, 2);
+  assert.equal(notGranted.stdout, '');
+  assert.match(notGranted.stderr, /KEY_C is not granted in group keyed/);
+  const noValue = await brokerKey(good, 'keyed', 'KEY_B');
+  assert.equal(noValue.status, 3);
+  assert.equal(noValue.stdout, '');
+  assert.match(noValue.stderr, /has no value for KEY_B/);
+  assert.equal((await brokerKey(good, 'keyed', 'lower')).status, 2);
+  assert.match((await brokerKey(good, 'ghost', 'KEY_A')).stderr, /unknown group: ghost/);
+  ok(admin(['apply', '--group', 'noprog', '--new-group', '--grant-root', 'KEY_A'], `group:KEY_A=${KEY_VALUE}\n`));
+  assert.match((await brokerKey(good, 'noprog', 'KEY_A')).stderr, /no program grant in group noprog/);
+
+  // Caller cgroup: another unit, another user's slice and a deeper path below the granted unit are all refused.
+  for (const [what, opts] of [
+    ['another unit', { unit: 'demo.service' }],
+    ['another user', { cgroup: cgroupOf('paseo.service', 1001) }],
+    ['a deeper path', { cgroup: `${cgroupOf('paseo.service').trim()}/sub\n` }],
+    ['a system service', { cgroup: '0::/system.slice/paseo.service\n' }],
+  ]) {
+    const bad = await brokerKey(good, 'keyed', 'KEY_A', opts);
+    assert.equal(bad.status, 2, what);
+    assert.equal(bad.stdout, '', what);
+  }
+  const log2 = await fs.readFile(path.join(dev, 'home/log/broker.log'), 'utf8');
+  assert.match(log2, /"name":"KEY_A","result":"bad-caller"/);
+  assert.match(log2, /"name":"KEY_A","result":"no-program"/);
+  assert.match(log2, /"name":"KEY_C","result":"not-granted"/);
+  assert.match(log2, /"name":"KEY_B","result":"no-value"/);
+  assert.ok(!log2.includes(KEY_VALUE));
+  for (const d of dirs) await fs.rm(d, { recursive: true, force: true });
+});
+
+test('key: the process walk stops at a parent loop and at 32 ancestors, and reads a program name holding ")" and spaces', async () => {
+  ok(admin(['apply', '--group', 'walk', '--new-group', '--grant-omp', 'KEY_A', '--omp-exe', '/opt/demo-omp/'], `group:KEY_A=${KEY_VALUE}\n`));
+  const shell = ['sh', '/bin/sh'];
+  const dirs = [];
+  const proc = async (...a) => { const d = await fakeProc(...a); dirs.push(d); return d; };
+
+  // A loop (the last ancestor points back at pid 899) ends the walk without hanging: no program in it, so refused.
+  const loop = await brokerKey(await proc([shell, shell, shell], { loopBack: true }), 'walk', 'KEY_A');
+  assert.equal(loop.status, 2);
+  assert.equal(loop.signal, null);
+
+  // The program at the 32nd ancestor still counts; at the 33rd it is out of reach.
+  const deep = (n) => [...Array.from({ length: n - 1 }, () => shell), ['demo-omp', PROGRAM]];
+  assert.equal((await brokerKey(await proc(deep(32)), 'walk', 'KEY_A')).status, 0);
+  const tooDeep = await brokerKey(await proc(deep(33)), 'walk', 'KEY_A');
+  assert.equal(tooDeep.status, 2);
+  assert.equal(tooDeep.stdout, '');
+  // A long loop-free chain without the program also ends.
+  assert.equal((await brokerKey(await proc(Array.from({ length: 60 }, () => shell)), 'walk', 'KEY_A')).status, 2);
+
+  // A name with ")" and spaces in the middle of the chain does not break the parent lookup.
+  const odd = await brokerKey(await proc([['we ird) (name ) x', '/usr/bin/odd'], ['demo-omp', PROGRAM]]), 'walk', 'KEY_A');
+  assert.equal(odd.status, 0, odd.stderr);
+  const logged = (await fs.readFile(path.join(dev, 'home/log/broker.log'), 'utf8')).trim().split('\n').at(-1);
+  assert.match(logged, /"name":"we ird\) \(name \) x"/);
+  for (const d of dirs) await fs.rm(d, { recursive: true, force: true });
+});
+
+test('key wrapper: stdout is the value and nothing else, and the broker\'s exit code comes through', async () => {
+  ok(admin(['apply', '--group', 'wrapped', '--new-group', '--grant-omp', 'KEY_A', '--grant-omp', 'KEY_B', '--omp-exe', '/opt/demo-omp/'], `group:KEY_A=${KEY_VALUE}\n`));
+  const proc = await fakeProc([['demo-omp', PROGRAM]]);
+  const cgroupFile = path.join(proc, 'cgroup');
+  await fs.writeFile(cgroupFile, cgroupOf('paseo.service'));
+  const fakeBroker = path.join(proc, 'broker.sh');
+  await fs.writeFile(fakeBroker, `#!/bin/bash\nexec '${process.execPath}' '${path.join(BIN, 'agent-broker.mjs')}' "$@"\n`, { mode: 0o700 });
+  const wrapper = path.resolve(import.meta.dirname, '../wrappers/agent-broker');
+  const viaWrapper = (key) => spawnSync('bash', [wrapper, 'key', 'wrapped', key], {
+    cwd: dev, encoding: 'utf8',
+    env: { ...env, SUDO_UID: '1000', AGENT_BROKER_DEV_BROKER: fakeBroker, AGENT_BROKER_DEV_CGROUP_FILE: cgroupFile, AGENT_BROKER_DEV_PROC: proc, AGENT_BROKER_DEV_PID: '900' },
+  });
+  const good = viaWrapper('KEY_A');
+  assert.equal(good.status, 0, good.stderr);
+  assert.equal(good.stdout, `${KEY_VALUE}\n`);
+  assert.equal(good.stderr, '');
+  assert.equal(viaWrapper('KEY_B').status, 3);
+  assert.equal(viaWrapper('KEY_Z').status, 2);
+  await fs.rm(proc, { recursive: true, force: true });
+});

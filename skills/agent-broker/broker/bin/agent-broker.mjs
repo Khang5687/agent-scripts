@@ -9,7 +9,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createNetlifySite, createReadOnlyUser, lookup, verifyPins } from './accounts.mjs';
 import {
-  CA_FILE, DIR, LINUX, NAME, SERVICES, UsageError, allSecretValues, assertNoSecret, assertUnclaimed, audit, checkName,
+  CA_FILE, DIR, KEY, LINUX, NAME, SERVICES, UsageError, allSecretValues, assertNoSecret, assertUnclaimed, audit, checkName,
   checkRelative, effectiveStack, fail, gitRoot, listProjects, listStacks, loadGroup, loadGroupSecrets, loadProject,
   loadSecrets, loadStack, loadStackSecrets, makeScrubber, mkdirs, parseArgs, projectSecrets, resolveProject, run,
   saveProject, saveSecrets,
@@ -23,6 +23,8 @@ const HELP = `agent-broker <service> <action> [options]      run inside the proj
   agent-broker result <id>   result of an approved Supabase admin query
   agent-broker run <group>   for a systemd unit's pre-start step only (ExecStartPre=+): fills the unit's RuntimeDirectory
                              with the keys its group grants; refused for any other caller
+  agent-broker key <group> <KEY>   for a program's key line (OMP apiKey "!..."): prints that one value to the
+                             program the group's program grant names; refused for anything else
 
 New project (a folder not registered yet; the user names the stack; stacks come from the owner's wizard):
   agent-broker init --stack S --list                     the stack's sites and databases (free or used by a project)
@@ -762,6 +764,76 @@ async function runGroup(name) {
   return 0;
 }
 
+// Process tree for `key`: /proc, or under the dev root a fake one (AGENT_BROKER_DEV_PROC, own pid AGENT_BROKER_DEV_PID).
+const procRoot = () => (process.env.AGENT_BROKER_DEV_ROOT && process.env.AGENT_BROKER_DEV_PROC) || '/proc';
+const ownPid = () => (process.env.AGENT_BROKER_DEV_ROOT && process.env.AGENT_BROKER_DEV_PID ? Number(process.env.AGENT_BROKER_DEV_PID) : process.pid);
+const MAX_ANCESTORS = 32;
+
+/** { name, ppid } from /proc/<pid>/stat. The name sits between the first "(" and the LAST ")": it may hold spaces and brackets. */
+function parseStat(text) {
+  const open = text.indexOf('(');
+  const close = text.lastIndexOf(')');
+  if (open < 0 || close < open) return null;
+  const ppid = Number(text.slice(close + 1).trim().split(' ')[1]);
+  return Number.isInteger(ppid) && ppid >= 0 ? { name: text.slice(open + 1, close), ppid } : null;
+}
+
+/** The caller's ancestors, nearest first: [{ pid, name, arg0 }]. Ends at pid 1, a loop, an unreadable entry, or MAX_ANCESTORS. */
+async function ancestors() {
+  const root = procRoot();
+  const out = [];
+  const seen = new Set([ownPid()]);
+  let pid = ownPid();
+  while (out.length < MAX_ANCESTORS) {
+    const self = parseStat(await fs.readFile(`${root}/${pid}/stat`, 'utf8').catch(() => ''));
+    if (!self || self.ppid <= 1 || seen.has(self.ppid)) break;
+    pid = self.ppid;
+    seen.add(pid);
+    const parent = parseStat(await fs.readFile(`${root}/${pid}/stat`, 'utf8').catch(() => ''));
+    if (!parent) break;
+    const cmdline = await fs.readFile(`${root}/${pid}/cmdline`, 'utf8').catch(() => '');
+    out.push({ pid, name: parent.name, arg0: cmdline.split('\0')[0] });
+  }
+  return out;
+}
+
+/**
+ * agent-broker key <group> <KEY>: one raw value on stdout (+ newline), for a program's `!command` key line (OMP).
+ * All must hold: the caller's cgroup is the grant's (directly under the user's app.slice); an ancestor process was
+ * started from the grant's program folder; the key is granted and stored. Exit 2 refused, 3 granted but no stored value.
+ * The program check reads argv[0] from /proc/<pid>/cmdline (the broker user cannot read another user's /proc/<pid>/exe):
+ * a caller can fake it, so this is a guard against the wrong program, not a wall. Audit: pid + program name, never
+ * command lines or values.
+ */
+async function keyValue(group, key) {
+  checkName(group ?? '', 'group');
+  if (!KEY.test(key ?? '')) fail(`invalid key name: ${key ?? '(missing)'}`);
+  let chain = [];
+  let result = 'error';
+  try {
+    const unit = await callerUnit().catch((e) => { result = 'bad-caller'; throw e; });
+    const grant = (await loadGroup(group)).grants.find((g) => g.omp);
+    if (!grant) { result = 'no-grant'; fail(`no program grant in group ${group}`); }
+    if (unit !== grant.cgroup) { result = 'bad-caller'; fail(`the caller is ${unit}, not ${grant.cgroup}`); }
+    chain = await ancestors();
+    const prefix = grant.exe.endsWith('/') ? grant.exe : `${grant.exe}/`;
+    const fromProgram = (a) => a.startsWith(prefix) && !a.split('/').some((p) => p === '..' || p === '.');
+    if (!chain.some((a) => fromProgram(a.arg0))) { result = 'no-program'; fail(`no process above the caller was started from ${grant.exe}`); }
+    if (!grant.keys.includes(key)) { result = 'not-granted'; fail(`${key} is not granted in group ${group}`); }
+    const value = (await loadGroupSecrets(group))[key];
+    if (value === undefined) {
+      result = 'no-value';
+      process.stderr.write(`agent-broker: group ${group} has no value for ${key}\n`);
+      return 3;
+    }
+    result = 'ok';
+    process.stdout.write(`${value}\n`);
+    return 0;
+  } finally {
+    await audit({ key: group, name: key, result, chain: chain.map(({ pid, name }) => ({ pid, name })) });
+  }
+}
+
 async function main(argv) {
   const cwd = process.cwd(); // the caller's folder (sudo keeps it): it decides the project
   await mkdirs();
@@ -772,6 +844,7 @@ async function main(argv) {
   if (service === 'stacks') return stacksList();
   if (service === 'result') return result(action);
   if (service === 'run') return runGroup(action);
+  if (service === 'key') return keyValue(action, args[0]);
   const after = [action, ...args].filter((a) => a !== undefined);
   if (service === 'whoami') return whoami(cwd, takeFlags(after));
   if (service === 'init') return init(cwd, after);
