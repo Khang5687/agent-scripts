@@ -961,3 +961,164 @@ test('health: one line, exit 0 when every promised key can be served, exit 1 nam
   assert.match(await fs.readFile(statusLog, 'utf8'), /--result fail .*exit 7/);
   for (const d of [hdev, programDir, base]) await fs.rm(d, { recursive: true, force: true });
 });
+
+// ---- omp-move ----------------------------------------------------------------------------------------------------
+
+const OM = {
+  alpha: 'alpha-plain-value-111',
+  beta: 'beta-single-value-222',
+  gamma: 'gamma-double-value-333',
+  old: 'old-kept-value-444',
+};
+const modelsText = (extra = '') => [
+  '# my models',
+  'providers:',
+  '  alpha-ai:',
+  '    baseUrl: https://a.example/v1',
+  `    apiKey: ${OM.alpha}   # note: plain`,
+  '    api: openai-completions',
+  '  beta:',
+  `    apiKey: '${OM.beta}'`,
+  '    models:',
+  '      - id: m1',
+  '        name: M1',
+  '  gamma.x:',
+  `      apiKey: "${OM.gamma}" # keep me`,
+  '      api: x',
+  '  delta:',
+  '    apiKey: DELTA_API_KEY',
+  '  eps:',
+  '    apiKey: "!op read op://demo/eps"',
+  '  local:',
+  '    auth: none',
+  extra,
+  'other: 1',
+  '',
+].join('\n');
+
+test('omp-move: literal keys move into the group, lines are rewritten, the rest of the file and its mode stay; refusals change nothing', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'agent-broker-ompmove-'));
+  const exe = path.join(dir, 'omp-bin');
+  await fs.mkdir(exe);
+  const argsLog = path.join(dir, 'argv.log');
+  const stdinLog = path.join(dir, 'stdin.log');
+  const real = path.join(BIN, 'agent-broker-admin.mjs');
+  const fakeAdmin = path.join(dir, 'admin.sh');
+  await fs.writeFile(fakeAdmin, `#!/bin/bash\nprintf '%s\\n' "$*" >> '${argsLog}'\ntee -a '${stdinLog}' | '${process.execPath}' '${real}' "$@"\n`, { mode: 0o700 });
+  const failAdmin = path.join(dir, 'fail.sh');
+  await fs.writeFile(failAdmin, `#!/bin/bash\ncat >/dev/null\necho "admin said no" >&2\nexit 9\n`, { mode: 0o700 });
+  const wrapper = path.resolve(import.meta.dirname, '../wrappers/agent-broker-admin');
+  const move = (file, args = [], adminCmd = fakeAdmin) => spawnSync('bash', [wrapper, 'omp-move', '--file', file, '--group', 'omptest', '--exe', exe, ...args], {
+    env: { ...env, AGENT_BROKER_DEV_ADMIN: adminCmd, AGENT_BROKER_DEV_NODE: process.execPath }, encoding: 'utf8',
+  });
+  const exists = (p) => fs.stat(p).then(() => true, () => false);
+  const everything = (r) => r.stdout + r.stderr;
+  const noValues = async (r) => {
+    for (const v of Object.values(OM)) {
+      assert.ok(!everything(r).includes(v));
+      assert.ok(!(await fs.readFile(argsLog, 'utf8').catch(() => '')).includes(v));
+    }
+  };
+
+  // The group exists already with an omp grant on another key: that key stays granted.
+  ok(admin(['apply', '--group', 'omptest', '--new-group', '--grant-omp', 'OLD_KEY', '--omp-exe', exe], `group:OLD_KEY=${OM.old}\n`));
+
+  const file = path.join(dir, 'models.yml');
+  const original = modelsText();
+  await fs.writeFile(file, original, { mode: 0o640 });
+  await fs.chmod(file, 0o640);
+  const r = move(file);
+  assert.equal(r.status, 0, everything(r));
+  await noValues(r);
+  const line = (k) => `"!/usr/local/bin/agent-broker key omptest ${k}"`;
+  const expected = original
+    .replace(`apiKey: ${OM.alpha}   # note: plain`, `apiKey: ${line('ALPHA_AI_API_KEY')}   # note: plain`)
+    .replace(`apiKey: '${OM.beta}'`, `apiKey: ${line('BETA_API_KEY')}`)
+    .replace(`apiKey: "${OM.gamma}" # keep me`, `apiKey: ${line('GAMMA_X_API_KEY')} # keep me`);
+  assert.equal(await fs.readFile(file, 'utf8'), expected);
+  assert.equal((await fs.stat(file)).mode & 0o777, 0o640);
+  const backup = `${file}.pre-broker`;
+  assert.equal(await fs.readFile(backup, 'utf8'), original);
+  assert.equal((await fs.stat(backup)).mode & 0o777, 0o600);
+  assert.deepEqual((await fs.readdir(dir)).filter((n) => n.includes('omp-move-')), []); // no temp file left
+  assert.match(r.stdout, /moved 3 provider keys/);
+  assert.match(r.stdout, /alpha-ai -> ALPHA_AI_API_KEY \(line 5\)/);
+  assert.match(r.stdout, /delta \(line 16\): an environment variable name \(DELTA_API_KEY\)/);
+  assert.match(r.stdout, /eps \(line 18\): already a command/);
+  assert.match(r.stdout, /Start a test agent on each moved provider \(alpha-ai, beta, gamma\.x\)/);
+  assert.match(r.stdout, /shred -u '.*models\.yml\.pre-broker'/);
+  // One admin call; values on stdin only.
+  const calls = (await fs.readFile(argsLog, 'utf8')).trim().split('\n');
+  assert.deepEqual(calls, [`apply --group omptest --ensure-group --omp-exe ${exe} --add-grant-omp ALPHA_AI_API_KEY --add-grant-omp BETA_API_KEY --add-grant-omp GAMMA_X_API_KEY`]);
+  assert.equal(await fs.readFile(stdinLog, 'utf8'), `group:ALPHA_AI_API_KEY=${OM.alpha}\ngroup:BETA_API_KEY=${OM.beta}\ngroup:GAMMA_X_API_KEY=${OM.gamma}\n`);
+  const stored = await fs.readFile(path.join(dev, 'home/group-secrets/omptest.env'), 'utf8');
+  for (const v of [OM.alpha, OM.beta, OM.gamma, OM.old]) assert.ok(stored.includes(v));
+  const record = JSON.parse(await fs.readFile(path.join(dev, 'home/groups/omptest.json'), 'utf8'));
+  assert.deepEqual(record.grants.find((g) => g.omp).keys, ['OLD_KEY', 'ALPHA_AI_API_KEY', 'BETA_API_KEY', 'GAMMA_X_API_KEY']);
+  assert.ok(!ok(admin(['list'])).stdout.includes('plain-value'));
+
+  // A second run finds nothing, makes no backup, calls no admin.
+  await fs.rm(backup);
+  const again = move(file);
+  assert.equal(again.status, 0, everything(again));
+  assert.match(again.stdout, /nothing to move/);
+  assert.equal(await exists(backup), false);
+  assert.equal((await fs.readFile(argsLog, 'utf8')).trim().split('\n').length, 1);
+  assert.equal(await fs.readFile(file, 'utf8'), expected);
+
+  // An existing backup is refused; nothing changes and no admin call is made.
+  await fs.writeFile(file, original, { mode: 0o640 });
+  await fs.writeFile(backup, 'someone else\n', { mode: 0o600 });
+  const refused = move(file);
+  assert.equal(refused.status, 2);
+  assert.match(refused.stderr, /already exists/);
+  assert.equal(await fs.readFile(backup, 'utf8'), 'someone else\n');
+  assert.equal(await fs.readFile(file, 'utf8'), original);
+  assert.equal((await fs.readFile(argsLog, 'utf8')).trim().split('\n').length, 1);
+  await fs.rm(backup);
+
+  // A failing admin call: the file is untouched and the backup is removed again.
+  const failed = move(file, [], failAdmin);
+  assert.equal(failed.status, 9);
+  assert.match(failed.stderr, /the admin call failed \(exit 9\).*unchanged/);
+  assert.equal(await fs.readFile(file, 'utf8'), original);
+  assert.equal(await exists(backup), false);
+  await noValues(failed);
+
+  // Anything that is not one plain line: stop at that line, change nothing, leave no backup.
+  const bad = {
+    'a block scalar': ['    apiKey: |\n      one-line-value-555', /line 22: .*block scalar/],
+    'a plain value that continues': ['    apiKey: first-part\n      second-part', /line 22: .*continues on the next line/],
+    'a value on the next line': ['    apiKey:\n      deeper', /line 22: .*no value on its line/],
+    'an anchor': ['    apiKey: &key some-anchored-666', /line 22: .*an anchor/],
+    'an alias': ['    apiKey: *key', /line 22: .*an alias/],
+    'a flow mapping': ['    apiKey: {a: b}', /line 22: .*flow mapping/],
+    'an unterminated quote': ['    apiKey: "no end', /line 22: .*does not end on this line/],
+    'text after a quote': ['    apiKey: "a" b', /line 22: .*after its closing quote/],
+    'a double apiKey': [`    apiKey: ${OM.alpha}-x\n    apiKey: again-value`, /line 23: .*two apiKey lines/],
+    'an apiKey deeper than the provider fields': ['    headers:\n      apiKey: nested-value-777', /line 23: .*place this command does not understand/],
+    'an apiKey in a model entry': ['    models:\n      - id: z\n        apiKey: model-level-888', /line 24: .*place this command does not understand/],
+    'two providers with one key name': ['  alpha_ai:\n    apiKey: collide-value-999', /line 23: .*both map to ALPHA_AI_API_KEY/],
+    'an invalid key name': ['  9lives:\n    apiKey: digit-start-value', /line 23: .*valid key name/],
+    'a merge key': ['    <<: *base', /line 22: .*merge key/],
+  };
+  for (const [what, [extra, pattern]] of Object.entries(bad)) {
+    const text = modelsText(`  zed:\n${extra}`);
+    await fs.writeFile(file, text, { mode: 0o640 });
+    const beforeCalls = (await fs.readFile(argsLog, 'utf8')).trim().split('\n').length;
+    const rr = move(file);
+    assert.equal(rr.status, 2, `${what}: ${everything(rr)}`);
+    assert.match(rr.stderr, pattern, what);
+    assert.match(rr.stderr, /Nothing was changed/);
+    assert.equal(await fs.readFile(file, 'utf8'), text, what);
+    assert.equal(await exists(backup), false, what);
+    assert.equal((await fs.readFile(argsLog, 'utf8')).trim().split('\n').length, beforeCalls, what);
+  }
+
+  // Windows line ends are kept, line by line.
+  const crlf = original.replace(/\n/g, '\r\n');
+  await fs.writeFile(file, crlf, { mode: 0o640 });
+  assert.equal(move(file).status, 0);
+  assert.equal(await fs.readFile(file, 'utf8'), expected.replace(/\n/g, '\r\n'));
+  await fs.rm(dir, { recursive: true, force: true });
+});

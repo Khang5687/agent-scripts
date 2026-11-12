@@ -59,6 +59,18 @@ case "${1:-}" in
     printf '%s' "$lines" | "${ADMIN[@]}" import-group "$group"
     echo "imported$names into group $group (files not changed)"
     ;;
+  omp-move)
+    # omp-move --exe DIR [--file models.yml] [--group omp]: moves the literal provider keys out of OMP's models file into a
+    # broker group (one password) and leaves a key line behind. Runs as YOU (the broker user cannot read your models file);
+    # the helper does the reading, the backup and the rewrite, and makes one admin call. Values travel on its stdin only.
+    shift
+    if [ -n "${AGENT_BROKER_DEV_ROOT:-}" ]; then # tests only
+      NODE=${AGENT_BROKER_DEV_NODE:-node} HELPER=$(cd "$(dirname "$0")" && pwd)/../bin/omp-move.mjs
+    else
+      NODE=/opt/agent-broker/node/bin/node HELPER=/opt/agent-broker/bin/omp-move.mjs
+    fi
+    exec "$NODE" "$HELPER" "$@" -- "${ADMIN[@]}"
+    ;;
   *)
     exec "${ADMIN[@]}" "$@"
     ;;

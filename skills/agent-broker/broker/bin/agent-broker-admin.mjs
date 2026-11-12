@@ -29,11 +29,14 @@ On a Mac usually run by the wizard: ~/git/agent-scripts/skills/agent-broker/scri
         A grant is replaced as a whole by the unit / root / omp it names:
         --grant-file UNIT:FILE=KEY  (UNIT is e.g. demo.service)   --grant-env UNIT:KEY   --optional KEY
         --grant-root KEY  --grant-root-write KEY                  --grant-omp KEY [--omp-exe DIR] [--omp-cgroup UNIT]
-        --remove-grant UNIT|root|omp
+        --add-grant-omp KEY  (adds to the omp grant's keys instead of replacing them)   --remove-grant UNIT|root|omp
+     --ensure-group                 like --new-group, but fine when the group already exists
   lookup <stack>                  who the stack's tokens belong to; their sites and databases
   set <project> <KEY> | set-stack <stack> <KEY> | set-group <group> <KEY>     store one value (typed hidden)
   import <project> <env-file> <KEY>...              move keys out of a .env file
   import-group <group>            KEY=VALUE lines on stdin, taken literally (used by: agent-broker-admin import-files)
+  omp-move --exe DIR [--file F] [--group G]   move literal provider keys out of OMP's models.yml into group G (default omp);
+                                  run as yourself: backs up to F.pre-broker, stores the keys, rewrites the lines, one password
   unset <project> <KEY> | unset-stack <stack> <KEY> | unset-group <group> <KEY>
   list                            stacks, projects and groups (key names and grants, never values)
   remove-project <name> | remove-stack <name> | remove-group <name>
@@ -72,8 +75,9 @@ async function applyGroup(opts, values) {
   const name = checkName(opts.group, 'group');
   if (opts.stack || opts.project || Object.keys(values.stack).length || Object.keys(values.project).length) fail('--group cannot be combined with --stack, --project or their values');
   const known = await exists(listGroups, name);
+  if (opts['new-group'] && opts['ensure-group']) fail('--new-group and --ensure-group cannot be combined');
   if (opts['new-group'] && known) fail(`group ${name} already exists`);
-  if (!opts['new-group'] && !known) fail(`unknown group ${name} (add --new-group to create it)`);
+  if (!opts['new-group'] && !opts['ensure-group'] && !known) fail(`unknown group ${name} (add --new-group to create it)`);
   const group = known ? await loadGroup(name) : { grants: [] };
   const idOf = (g) => g.unit ?? (g.root ? 'root' : 'omp');
   const grants = new Map(group.grants.map((g) => [idOf(g), g]));
@@ -112,12 +116,14 @@ async function applyGroup(opts, values) {
     grants.set('root', { root: true, keys: opts['grant-root'] ?? [], write: opts['grant-root-write'] ?? [] });
     summary.push(`group ${name}: root grant`);
   }
-  if (opts['grant-omp'] || opts['omp-exe'] || opts['omp-cgroup']) {
+  if (opts['grant-omp'] || opts['add-grant-omp'] || opts['omp-exe'] || opts['omp-cgroup']) {
+    if (opts['grant-omp'] && opts['add-grant-omp']) fail('--grant-omp replaces the keys, --add-grant-omp adds to them: use one');
     const old = grants.get('omp');
     const exe = opts['omp-exe'] ?? old?.exe;
-    if (!opts['grant-omp']) fail('--omp-exe and --omp-cgroup go with --grant-omp KEY');
+    if (!opts['grant-omp'] && !opts['add-grant-omp']) fail('--omp-exe and --omp-cgroup go with --grant-omp KEY or --add-grant-omp KEY');
     if (!exe) fail('--grant-omp needs --omp-exe DIR (the folder the OMP program runs from)');
-    grants.set('omp', { omp: true, cgroup: opts['omp-cgroup'] ?? old?.cgroup ?? 'paseo.service', exe, keys: opts['grant-omp'] });
+    const keys = opts['grant-omp'] ?? [...new Set([...(old?.keys ?? []), ...opts['add-grant-omp']])];
+    grants.set('omp', { omp: true, cgroup: opts['omp-cgroup'] ?? old?.cgroup ?? 'paseo.service', exe, keys });
     summary.push(`group ${name}: omp grant`);
   }
 
@@ -151,13 +157,13 @@ async function apply(args) {
     'vercel-org': 'string', 'vercel-project': 'string', 'remove-service': 'list',
     group: 'string', 'new-group': 'bool', 'grant-file': 'list', 'grant-env': 'list', optional: 'list',
     'grant-root': 'list', 'grant-root-write': 'list', 'grant-omp': 'list', 'omp-exe': 'string', 'omp-cgroup': 'string',
-    'remove-grant': 'list',
+    'remove-grant': 'list', 'ensure-group': 'bool', 'add-grant-omp': 'list',
   });
   if (positional.length) fail(`unexpected arguments: ${positional.join(' ')}`);
   const values = parseValues(await readStdin());
   if (opts.group) return applyGroup(opts, values);
   if (Object.keys(values.group).length) fail('group:KEY values need --group NAME');
-  for (const f of ['new-group', 'grant-file', 'grant-env', 'optional', 'grant-root', 'grant-root-write', 'grant-omp', 'omp-exe', 'omp-cgroup', 'remove-grant']) {
+  for (const f of ['new-group', 'ensure-group', 'grant-file', 'grant-env', 'optional', 'grant-root', 'grant-root-write', 'grant-omp', 'add-grant-omp', 'omp-exe', 'omp-cgroup', 'remove-grant']) {
     if (opts[f]) fail(`--${f} needs --group NAME`);
   }
   // Tests only (dev root, never for _deployer): no calls to the services to check tokens and pins.
