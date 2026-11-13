@@ -51,6 +51,14 @@ test('scrubber removes stored values and token-shaped strings', () => {
   assert.match(out, /postgresql:\/\/reader\.abc:\[secret\]@aws-0/);
 });
 
+test('scrubber removes a stored value in its JSON, Go JSON and YAML forms (compose config --format json)', () => {
+  const value = `ab&cd<ef>"g\\h'i`;
+  const scrub = lib.makeScrubber([value]);
+  const go = 'ab\\u0026cd\\u003cef\\u003e\\"g\\\\h\'i';
+  const out = scrub([`plain ${value}`, `go "P": "${go}"`, `js ${JSON.stringify(value)}`, `yaml '${value.replaceAll("'", "''")}'`].join('\n'));
+  assert.equal(out, ['plain [secret]', 'go "P": "[secret]"', 'js "[secret]"', "yaml '[secret]'"].join('\n'));
+});
+
 test('stream scrubbing catches a token split across chunks', async () => {
   const input = new PassThrough();
   let out = '';

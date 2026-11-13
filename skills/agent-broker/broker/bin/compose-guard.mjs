@@ -77,8 +77,10 @@ export async function configProblems(config, { home, cwd, otherValues = [] }) {
     for (const s of Array.isArray(ssh) ? ssh : Object.entries(ssh).map(([id, p]) => `${id}=${p}`)) await bad(`${at} build ssh`, typeof s === 'string' ? s.split('=').slice(1).join('=') : s?.path);
     for (const key of ['cache_from', 'cache_to']) {
       for (const entry of svc.build?.[key] ?? []) {
-        // buildx reads an entry as CSV and lowercases the keys: drop quotes and compare keys without case.
-        const parts = String(entry).replaceAll('"', '').split(',').map((p) => p.trim());
+        // buildx reads an entry as CSV (a quoted field may hold a comma) and lowercases the keys. No documented use
+        // needs quotes, so a quoted entry is refused; the rest is split on commas and keys compared without case.
+        if (String(entry).includes('"')) { out.push(`${at} build ${key}: quoted cache entries are not offered`); continue; }
+        const parts = String(entry).split(',').map((p) => p.trim());
         if (!parts.some((p) => /^type=local$/i.test(p))) continue;
         for (const part of parts) {
           const m = /^(?:src|dest)=(.*)$/i.exec(part);
@@ -130,7 +132,7 @@ export const COMPOSE_COMMANDS = {
   stop: { flags: take('-t', '--timeout') },
   start: { check: true, flags: {} },
   rm: { flags: list('-f', '--force', '-s', '--stop'), no: { '-v': VOLUMES, '--volumes': VOLUMES } },
-  config: { flags: { ...list('-q', '--quiet', '--services', '--volumes', '--profiles', '--images', '--no-interpolate'), ...take('--format') } },
+  config: { check: true, flags: { ...list('-q', '--quiet', '--services', '--volumes', '--profiles', '--images', '--no-interpolate'), ...take('--format') } },
   build: { check: true, flags: { ...list('--no-cache', '--pull', '-q', '--quiet', '--with-dependencies'), ...take('--build-arg') } },
   images: { flags: { ...list('-q', '--quiet'), ...take('--format') } },
   top: { flags: {} },

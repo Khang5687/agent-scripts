@@ -371,9 +371,18 @@ const PATTERNS = [
   [/(\bauthorization["']?\s*[:=]\s*["']?(?:bearer|token|basic)\s+)[^\s"']+/gi, '$1[secret]'],
 ];
 
-/** Returns text -> text that removes every known secret value and every token-shaped string. */
+/**
+ * Returns text -> text that removes every known secret value and every token-shaped string. Each value is also matched
+ * in the forms a CLI may print it in: JSON-escaped, Go's JSON (which also escapes < > & U+2028 U+2029, as
+ * `compose config --format json` does) and YAML single-quoted.
+ */
 export function makeScrubber(values) {
-  const exact = [...new Set(values.filter((v) => typeof v === 'string' && v.length >= 6))].sort((a, b) => b.length - a.length);
+  const forms = (v) => {
+    const js = JSON.stringify(v).slice(1, -1);
+    const go = js.replace(/[<>&\u2028\u2029]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
+    return [v, js, go, v.replaceAll("'", "''")];
+  };
+  const exact = [...new Set(values.filter((v) => typeof v === 'string' && v.length >= 6).flatMap(forms))].sort((a, b) => b.length - a.length);
   return (text) => {
     let t = text;
     for (const v of exact) if (t.includes(v)) t = t.split(v).join('[secret]');

@@ -25,7 +25,7 @@ test.before(async () => {
   await fs.mkdir(project, { recursive: true });
   await fs.mkdir(bin);
   // config -> the JSON in $FAKE_CONFIG (and a log line); anything else -> a log line "RAN <args>".
-  await fs.writeFile(path.join(bin, 'docker'), `#!/bin/sh\ncase " $* " in *" config "*) echo "CONFIG $*" >> "${log}"; cat "${cfg}";; *) echo "RAN $*" >> "${log}"; echo "STDIN:$(cat)" >> "${log}"; echo "ran $OWN";; esac\n`, { mode: 0o755 });
+  await fs.writeFile(path.join(bin, 'docker'), `#!/bin/sh\necho "ENV $COMPOSE_EXPERIMENTAL_GIT_REMOTE $COMPOSE_EXPERIMENTAL_OCI_REMOTE" >> "${log}"\ncase " $* " in *" config "*) echo "CONFIG $*" >> "${log}"; cat "${cfg}";; *) echo "RAN $*" >> "${log}"; echo "STDIN:$(cat)" >> "${log}"; echo "ran $OWN";; esac\n`, { mode: 0o755 });
   let r = admin(['apply', '--stack', 'demo', '--new-stack', '--project', 'app', '--new-project', '--path', project], `project:APP_SECRET=${OWN}\n`);
   assert.equal(r.status, 0, r.stderr);
   r = admin(['apply', '--group', 'other', '--new-group', '--grant-root', 'OTHER_KEY'], `group:OTHER_KEY=${OTHER}\n`);
@@ -40,7 +40,7 @@ async function compose(config, args, { input, dotenv } = {}) {
   const r = spawnSync(process.execPath, [path.join(BIN, 'agent-broker.mjs'), 'compose', ...args], { cwd: project, env: { ...env, PATH: `${bin}:${process.env.PATH}` }, encoding: 'utf8', input });
   await fs.rm(path.join(project, '.env'), { force: true });
   const lines = (await fs.readFile(log, 'utf8')).trim().split('\n').filter(Boolean);
-  return { ...r, ran: lines.filter((l) => l.startsWith('RAN')), configCalls: lines.filter((l) => l.startsWith('CONFIG')), stdinSeen: lines.filter((l) => l.startsWith('STDIN:')).map((l) => l.slice(6)) };
+  return { ...r, ran: lines.filter((l) => l.startsWith('RAN')), configCalls: lines.filter((l) => l.startsWith('CONFIG')), envSeen: lines.filter((l) => l.startsWith('ENV')), stdinSeen: lines.filter((l) => l.startsWith('STDIN:')).map((l) => l.slice(6)) };
 }
 const svc = (extra) => ({ services: { web: { image: 'x', ...extra } } });
 const bind = (source) => svc({ volumes: [{ type: 'bind', source, target: '/t' }] });
@@ -61,6 +61,8 @@ test('a clean config starts: named volumes, ordinary binds, GPU reservations and
   const withOpts = await compose(svc({}), ['-f', 'compose.yaml', '--profile', 'mcp', '--dry-run', 'up']);
   assert.match(withOpts.configCalls[0], /^CONFIG compose -f compose.yaml --profile mcp --profile \* config --format json$/);
   assert.equal(withOpts.ran[0], 'RAN compose -f compose.yaml --profile mcp --dry-run up');
+  // Compose files from git or a registry stay off in both the check and the real call.
+  assert.deepEqual(withOpts.envSeen, ['ENV false false', 'ENV false false']);
 });
 
 test('refused, with the service and the path named and nothing started: the broker home, inside it, above it, the Docker socket', async () => {
@@ -209,9 +211,9 @@ test('the compose commands the runbooks use still run, with the flags they use',
   for (const args of [['config', '--quiet'], ['--profile', 'mcp', 'config', '--quiet']]) {
     const r = await compose(svc({}), args);
     assert.equal(r.status, 0, `${args.join(' ')}: ${r.stderr}`);
-    assert.equal(r.configCalls.length, 1);
+    assert.equal(r.configCalls.length, 2); // the path check, then the real call
   }
-  // Read-only and stop commands do not resolve the config; the ones that start something do.
+  // Read-only and stop commands do not resolve the config; the ones that start something, and config itself, do.
   assert.deepEqual((await compose(svc({}), ['ps'])).configCalls, []);
   assert.equal((await compose(svc({}), ['up', '-d'])).configCalls.length, 1);
 });
@@ -333,11 +335,24 @@ test('Z1: stdin goes only to exec; run, up, build, restart, start and the rest r
 });
 
 test('Z2: a local cache entry is read the way buildx reads it (keys in any case, quoted CSV)', async () => {
-  for (const entry of [`TYPE=local,DEST=${home}/c`, `type=local,Dest=${home}/c`, `"type=local","dest=${home}/c"`]) {
+  for (const entry of [`TYPE=local,DEST=${home}/c`, `type=local,Dest=${home}/c`]) {
     const r = await compose(svc({ build: { context: '.', cache_to: [entry] } }), ['up', '-d']);
     assert.equal(r.status, 2, entry);
     assert.match(r.stderr, /cache_to/);
   }
+  // buildx keeps a comma inside a quoted CSV field, so quoted entries are refused outright.
+  for (const entry of [`"type=local","dest=${home}/c"`, `type=local,"dest=/tmp/a,/../..${home}/c"`]) {
+    const r = await compose(svc({ build: { context: '.', cache_from: [entry] } }), ['build']);
+    assert.equal(r.status, 2, entry);
+    assert.match(r.stderr, /cache_from: quoted cache entries are not offered/);
+  }
+});
+
+test('W2: compose config gets the path check, so it cannot print an env_file from the broker home', async () => {
+  const r = await compose(svc({ env_file: path.join(home, 'group-secrets/other.env') }), ['config']);
+  assert.equal(r.status, 2, r.stderr);
+  assert.match(r.stderr, /env_file/);
+  assert.equal(r.configCalls.length, 1); // the check only; the real config call never ran
 });
 
 test('Y2: every key that makes the client read or write a host path goes through the path check', async () => {

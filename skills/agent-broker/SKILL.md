@@ -200,8 +200,9 @@ Each `agent-broker-admin` call asks your password.
   Docker socket or `/`; `privileged`, `pid`/`network_mode`/`userns_mode: host`, `container:` forms of
   `network_mode`/`pid`/`ipc`, `devices`, `device_cgroup_rules`, `cap_add`, `security_opt` other than
   `no-new-privileges`, and a volume `device` that is not a bind (an `o` that is exactly `bind` or `rbind`) passing the
-  checks; every host path the client reads or writes (secrets, configs, `env_file`, `label_file`, build context,
-  absolute or climbing `dockerfile`, `ssh`, `type=local` cache) when it is in the broker's home. Compose files: `-f`
+  checks; for `up`, `run`, `restart`, `start`, `build` and `config`, every host path the client reads or writes
+  (secrets, configs, `env_file`, `label_file`, build context, absolute or climbing `dockerfile`, `ssh`, `type=local`
+  cache; a quoted cache entry is refused outright) when it is in the broker's home. Compose files: `-f`
   must be a file inside the project, never `-` (stdin) or a remote reference; a plain `COMPOSE_FILE` line (stored
   values or the folder's `.env`) gets the same rule, and `COMPOSE_ENV_FILES` is refused. Because Compose reads `.env`
   in more forms than the broker does, the guarantee is this instead: only `exec` gets the caller's stdin, so a compose
@@ -210,5 +211,7 @@ Each `agent-broker-admin` call asks your password.
   real call (the real call reads the files again; running it on the checked JSON was not done because it cannot be
   proven here that Compose then keeps every container unchanged), a path swapped after the check, a socket under
   another name, a top-level `name:` or `COMPOSE_PROJECT_NAME` that points at another project's containers (the owner has
-  not decided whether the broker pins the project name), `docker exec` into a running container, and `docker`/`lxc`
-  run by the agent itself. The secret guard has its own rules for those direct calls (a guard as well).
+  not decided whether the broker pins the project name), `docker exec` into a running container, `exec -e KEY` or
+  `run -e KEY` without `=` (Compose fills in the project's own stored value, which the command can then print in
+  another form; only that project's values), and `docker`/`lxc` run by the agent itself. The secret guard has its own
+  rules for those direct calls (a guard as well).
