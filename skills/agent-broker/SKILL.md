@@ -60,7 +60,8 @@ agent-broker attach --supabase-ref REF       # later: add a service the project 
   nobody owns, on an existing stack, with a site / database of that stack's account that no other project uses.
 - `--netlify-new` creates a free Netlify site. A new Supabase project costs money: ask the user to create it on
   supabase.com, then `attach --supabase-ref`. A Supabase ref also gets a read-only database user (`--no-reader` skips).
-- A stack that does not exist yet, or lacks a token: the owner adds it with the wizard (menu 1 or 2).
+- A stack that does not exist yet, or lacks a token: the owner adds it with the wizard (menu 1 or 2; on Linux, which
+  has no wizard: "Owner: Linux commands", step 3).
 
 ## Owner: the wizard
 
@@ -139,7 +140,9 @@ Each `agent-broker-admin` call asks your password.
 1. Install or update (rerun after `git pull`):
    `sudo ~/git/agent-scripts/skills/agent-broker/broker/install.sh`. It creates `_deployer` (your group + docker),
    `/opt/agent-broker` (own Node, the cloud CLIs), the commands, the sudo rule and the CLI guard. It sets `_deployer`'s
-   shell to `/bin/sh` so the other machine's one SSH key can deliver tokens; the account has no password.
+   shell to `/bin/sh` so the other machine's one SSH key can deliver tokens; the account has no password. If step 3
+   stops with `spawnSync .../esbuild/bin/esbuild ETXTBSY`, run it again: npm runs the 5 esbuild setup scripts at once,
+   and on an empty npm cache 2 of them failed this way once (Omen, 2026-11-18); the rerun passed.
 2. AppArmor, once, so bwrap may run:
    `sudo install -m 644 /opt/agent-broker/apparmor/bwrap /etc/apparmor.d/bwrap && sudo apparmor_parser -r /etc/apparmor.d/bwrap`.
    Side effect: every user of the machine, agents included, may then use bwrap. Undo: `sudo apparmor_parser -R /etc/apparmor.d/bwrap && sudo rm /etc/apparmor.d/bwrap`.
@@ -148,6 +151,9 @@ Each `agent-broker-admin` call asks your password.
    `agent-broker init --stack demo --here --no-agents-md`; then `agent-broker-admin import <name> .env KEY1 KEY2`
    (moves the secret lines out; Compose quoting is read; a value with a `$` Compose would expand is refused: use
    `agent-broker-admin set <name> KEY`), and `chmod 640 .env`.
+   A stack with cloud tokens (the wizard is macOS-only): `agent-broker-admin apply --stack <name> --new-stack </dev/null`,
+   then `agent-broker-admin set-stack <name> SUPABASE_ACCESS_TOKEN` (or `NETLIFY_AUTH_TOKEN`, `VERCEL_TOKEN`,
+   `APIFY_TOKEN`; typed hidden).
 4. Key files into a group: `agent-broker-admin import-files <group> KEY=<file> ...` (one password; the files stay, delete
    them once the service works). Add the grant with `apply --group <group> --grant-file <unit>:<file>=KEY` (or
    `--grant-env`, `--grant-root`, `--grant-root-write`, `--grant-omp`).
