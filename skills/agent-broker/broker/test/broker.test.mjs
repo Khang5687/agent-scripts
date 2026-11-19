@@ -291,6 +291,26 @@ test('init: an agent registers an unclaimed git repo on an existing stack; claim
   assert.equal(await fs.lstat(path.join(dev, 'home', 'projects', 'otherapp.json')).catch(() => null), null);
 });
 
+test('supabase migrate copies only the supabase folder: the rest of the project and an older full copy stay out', async () => {
+  ok(admin(['apply', '--stack', 'studio'], `stack:SUPABASE_ACCESS_TOKEN=${['sbp', 'fake', 'value'].join('_')}\n`));
+  const app = await folder('dbapp');
+  ok(broker(['init', '--stack', 'studio', '--here', '--supabase-ref', 'refdb', '--no-reader'], app));
+  const { call, log } = await fakeCli('supabase', 'printf "%s\\n" "$1" >> "$LOG"; find . -type f | sort >> "$LOG"');
+  assert.match(call(['supabase', 'migrate', '--dry-run'], app).stderr, /supabase\/ is not a folder/);
+
+  await fs.mkdir(path.join(app, 'supabase', 'migrations'), { recursive: true });
+  await fs.writeFile(path.join(app, 'supabase', 'migrations', '001_init.sql'), 'select 1;\n');
+  await fs.mkdir(path.join(app, 'scratch'));
+  await fs.writeFile(path.join(app, 'scratch', 'run.apk'), 'big');
+  const stale = path.join(dev, 'home', 'work', 'dbapp', 'scratch');
+  await fs.mkdir(stale, { recursive: true });
+  await fs.writeFile(path.join(stale, 'half-copied.apk'), 'big');
+  ok(call(['supabase', 'migrate', '--dry-run'], app));
+  assert.deepEqual((await fs.readFile(log, 'utf8')).trim().split('\n'),
+    ['link', './supabase/migrations/001_init.sql', 'db', './supabase/migrations/001_init.sql']);
+  assert.equal(await fs.lstat(stale).catch(() => null), null);
+});
+
 test('attach adds a missing service only; agents-md gives the block for the folder', async () => {
   const app = await folder('attachapp');
   ok(broker(['init', '--stack', 'studio', '--here'], app));

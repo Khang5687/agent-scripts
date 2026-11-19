@@ -260,6 +260,11 @@ export async function stackFromAgentsMd(dir) {
 
 export async function resolveProject(cwd, explicit, explicitStack, opts = {}) {
   const dir = await fs.realpath(cwd).catch(() => cwd);
+  // A folder the broker user cannot enter (a private parent, e.g. made by mktemp -d) hides its .git file, so a worktree
+  // in it would read as "not inside a registered project". Say what is wrong instead.
+  if ((await fs.access(dir, constants.R_OK | constants.X_OK).catch((e) => e))?.code === 'EACCES') {
+    fail(`the broker cannot read ${dir}: a folder on that path is private to you (mode 700, e.g. from mktemp -d). Run from a folder your group may read (chmod 750 the private one).`);
+  }
   let found = await matches(dir);
   let rootFor = (folder) => folder;
   if (!found.length) {

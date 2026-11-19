@@ -89,10 +89,21 @@ async function context(P, service, needs) {
   return { project: P.project, config, secrets, values, scrub: makeScrubber(values) };
 }
 
-async function workCopy(P, ctx) {
+// `sub` (e.g. supabase): copy only that folder of the project and drop everything else from the work copy. The rest is
+// not needed and can be huge (a git-ignored scratch folder of test runs); a real folder only, never a link.
+async function workCopy(P, ctx, sub) {
   const dest = path.join(DIR.work, P.name);
-  const { changed, skipped } = await syncProject(P.root, dest, ctx.values);
-  process.stderr.write(`agent-broker: copied ${changed} changed file(s) from ${P.root}${skipped.length ? `; left out ${skipped.length} (links outside the project, or files only you can read): ${skipped.slice(0, 5).join(', ')}${skipped.length > 5 ? ', ...' : ''}` : ''}\n`);
+  let from = P.root;
+  let to = dest;
+  if (sub) {
+    from = path.join(P.root, sub);
+    if (!(await fs.lstat(from).catch(() => null))?.isDirectory()) fail(`${sub}/ is not a folder in ${P.root}`);
+    to = path.join(dest, sub);
+    await fs.mkdir(dest, { recursive: true, mode: 0o700 });
+    for (const e of await fs.readdir(dest)) if (e !== sub) await fs.rm(path.join(dest, e), { recursive: true, force: true });
+  }
+  const { changed, skipped } = await syncProject(from, to, ctx.values);
+  process.stderr.write(`agent-broker: copied ${changed} changed file(s) from ${from}${skipped.length ? `; left out ${skipped.length} (links outside the project, or files only you can read): ${skipped.slice(0, 5).join(', ')}${skipped.length > 5 ? ', ...' : ''}` : ''}\n`);
   return dest;
 }
 
@@ -274,7 +285,7 @@ const supabase = {
     const { opts, positional } = parseArgs(args, { 'dry-run': 'bool', 'include-all': 'bool' });
     none(positional);
     const ctx = await context(P, 'supabase', ['SUPABASE_ACCESS_TOKEN']);
-    const work = await workCopy(P, ctx);
+    const work = await workCopy(P, ctx, 'supabase');
     const env = { SUPABASE_ACCESS_TOKEN: ctx.secrets.SUPABASE_ACCESS_TOKEN };
     const linked = await run('supabase', ['link', '--project-ref', ctx.config.project_ref, '--yes'], { cwd: work, env, scrub: ctx.scrub });
     if (linked) return linked;

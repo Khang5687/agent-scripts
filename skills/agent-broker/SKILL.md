@@ -28,9 +28,13 @@ agent-broker <service> <action> [options]
   `--prod`, `--alias`, `--functions`, `--json` ... pass through (`agent-broker help`). Add `--prod` only when the owner
   asks (credits). Vercel: `mkdir -p .vercel && agent-broker vercel settings > .vercel/project.json`, `vercel build`,
   `agent-broker vercel deploy`.
-- **Supabase**: `query "select ..."` is read-only; `migrate [--dry-run]` applies `supabase/migrations`; any other
-  write is `admin-query "..."`, which waits: ask the owner to run `agent-broker-admin approve <id>`, then
-  `agent-broker result <id>`.
+- **Supabase**: `query "select ..."` is read-only; `migrate [--dry-run]` applies `supabase/migrations` (it copies only
+  the `supabase/` folder); any other write is `admin-query "..."`, which waits: ask the owner to run
+  `agent-broker-admin approve <id>`, then `agent-broker result <id>`.
+- **Copies**: deploys and pushes (netlify, vercel, apify) copy the whole project folder, git-ignored files included
+  (build output is often ignored), so a big ignored folder (test runs, APKs) makes them slow. The broker user reads
+  your folders through your group: a worktree inside a private folder (`mktemp -d`, mode 700) is refused; use
+  `mkdir` or `chmod 750`.
 - **Apify**: `push [--dir <actor folder>]`, `info|builds|runs <actor>`, `logs <run-id>`, `call <actor> --input-file F`,
   `pull <actor> | tar -x`.
 - **Plain CLIs** (`netlify`, `supabase`, `apify`, `vercel`) do local work only (`netlify dev`, `supabase start`,
