@@ -7,7 +7,14 @@ import { randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
+import dns from 'node:dns';
 import path from 'node:path';
+import net from 'node:net';
+
+// Node tries the IPv6 address first when a name has one. On a host whose IPv6 route is broken (Omen, 2026-11: api.supabase.com
+// failed with "fetch failed" / ETIMEDOUT while IPv4 answered in under half a second) that is a long wait, then an error. IPv4 first for
+// every lookup this broker makes (fetch, pg); the CLIs it starts get the same through NODE_OPTIONS (see run()).
+dns.setDefaultResultOrder('ipv4first');
 
 // AGENT_BROKER_DEV_ROOT: tests only. Everything lives under that folder and the CLIs come from PATH. sudo resets
 // the environment, so the installed broker never sees it; it is refused when running as _deployer anyway.
@@ -44,6 +51,37 @@ const TOOL_PATH = DEV
 
 export class UsageError extends Error {}
 export const fail = (msg) => { throw new UsageError(msg); };
+
+/**
+ * Why a network call failed, without secrets: the error codes, the host, and each address tried with its family. Node's
+ * fetch only says "fetch failed"; the code sits in `cause`, and with several addresses tried the causes are in `cause.errors`.
+ */
+export function describeNetError(e, host) {
+  const parts = [];
+  const seen = new Set();
+  const add = (x) => {
+    if (!x || typeof x !== 'object' || seen.has(x)) return;
+    seen.add(x);
+    if (Array.isArray(x.errors)) x.errors.forEach(add);
+    if (x.code || x.address) {
+      const fam = x.address ? (net.isIP(x.address) === 6 ? 'IPv6' : net.isIP(x.address) === 4 ? 'IPv4' : null) : null;
+      parts.push(`${x.code ?? 'error'}${x.address ? ` at ${x.address}${x.port ? `:${x.port}` : ''}` : ''}${fam ? ` (${fam})` : ''}`);
+    } else if (x !== e && x.message && !Array.isArray(x.errors)) parts.push(String(x.message).slice(0, 200)); // e.g. undici's "bad port"
+    add(x.cause);
+  };
+  add(e);
+  const base = String(e?.message || e?.cause?.message || 'network error').slice(0, 200);
+  return `${base}${host ? ` [host ${host}]` : ''}${parts.length ? `: ${[...new Set(parts)].join('; ')}` : ''}`;
+}
+
+/** fetch that reports a network failure with describeNetError (a plain Error: the caller adds its own context). */
+export async function netFetch(url, init) {
+  try {
+    return await fetch(url, init);
+  } catch (e) {
+    throw new Error(describeNetError(e, new URL(url).hostname), { cause: e });
+  }
+}
 
 export const NAME = /^[a-z0-9][a-z0-9_-]{0,62}$/;
 export const KEY = /^[A-Z][A-Z0-9_]{0,62}$/;
@@ -533,6 +571,7 @@ export async function run(cmd, args, { cwd, env = {}, scrub, outScrub = scrub, o
         NO_COLOR: '1',
         FORCE_COLOR: '0',
         CI: '1', // no interactive prompts
+        NODE_OPTIONS: '--dns-result-order=ipv4first', // the Node CLIs (netlify, vercel, apify, the supabase launcher) skip a broken IPv6 route too
         ...env,
       },
       stdio: [stdin, 'pipe', 'pipe'],

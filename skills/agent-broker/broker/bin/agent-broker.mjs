@@ -1,5 +1,5 @@
 #!/opt/agent-broker/node/bin/node
-// agent-broker: the only way agents use Netlify, Vercel, Supabase and Apify accounts on this Mac.
+// agent-broker: the only way agents use Netlify, Vercel, Supabase and Apify accounts on this machine (Mac or Linux).
 // Runs as _deployer through `sudo -n -u _deployer` (wrapper /usr/local/bin/agent-broker). The folder the agent runs
 // in decides the project; the project decides its account stack and the one site / database it may touch. Agents
 // never name an account, a site or a database. Output has secrets removed.
@@ -12,7 +12,7 @@ import {
   CA_FILE, DIR, HOME, KEY, LINUX, NAME, SERVICES, UsageError, allSecretValues, assertNoSecret, assertUnclaimed, audit, checkName,
   checkRelative, effectiveStack, fail, gitRoot, listGroups, listProjects, listStacks, loadGroup, loadGroupSecrets, loadProject,
   loadSecrets, loadStack, loadStackSecrets, loadSyncState, makeScrubber, mkdirs, parseArgs, projectSecrets, resolveProject, run,
-  saveProject, saveSecrets, sandboxReady,
+  saveProject, saveSecrets, sandboxReady, describeNetError, netFetch,
   stackFromAgentsMd, syncProject,
 } from './lib.mjs';
 import { deliver, describeDelivery, healthNotes } from './sync.mjs';
@@ -53,6 +53,8 @@ vercel   deploy [--prod]                                deploy .vercel/output bu
          deploys | logs <deployment-url-or-id>
 supabase query "<SQL>"                                  read-only database user
          migrate [--dry-run] [--include-all]            apply supabase/migrations
+         functions-deploy [name...] [--no-verify-jwt]   \`supabase functions deploy --use-api\` for the pinned project: the
+                  [--import-map F] [--jobs N]            supabase/ folder only; no name = every function; no --prune
          admin-query "<SQL>"                            full rights; waits for the owner's approval
 apify    push [--dir D] [--force] [--version V] [--build-tag T]
          pull <actor>                                   actor source as a tar stream on stdout
@@ -116,7 +118,7 @@ async function scratch() {
 // ---- Netlify -----------------------------------------------------------------------------------------------------
 
 async function netlifyApi(ctx, route) {
-  const res = await fetch(`https://api.netlify.com/api/v1${route}`, { headers: { Authorization: `Bearer ${ctx.secrets.NETLIFY_AUTH_TOKEN}` } });
+  const res = await netFetch(`https://api.netlify.com/api/v1${route}`, { headers: { Authorization: `Bearer ${ctx.secrets.NETLIFY_AUTH_TOKEN}` } });
   if (!res.ok) fail(`Netlify API ${res.status}: ${ctx.scrub(await res.text()).slice(0, 500)}`);
   return res.json();
 }
@@ -235,7 +237,7 @@ const vercel = {
     none(args);
     const ctx = await context(P, 'vercel', ['VERCEL_TOKEN']);
     const q = new URLSearchParams({ projectId: ctx.config.project_id, limit: '10', ...(ctx.config.org_id?.startsWith('team_') ? { teamId: ctx.config.org_id } : {}) });
-    const res = await fetch(`https://api.vercel.com/v6/deployments?${q}`, { headers: { Authorization: `Bearer ${ctx.secrets.VERCEL_TOKEN}` } });
+    const res = await netFetch(`https://api.vercel.com/v6/deployments?${q}`, { headers: { Authorization: `Bearer ${ctx.secrets.VERCEL_TOKEN}` } });
     if (!res.ok) fail(`Vercel API ${res.status}: ${ctx.scrub(await res.text()).slice(0, 500)}`);
     json((await res.json()).deployments.map((d) => ({ id: d.uid, state: d.state ?? d.readyState, target: d.target, created: new Date(d.created).toISOString(), url: d.url })));
     return 0;
@@ -251,6 +253,7 @@ const vercel = {
 // ---- Supabase ----------------------------------------------------------------------------------------------------
 
 const ROW_LIMIT = 2000;
+const FUNCTION_NAME = /^[A-Za-z][A-Za-z0-9_-]{0,62}$/;
 
 const supabase = {
   async query(P, args) {
@@ -275,7 +278,9 @@ const supabase = {
       process.stdout.write(`${ctx.scrub(JSON.stringify(out.length === 1 ? out[0] : out, null, 2))}\n`);
       return 0;
     } catch (e) {
-      process.stderr.write(`agent-broker: ${ctx.scrub(String(e.message ?? e))}\n`);
+      // A database error (bad SQL, no rights) keeps its own message; a failed connection gets its codes and addresses.
+      const net = e?.syscall || Array.isArray(e?.errors) || !e?.message;
+      process.stderr.write(`agent-broker: ${ctx.scrub(net ? describeNetError(e, new URL(ctx.secrets.SUPABASE_READ_URL).hostname) : String(e.message))}\n`);
       return 1;
     } finally {
       await client.end().catch(() => {});
@@ -293,6 +298,24 @@ const supabase = {
     if (opts['dry-run']) cli.push('--dry-run');
     if (opts['include-all']) cli.push('--include-all');
     return run('supabase', cli, { cwd: work, env, scrub: ctx.scrub });
+  },
+  async 'functions-deploy'(P, args) {
+    const { opts, positional } = parseArgs(args, { 'no-verify-jwt': 'bool', 'import-map': 'string', jobs: 'string' });
+    const names = positional.map((n) => (FUNCTION_NAME.test(n) ? n : fail(`invalid function name: ${n}`)));
+    if (opts.jobs !== undefined && !/^[1-9]\d?$/.test(opts.jobs)) fail('--jobs must be a number from 1 to 99');
+    const ctx = await context(P, 'supabase', ['SUPABASE_ACCESS_TOKEN']);
+    // The import map is read by the CLI inside the copy, which holds only supabase/.
+    const importMap = opts['import-map'] === undefined ? null : checkRelative(opts['import-map'], '--import-map');
+    if (importMap !== null && !importMap.startsWith('supabase/')) fail(`--import-map must be a file inside supabase/: ${opts['import-map']}`);
+    const work = await workCopy(P, ctx, 'supabase');
+    // --use-api: the functions are bundled on Supabase's side. The default bundles with Docker, which the sandbox cannot reach.
+    // Not offered: --prune (deletes the project's other functions: the owner's call), --project-ref (the folder picks it).
+    const cli = ['functions', 'deploy', '--use-api', '--project-ref', ctx.config.project_ref];
+    if (opts['no-verify-jwt']) cli.push('--no-verify-jwt');
+    if (importMap !== null) cli.push(`--import-map=${importMap}`);
+    if (opts.jobs !== undefined) cli.push(`--jobs=${opts.jobs}`);
+    cli.push(...names);
+    return run('supabase', cli, { cwd: work, env: { SUPABASE_ACCESS_TOKEN: ctx.secrets.SUPABASE_ACCESS_TOKEN }, scrub: ctx.scrub });
   },
   async 'admin-query'(P, args) {
     if (args.length !== 1) fail('give the SQL as one argument: agent-broker supabase admin-query "..."');

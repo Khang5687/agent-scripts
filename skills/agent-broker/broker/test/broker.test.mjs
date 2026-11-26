@@ -5,6 +5,7 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import fsSync from 'node:fs';
+import net from 'node:net';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -309,6 +310,81 @@ test('supabase migrate copies only the supabase folder: the rest of the project 
   assert.deepEqual((await fs.readFile(log, 'utf8')).trim().split('\n'),
     ['link', './supabase/migrations/001_init.sql', 'db', './supabase/migrations/001_init.sql']);
   assert.equal(await fs.lstat(stale).catch(() => null), null);
+});
+
+test('supabase functions-deploy: `functions deploy --use-api` on the pinned ref, from a copy of supabase/ only, with the token in the environment', async () => {
+  assert.ok(lib.HOME.startsWith(dev), 'test state must not point at the real broker home');
+  const tok = ['sbp', 'FNtokenVALUE0123456789abcdef'].join('_');
+  ok(admin(['apply', '--stack', 'fnstack', '--new-stack'], `stack:SUPABASE_ACCESS_TOKEN=${tok}\n`));
+  const app = await folder('fnapp');
+  ok(broker(['init', '--stack', 'fnstack', '--here', '--supabase-ref', 'reffn', '--no-reader'], app));
+  const { call, log } = await fakeCli('supabase', 'printf "%s\\n" "$@" > "$LOG"; echo "token=$SUPABASE_ACCESS_TOKEN" >> "$LOG"; find . -type f | sort >> "$LOG"');
+  assert.match(call(['supabase', 'functions-deploy'], app).stderr, /supabase\/ is not a folder/);
+
+  await fs.mkdir(path.join(app, 'supabase', 'functions', 'delete-account'), { recursive: true });
+  await fs.writeFile(path.join(app, 'supabase', 'functions', 'delete-account', 'index.ts'), 'export {};\n');
+  await fs.writeFile(path.join(app, 'supabase', 'import_map.json'), '{}\n');
+  await fs.mkdir(path.join(app, 'scratch'));
+  await fs.writeFile(path.join(app, 'scratch', 'run.apk'), 'big');
+  const lines = async () => (await fs.readFile(log, 'utf8')).trim().split('\n');
+
+  const r = call(['supabase', 'functions-deploy', 'delete-account', '--no-verify-jwt', '--import-map', 'supabase/import_map.json', '--jobs', '2'], app);
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual((await lines()).slice(0, 8),
+    ['functions', 'deploy', '--use-api', '--project-ref', 'reffn', '--no-verify-jwt', '--import-map=supabase/import_map.json', '--jobs=2']);
+  const all = await lines();
+  assert.ok(all.includes('delete-account'), all.join('\n'));
+  assert.ok(all.includes(`token=${tok}`)); // the token reaches the CLI only through its environment ...
+  assert.ok(!all.slice(0, 9).join(' ').includes(tok)); // ... never through its arguments
+  assert.ok(all.includes('./supabase/functions/delete-account/index.ts') && !all.some((l) => l.includes('scratch')), all.join('\n'));
+  assert.ok(!(r.stdout + r.stderr).includes(tok));
+
+  ok(call(['supabase', 'functions-deploy'], app)); // no name: every function
+  assert.deepEqual((await lines()).slice(0, 4), ['functions', 'deploy', '--use-api', '--project-ref']);
+  assert.equal((await lines())[4], 'reffn');
+  assert.ok(!(await lines()).slice(0, 6).includes('delete-account'));
+
+  // Not offered or refused before any copy or child: the folder picks the project, --prune deletes other functions, names and paths are checked.
+  await fs.rm(log);
+  for (const [args, why] of [
+    [['--prune'], /unknown option --prune/],
+    [['--project-ref', 'other'], /unknown option --project-ref/],
+    [['--use-docker'], /unknown option --use-docker/],
+    [['../x'], /invalid function name/],
+    [['-x'], /invalid function name/],
+    [['--import-map', '../x.json'], /must be a path inside the project/],
+    [['--import-map', 'other/map.json'], /must be a file inside supabase\//],
+    [['--jobs', 'many'], /--jobs must be a number/],
+  ]) {
+    const bad = call(['supabase', 'functions-deploy', ...args], app);
+    assert.equal(bad.status, 2, `${args}: ${bad.stderr}`);
+    assert.match(bad.stderr, why);
+  }
+  assert.equal(await fs.lstat(log).catch(() => null), null); // the fake CLI never ran
+  assert.match(broker(['supabase', 'functions-deploy'], await folder('nofn')).stderr, /is not inside a registered project/);
+});
+
+test('network calls prefer IPv4, and a failed call names its cause: code, host, address and family, no secret', async () => {
+  const dns = await import('node:dns');
+  assert.equal(dns.getDefaultResultOrder(), 'ipv4first');
+  const agg = Object.assign(new Error(''), { errors: [
+    Object.assign(new Error('connect ETIMEDOUT'), { code: 'ETIMEDOUT', address: '2600:1f18:aaaa::1', port: 443 }),
+    Object.assign(new Error('connect ENETUNREACH'), { code: 'ENETUNREACH', address: '104.18.1.1', port: 443 }),
+  ] });
+  const described = lib.describeNetError(new TypeError('fetch failed', { cause: agg }), 'api.supabase.com');
+  assert.equal(described, 'fetch failed [host api.supabase.com]: ETIMEDOUT at 2600:1f18:aaaa::1:443 (IPv6); ENETUNREACH at 104.18.1.1:443 (IPv4)');
+  // A real refused connection: a loopback port that was just free and has no listener now (no outside call).
+  const probe = net.createServer();
+  await new Promise((resolve) => probe.listen(0, '127.0.0.1', resolve));
+  const { port } = probe.address();
+  await new Promise((resolve) => probe.close(resolve));
+  await assert.rejects(lib.netFetch(`http://127.0.0.1:${port}/x`), (e) => new RegExp(`^fetch failed \\[host 127\\.0\\.0\\.1\\].*ECONNREFUSED at 127\\.0\\.0\\.1:${port} \\(IPv4\\)`).test(e.message));
+  // The CLIs the broker starts get the same preference.
+  const app = await folder('v4app');
+  ok(admin(['apply', '--stack', 'v4', '--new-stack', '--project', 'v4app', '--new-project', '--path', app, '--netlify-site', 'site-v4'], 'stack:NETLIFY_AUTH_TOKEN=nfp_V4tokenVALUE0123456789abcdefg\n'));
+  const { call, log } = await fakeCli('netlify', 'echo "$NODE_OPTIONS" > "$LOG"');
+  ok(call(['netlify', 'deploy'], app));
+  assert.equal((await fs.readFile(log, 'utf8')).trim(), '--dns-result-order=ipv4first');
 });
 
 test('attach adds a missing service only; agents-md gives the block for the folder', async () => {

@@ -3,6 +3,7 @@
 // database user. Used by agent-broker (init / attach), agent-broker-admin (stored tokens) and the wizard's
 // scripts/lookup.mjs (tokens the owner just typed). Tokens go only into request headers.
 import { randomBytes } from 'node:crypto';
+import { netFetch } from './lib.mjs';
 
 const API = {
   netlify: 'https://api.netlify.com/api/v1',
@@ -12,14 +13,14 @@ const API = {
 };
 
 async function get(service, token, route) {
-  const res = await fetch(`${API[service]}${route}`, { headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(30000) });
+  const res = await netFetch(`${API[service]}${route}`, { headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(30000) });
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`${service} API ${res.status} for ${route.split('?')[0]}${res.status === 401 || res.status === 403 ? ' (token not valid or not allowed)' : ''}`);
   return res.json();
 }
 
 async function send(service, token, method, route, body) {
-  const res = await fetch(`${API[service]}${route}`, {
+  const res = await netFetch(`${API[service]}${route}`, {
     method,
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(body),

@@ -28,8 +28,12 @@ agent-broker <service> <action> [options]
   `--prod`, `--alias`, `--functions`, `--json` ... pass through (`agent-broker help`). Add `--prod` only when the owner
   asks (credits). Vercel: `mkdir -p .vercel && agent-broker vercel settings > .vercel/project.json`, `vercel build`,
   `agent-broker vercel deploy`.
-- **Supabase**: `query "select ..."` is read-only; `migrate [--dry-run]` applies `supabase/migrations` (it copies only
-  the `supabase/` folder); any other write is `admin-query "..."`, which waits: ask the owner to run
+- **Supabase**: `query "select ..."` is read-only; `migrate [--dry-run]` applies `supabase/migrations`;
+  `functions-deploy [name...] [--no-verify-jwt] [--import-map supabase/F] [--jobs N]` deploys Edge Functions
+  (`supabase/functions/<name>`) to the pinned project, all of them when no name is given. Both copy only the
+  `supabase/` folder. `functions-deploy` bundles on Supabase's side (`--use-api`: no Docker in the sandbox) and does
+  not offer `--prune` (it deletes the project's other functions: the owner's to run) or `--project-ref`. Secrets for
+  functions are not set by the broker. Any other write is `admin-query "..."`, which waits: ask the owner to run
   `agent-broker-admin approve <id>`, then `agent-broker result <id>`.
 - **Copies**: deploys and pushes (netlify, vercel, apify) copy the whole project folder, git-ignored files included
   (build output is often ignored), so a big ignored folder (test runs, APKs) makes them slow. The broker user reads
@@ -72,7 +76,7 @@ agent-broker attach --supabase-ref REF       # later: add a service the project 
 In your own Terminal app:
 
 ```sh
-~/git/agent-scripts/skills/agent-broker/scripts/wizard.sh
+~/git/agent-scripts/skills/agent-broker/scripts/wizard.sh      # macOS only; Linux: "Owner: Linux commands"
 ```
 
 Menu: 1 Add an account stack · 2 Replace a token (one place, every project on the stack) · 3 Add a project
@@ -82,13 +86,23 @@ Menu: 1 Add an account stack · 2 Replace a token (one place, every project on t
 Setup / update installs `broker/` to `/opt/agent-broker` (own Node and CLIs), `/usr/local/bin/agent-broker{,-admin}`,
 the sudo rule `/etc/sudoers.d/agent-broker` (password every time), and the CLI guard (`/opt/agent-broker/guard`, first
 in `PATH` via one line in `~/.zshenv` and `~/.zshrc`). Owner bypass for a real CLI: its full path (`which -a netlify`).
-Changing the broker: edit `broker/`, `cd broker && npm test`, then wizard → 7.
+Changing the broker: edit `broker/`, `cd broker && npm test` (fakes only, no real service), then wizard → 7 (Mac) or
+the Linux install command below.
 
 ## Linux (homelab)
 
 The cloud actions above (`netlify`, `vercel`, `supabase`, `apify`), `init`, `whoami` and `compose` all run on Linux. The
 cloud CLIs run in a bwrap sandbox that cannot read the broker's folders; without the owner's AppArmor file (Owner
-section) a cloud action stops with one line that names the fix.
+section, step 2) a cloud action stops with one line that names the fix. The broker's home is `/home/_deployer`, its
+copy `/opt/agent-broker`; the CLI guard goes first in `PATH` through the owner's `.profile`, `.bashrc` (top of the file)
+and `.bash_profile` (a shell that reads none of them, such as plain `bash -c`, is not covered).
+
+**Network: IPv4 first.** The broker resolves names IPv4 first (its own calls, `pg`, and the Node CLIs through
+`NODE_OPTIONS=--dns-result-order=ipv4first`), because a broken IPv6 route made Node fetch to `api.supabase.com` fail
+with "fetch failed" / ETIMEDOUT (Omen, 2026-11). A failed call now prints its cause without secrets, for example
+`fetch failed [host api.supabase.com]: ETIMEDOUT at 2600:...:443 (IPv6)`. The `supabase` CLI itself is a Go binary: it
+ignores that setting (its own resolver; not changed, not tested). If it still fails on a broken IPv6 route, the owner's
+option is `precedence ::ffff:0:0/96 100` in `/etc/gai.conf` (IPv4 first for every program on the host; not done).
 
 ```sh
 agent-broker health      # one line, exit 0 = the broker can serve every key its groups promise; waiting token copies are notes
@@ -141,7 +155,8 @@ owner adds: `agent-broker-admin apply --group <group> --grant-root <READ_KEY> --
 
 Each `agent-broker-admin` call asks your password.
 
-1. Install or update (rerun after `git pull`):
+1. Install or update (rerun after `git pull`; the broker copies the newest Node of your nvm or mise, else the script
+   asks for `NODE_DIR=/path/to/node/version`):
    `sudo ~/git/agent-scripts/skills/agent-broker/broker/install.sh`. It creates `_deployer` (your group + docker),
    `/opt/agent-broker` (own Node, the cloud CLIs), the commands, the sudo rule and the CLI guard. It sets `_deployer`'s
    shell to `/bin/sh` so the other machine's one SSH key can deliver tokens; the account has no password. If step 3
@@ -191,18 +206,22 @@ Each `agent-broker-admin` call asks your password.
   GitHub bot account for agents (write, no admin), `main` protected with owner approval, secrets in an environment
   limited to `main`.
 - **Apify actor runs** get a run token; actor code can print it.
-- **Netlify** tokens open the whole account; edge-function bundling during a deploy may run project code with the
-  token present (no project uses edge functions yet). CLIs run in a sandbox (macOS sandbox-exec, Linux bwrap) that
-  cannot read the broker's token files, so a path in `netlify.toml` (or any project config) cannot point a deploy at them.
+- **Netlify** tokens open the whole account. A Netlify deploy's edge-function bundling may run project code with the
+  token present (no project uses Netlify edge functions yet). Supabase Edge Functions deploy through the broker with
+  `--use-api` (bundled server-side, per the CLI's help text). CLIs run in a sandbox (macOS
+  sandbox-exec, Linux bwrap) that cannot read the broker's token files, so a path in `netlify.toml` (or any project
+  config) cannot point a deploy at them.
 - **Tokens agents saw before the broker** (2026-10) stay valid until rotated (wizard → 2).
 - **Linux, guard not wall**: the secret guard stops an agent that runs `run`, `key` or `get`; root can read the broker's
   files anyway, and the `get` / root-write checks are an interface for scripts. The program check for `key` reads a
   process's command line, so a process started with an OMP binary's path (or a bare name the grant lists) imitates OMP.
   A unit name can be imitated by the user's own systemd (an own unit with the same name gets that unit's keys). The
   `run` check trusts the caller's cgroup, and any process of the user can join one.
+- **Linux, proven on the Omen** (2026-11-26, the broker test with the real bwrap and the owner's AppArmor file in
+  `/etc/apparmor.d/bwrap`): the sandbox hides the broker's folders from a CLI.
 - **Linux, unproven**: the env file for `env` grants (written by the pre-start step, read by `EnvironmentFile=`; a file
-  grant has no quoting question, so prefer file grants); that the bwrap sandbox hides the broker's folders in a live run
-  (waits for the AppArmor file); that the cloud CLIs work with an empty home folder inside the sandbox.
+  grant has no quoting question, so prefer file grants); that the cloud CLIs work with an empty home folder inside the
+  sandbox in a live run; a live `supabase functions-deploy` (the tests use a fake CLI).
 - **Linux: `agent-broker compose` and the `docker` group are a guard on any host, not a wall.** The Docker daemon is root:
   whoever can start containers from a file an agent wrote can reach the host. Taking the agent user out of `docker` does
   not change that while `compose` is offered, because the broker's own Docker calls run as the broker user. What the
